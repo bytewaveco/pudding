@@ -4,3 +4,5 @@ dist/
 .pudding/
 test/fixtures/.tmp-*/
 *.tgz
+.lab/
+test/fixtures/review-*/
