@@ -78,6 +78,15 @@ function print(e: Expr, memo: Map<Expr, string>): string {
     case "concat": text = `(${a} ++ ${b})`; break
     case "str": text = `(toString ${a})`; break
     case "ite": text = `(if ${a} then ${b} else ${c})`; break
+    case "fdiv": {
+      // Lean's `/` on integers rounds toward minus infinity when the divisor
+      // is positive, so a literal divisor needs no case split.
+      const divisor = e.args[1]!
+      if (divisor.t === "lit" && (divisor.value as bigint) > 0n) text = `(${a} / ${divisor.value})`
+      else if (divisor.t === "lit" && (divisor.value as bigint) < 0n) text = `((-${a}) / ${-(divisor.value as bigint)})`
+      else text = `(Int.fdiv ${a} ${b})`
+      break
+    }
     case "div":
     case "mod": {
       // BigInt division truncates toward zero and the remainder takes the sign
@@ -127,6 +136,25 @@ export interface Check {
  * cases in Lean's kernel. Otherwise the finite inputs are specialized away and
  * each remaining theorem quantifies over the unbounded ones.
  */
+/** The bounds of a finite integer input whose values are consecutive, when it has more than a couple. */
+function consecutive(binder: Binder): [bigint, bigint] | undefined {
+  const values = binder.domain
+  if (binder.ty !== "int" || !values || values.length < 3) return undefined
+  const sorted = (values as bigint[]).toSorted((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+  return sorted.every((value, i) => i === 0 || value === sorted[i - 1]! + 1n) ? [sorted[0]!, sorted.at(-1)!] : undefined
+}
+
+/** Whether a variable is divided by, or multiplied with something that is not a constant. */
+function usedNonlinearly(e: Expr, name: string, seen = new Set<Expr>()): boolean {
+  if (e.t !== "op" || seen.has(e)) return false
+  seen.add(e)
+  const mentions = (part: Expr) => ir.freeVariables(part).has(name)
+  const [a, b] = e.args as [Expr, Expr]
+  if ((e.op === "div" || e.op === "mod" || e.op === "fdiv") && mentions(b)) return true
+  if (e.op === "mul" && a.t !== "lit" && b.t !== "lit" && (mentions(a) || mentions(b))) return true
+  return e.args.some(arg => usedNonlinearly(arg, name, seen))
+}
+
 export function checksFor(binders: readonly Binder[], guard: Expr, claim: Expr, tactic: string | undefined): Check[] {
   const body = implication(guard, claim)
   const free = ir.freeVariables(body)
@@ -139,8 +167,21 @@ export function checksFor(binders: readonly Binder[], guard: Expr, claim: Expr, 
     }
     return [{ statement: ` : ${text} = true := by ${FINITE_TACTIC}`, cases }]
   }
-  const finite = used.filter(b => b.domain)
-  const symbolic = used.filter(b => !b.domain)
+  // An integer input over a run of consecutive values does not have to be
+  // split into cases: its bounds can be stated instead, which the arithmetic
+  // tactics use directly. Splitting is kept where the input is multiplied or
+  // divided by, because fixing its value is what makes that arithmetic linear.
+  const bounded = new Map<string, [bigint, bigint]>()
+  for (const binder of used) {
+    const range = consecutive(binder)
+    if (range && !usedNonlinearly(body, binder.name)) bounded.set(binder.name, range)
+  }
+  const finite = used.filter(b => b.domain && !bounded.has(b.name))
+  const symbolic = used.filter(b => !b.domain || bounded.has(b.name))
+  for (const [name, [low, high]] of bounded) {
+    const input = ir.variable(name, "int")
+    guard = ir.and(ir.and(ir.le(ir.lit(low), input), ir.le(input, ir.lit(high))), guard)
+  }
   const combinations = finite.reduce((n, b) => n * b.domain!.length, 1)
   if (combinations > MAX_SPECIALIZATIONS) {
     throw new TooLarge(`the finite inputs have ${combinations} combinations alongside unbounded ones; the limit is ${MAX_SPECIALIZATIONS}`)
@@ -229,7 +270,8 @@ export async function prove(lean: string, header: string, statements: string[]):
   if (!statements.length) return []
   const directory = await mkdtemp(join(tmpdir(), "pudding-"))
   try {
-    const workers = Math.max(1, Math.min(availableParallelism(), Math.ceil(statements.length / 24)))
+    // Starting Lean costs little next to proving, so spread the work widely.
+    const workers = Math.max(1, Math.min(availableParallelism(), Math.ceil(statements.length / 8)))
     const size = Math.ceil(statements.length / workers)
     const chunks: string[][] = []
     for (let i = 0; i < statements.length; i += size) chunks.push(statements.slice(i, i + size))

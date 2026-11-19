@@ -444,6 +444,30 @@ export async function run(options: RunOptions = {}): Promise<Report> {
     }
   }
 
+  // Start executing the laws against the real code now; it runs alongside
+  // the proving and is compared with the model once both are done.
+  const executing = performance.now()
+  const candidates = laws.filter(law => law.index >= 0)
+  const job: Job | undefined = executable && {
+    map: executable,
+    budget: RUNTIME_BUDGET,
+    files: [...new Set(candidates.map(law => law.file))].map(file => ({
+      file,
+      registered: candidates.filter(law => law.file === file).length,
+      laws: candidates.filter(law => law.file === file && law.mode === "run" && law.problem?.kind !== "invalid").map(law => ({
+        index: law.index,
+        unproved: law.problem !== undefined,
+        instances: law.instances.map(instance => ({
+          binders: instance.binders, arg: instance.arg, obligations: instance.obligations.map(o => ({ guard: o.guard, claim: o.claim, inexact: o.kind === "overflow" || o.kind === "nan" })),
+        })),
+      })),
+    })),
+  }
+  const execution = job && executeLaws(job).then(result => {
+    report.timings.crossCheck = Math.round(performance.now() - executing)
+    return result
+  })
+
   // Prove what the cache does not already hold.
   const proved = new Set(cache.proved)
   const keyOf = (statement: string) => hash(version + "\0" + statement)
@@ -473,8 +497,20 @@ export async function run(options: RunOptions = {}): Promise<Report> {
   // A rejection under the fast header is only final once the full library and
   // the slower fallback automation have also failed. Lean's first message is
   // kept because it describes the goal best.
+  // An obligation with a counterexample is false, so trying harder to prove
+  // it would only waste time. The search is cheap and its result is reused
+  // when the failure is explained.
   const retrying = performance.now()
-  const retry = quick.filter((_, i) => !first[i]!.ok)
+  const counterexamples = new Map<Obligation, ReturnType<typeof findInput>["found"]>()
+  const unexplained = new Set<string>()
+  for (const { instance, obligation, checks } of pending) {
+    const rejected = checks.filter(c => !outcomes.get(c.statement)!.ok)
+    if (!rejected.length) continue
+    const { found } = findInput(instance.binders, ir.and(obligation.guard, ir.not(obligation.claim)))
+    counterexamples.set(obligation, found)
+    if (!found) for (const check of rejected) unexplained.add(check.statement)
+  }
+  const retry = quick.filter((statement, i) => !first[i]!.ok && unexplained.has(statement))
   const second = await prove(lean, FULL_HEADER, retry.map(statement => withFallback(statement)!))
   retry.forEach((statement, i) => {
     if (second[i]!.ok) outcomes.set(statement, second[i]!)
@@ -492,8 +528,7 @@ export async function run(options: RunOptions = {}): Promise<Report> {
     const rejected = checks.map(c => outcomes.get(c.statement)!).find(o => !o.ok)
     if (!rejected) continue
     const at = { file: obligation.file, line: obligation.line, column: obligation.column, text: obligation.text }
-    const violated = ir.and(obligation.guard, ir.not(obligation.claim))
-    const { found } = findInput(instance.binders, violated)
+    const found = counterexamples.get(obligation)
     if (found) {
       const inputs = showInputs(instance.binders, found)
       if (obligation.kind === "expect") {
@@ -558,27 +593,10 @@ export async function run(options: RunOptions = {}): Promise<Report> {
     }
   }
 
-  // Run the real code and compare it with the model that was proved.
+  // Compare the model that was proved with what the real code did.
   const executedOnly = new Map<Law, boolean>()
-  const executing = performance.now()
-  if (executable) {
-    const candidates = laws.filter(law => law.index >= 0)
-    const job: Job = {
-      map: executable,
-      budget: RUNTIME_BUDGET,
-      files: [...new Set(candidates.map(law => law.file))].map(file => ({
-        file,
-        registered: candidates.filter(law => law.file === file).length,
-        laws: candidates.filter(law => law.file === file && law.mode === "run" && law.problem?.kind !== "invalid").map(law => ({
-          index: law.index,
-          unproved: law.problem !== undefined,
-          instances: law.instances.map(instance => ({
-            binders: instance.binders, arg: instance.arg, obligations: instance.obligations.map(o => ({ guard: o.guard, claim: o.claim, inexact: o.kind === "overflow" || o.kind === "nan" })),
-          })),
-        })),
-      })),
-    }
-    const { outcomes, timedOut } = await executeLaws(job)
+  if (job && execution) {
+    const { outcomes, timedOut } = await execution
     for (const { file } of job.files) {
       const outcome = outcomes.get(file)
       const reason = outcome?.error ?? (outcome ? undefined : timedOut ? `executing the laws took longer than ${RUNTIME_TIMEOUT_MS / 1000} s` : "the worker that executes laws stopped unexpectedly")
@@ -598,8 +616,6 @@ export async function run(options: RunOptions = {}): Promise<Report> {
       }
     }
   }
-
-  report.timings.crossCheck = Math.round(performance.now() - executing)
 
   // Settle each law's status.
   for (const law of laws) {

@@ -7,7 +7,7 @@ export type Scalar = boolean | bigint | string
 
 export type Op =
   | "not" | "and" | "or" | "eq" | "lt" | "le"
-  | "add" | "sub" | "mul" | "neg" | "div" | "mod"
+  | "add" | "sub" | "mul" | "neg" | "div" | "mod" | "fdiv"
   | "concat" | "str" | "ite"
 
 export type Expr =
@@ -159,6 +159,16 @@ export function div(a: Expr, b: Expr): Expr {
   return op("div", "int", a, b)
 }
 
+const floorDivide = (a: bigint, b: bigint) => (a % b !== 0n && (a < 0n) !== (b < 0n) ? a / b - 1n : a / b)
+
+/** Division rounded toward minus infinity, as `Math.floor(a / b)` computes it for whole numbers. The divisor must not be zero. */
+export function fdiv(a: Expr, b: Expr): Expr {
+  if (isLit(a) && isLit(b) && b.value !== 0n) return lit(floorDivide(a.value as bigint, b.value as bigint))
+  if (isInt(b, 1n)) return a
+  if (isInt(a, 0n)) return a
+  return op("fdiv", "int", a, b)
+}
+
 /** BigInt remainder, which takes the sign of the dividend. */
 export function mod(a: Expr, b: Expr): Expr {
   if (isLit(a) && isLit(b) && b.value !== 0n) return lit((a.value as bigint) % (b.value as bigint))
@@ -216,6 +226,7 @@ function rebuild(o: Op, args: Expr[]): Expr {
     case "neg": return neg(a)
     case "div": return div(a, b)
     case "mod": return mod(a, b)
+    case "fdiv": return fdiv(a, b)
     case "concat": return concat(a, b)
     case "str": return toStr(a)
     case "ite": return ite(a, b, c)
@@ -291,9 +302,11 @@ export function evaluate(e: Expr, env: ReadonlyMap<string, Scalar>): Scalar {
     case "mul": return (arg(0) as bigint) * (arg(1) as bigint)
     case "neg": return -(arg(0) as bigint)
     case "div":
-    case "mod": {
+    case "mod":
+    case "fdiv": {
       const divisor = arg(1) as bigint
       if (divisor === 0n) throw new EvaluationError("division by zero")
+      if (e.op === "fdiv") return floorDivide(arg(0) as bigint, divisor)
       return e.op === "div" ? (arg(0) as bigint) / divisor : (arg(0) as bigint) % divisor
     }
     case "concat": return (arg(0) as string) + (arg(1) as string)

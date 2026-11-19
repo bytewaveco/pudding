@@ -241,6 +241,8 @@ describe("the Lean encoding", () => {
   test("agrees with JavaScript on bigint division, remainder and comparison, including negatives", async () => {
     const statements = [
       ...[7n, -7n, 100n, 1n, -1n].flatMap(d => [agreement(ir.div(vx, ir.lit(d)), [x]), agreement(ir.mod(vx, ir.lit(d)), [x])]).flat(),
+      ...[7n, -7n, 100n, 1n, -1n].flatMap(d => agreement(ir.fdiv(vx, ir.lit(d)), [x])),
+      ...agreement(ir.fdiv(vx, vy), [x, y]),
       ...agreement(ir.div(vx, vy), [x, y]),
       ...agreement(ir.mod(vx, vy), [x, y]),
       ...agreement(ir.ite(ir.lt(vx, vy), ir.sub(vx, vy), ir.neg(ir.mul(vx, vy))), [x, y]),

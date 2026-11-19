@@ -1196,13 +1196,9 @@ export class Translator {
       const a = number(inner.left)
       const b = number(inner.right)
       this.emit("nan", ir.not(ir.eq(b, ir.lit(0n))), inner)
-      const truncated = ir.div(a, b)
-      if (name === "trunc") return scalar(truncated, true)
-      const inexact = ir.not(ir.eq(ir.mod(a, b), ir.lit(0n)))
-      const negative = ir.not(ir.eq(ir.lt(a, ir.lit(0n)), ir.lt(b, ir.lit(0n))))
-      return scalar(name === "floor"
-        ? ir.ite(ir.and(inexact, negative), ir.sub(truncated, ir.lit(1n)), truncated)
-        : ir.ite(ir.and(inexact, ir.not(negative)), ir.add(truncated, ir.lit(1n)), truncated), true)
+      if (name === "trunc") return scalar(ir.div(a, b), true)
+      // The ceiling of a quotient is the negated floor of its negation.
+      return scalar(name === "floor" ? ir.fdiv(a, b) : ir.neg(ir.fdiv(ir.neg(a), b)), true)
     }
     if (first && parameters.length === 1 && name === "abs") {
       const value = number(first)
