@@ -761,6 +761,7 @@ export class Translator {
 
   /** Apply an operation to a value, distributing over conditional values. */
   private over(value: Value, apply: (value: Value) => Value): Value {
+    value = this.settled(value)
     if (value.k === "choice") return this.branch(value.cond, () => this.over(value.a, apply), () => this.over(value.b, apply))
     return apply(value)
   }
@@ -1219,7 +1220,30 @@ export class Translator {
   private read(node: N, env: Env, shorthand = false): Value {
     const local = env.get(node.text)
     if (local?.k === "uninitialized") throw new Unsupported(`\`${node.text}\` is read before its declaration has run, which throws`, node)
-    return local ?? this.global(node, shorthand)
+    if (local) return this.settled(local)
+    if (node.text === "undefined") {
+      const symbol = shorthand ? undefined : this.checker.getSymbolAtLocation(node)
+      if (symbol && this.checker.isUndefinedSymbol(symbol)) return VOID
+    }
+    return this.global(node, shorthand)
+  }
+
+  /**
+   * A value that depends on a condition, reduced by what is already known on
+   * this path. After `if (x !== undefined)`, a variable that holds something
+   * or undefined depending on that very test holds the something.
+   */
+  private settled(value: Value): Value {
+    while (value.k === "choice") {
+      const cond = value.cond
+      if (this.pc.some(known => ir.same(known, cond))) value = value.a
+      else {
+        const negated = ir.not(cond)
+        if (this.pc.some(known => ir.same(known, negated))) value = value.b
+        else break
+      }
+    }
+    return value
   }
 
   /**
