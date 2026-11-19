@@ -1,6 +1,7 @@
 import assert from "node:assert/strict"
 import { spawnSync } from "node:child_process"
 import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { after, before, describe, test } from "node:test"
 import * as ir from "../src/ir.ts"
@@ -407,6 +408,21 @@ describe("the Lean encoding", () => {
     const [outcome] = await prove(lean, FAST_HEADER, wrong)
     assert.equal(outcome?.ok, false)
   })
+})
+
+test("Vitest runs a law file as tests that report the proofs", () => {
+  const root = join(fixtures, "vitest")
+  const output = join(mkdtempSync(join(tmpdir(), "pudding-vitest-")), "report.json")
+  const result = spawnSync("npx", ["vitest", "run", "--root", root, "--reporter", "json", "--outputFile", output], { encoding: "utf8", cwd: join(import.meta.dirname, "..") })
+  const report = JSON.parse(readFileSync(output, "utf8")) as {
+    numPassedTests: number; numFailedTests: number; numPendingTests: number; numTodoTests: number
+    testResults: { assertionResults: { fullName: string; status: string; failureMessages: string[] }[] }[]
+  }
+  assert.deepEqual([report.numPassedTests, report.numFailedTests, report.numPendingTests, report.numTodoTests], [3, 1, 1, 1])
+  const failed = report.testResults.flatMap(file => file.assertionResults).find(test => test.status === "failed")
+  assert.equal(failed?.fullName, "parity FALSE: every face is even")
+  assert.match(failed?.failureMessages.join("\n") ?? "", /the expectation does not hold[\s\S]*with face = 1[\s\S]*dice\.law\.ts:14:5/)
+  assert.equal(result.status, 1)
 })
 
 describe("proof scripts", () => {

@@ -71,10 +71,22 @@ export function domain<T>(): Domain<T> {
   return {} as Domain<T>
 }
 
-function register(name: string, second?: unknown, third?: unknown): void {
-  const registry = (globalThis as Record<symbol, unknown>)[REGISTRY] as Registered[] | undefined
+type Modifier = "run" | "skip" | "only" | "todo"
+
+/**
+ * A law file can be loaded in three ways. Pudding's own runner loads it with a
+ * registry in place, to execute the laws against the real code. Vitest loads
+ * it as a test file, and each law becomes a test that reports its proof.
+ * Anything else, such as importing it by accident, does nothing.
+ */
+const registry = () => (globalThis as Record<symbol, unknown>)[REGISTRY] as Registered[] | undefined
+const vitest = typeof process !== "undefined" && process.env["VITEST"] !== undefined && !registry() ? await import("./vitest.ts") : undefined
+
+const register = (modifier: Modifier) => (name: string, second?: unknown, third?: unknown): void => {
+  const collected = registry()
   const callback = (typeof second === "function" ? second : typeof third === "function" ? third : undefined) as Registered["callback"]
-  registry?.push({ name, callback })
+  if (collected) collected.push({ name, callback })
+  else vitest?.defineLaw(modifier, name)
 }
 
 export interface LawFunction {
@@ -93,7 +105,9 @@ export interface Law extends LawFunction {
   todo(name: string): void
 }
 
-export const law: Law = Object.assign(register as LawFunction, { skip: register as LawFunction, only: register as LawFunction, todo: register })
+export const law: Law = Object.assign(register("run") as LawFunction, {
+  skip: register("skip") as LawFunction, only: register("only") as LawFunction, todo: register("todo") as (name: string) => void,
+})
 
 export interface Describe {
   /** Group laws under a shared name. */
@@ -102,8 +116,11 @@ export interface Describe {
   only(name: string, body: () => void): void
 }
 
-const group = (_name: string, body: () => void) => body()
-export const describe: Describe = Object.assign(group, { skip: group, only: group })
+const group = (modifier: "run" | "skip" | "only") => (name: string, body: () => void): void => {
+  if (vitest && !registry()) vitest.defineGroup(modifier, name, body)
+  else body()
+}
+export const describe: Describe = Object.assign(group("run"), { skip: group("skip"), only: group("only") })
 
 export class ExpectationFailed extends Error {}
 

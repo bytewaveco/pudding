@@ -68,6 +68,47 @@ The `github` reporter is chosen automatically inside GitHub Actions and
 annotates the lines that failed. The same run is available from code as
 `run()` in `@bytewaveco/pudding/runner`.
 
+## Running under Vitest
+
+A law file is also a Vitest test file. Add the pattern to the files Vitest
+collects, and every law shows up as a test next to your unit tests:
+
+```ts
+// vitest.config.ts
+import { defineConfig } from "vitest/config"
+
+export default defineConfig({
+  test: { include: ["**/*.test.ts", "**/*.law.ts"] },
+})
+```
+
+```
+ ✓ src/cart.test.ts (1 test)
+ ❯ src/cart.law.ts (2 tests | 1 failed)
+   ✓ the order of two items does not matter
+   × FALSE: quantity is ignored
+
+ FAIL  src/cart.law.ts > FALSE: quantity is ignored
+LawFailed: the expectation does not hold
+  expect(subtotal([item])).toEqual(item.price)
+  with item.price = 1n, item.quantity = 0n
+  actual:   0n
+  expected: 1n
+ ❯ src/cart.law.ts:8:3
+```
+
+A passing test means what it means on the command line: the law was proved,
+or executed when it could not be, and a law that was only executed carries a
+note saying so. `describe`, `law.skip`, `law.only` and `law.todo` become
+their Vitest counterparts, and `pudding.config.ts` still applies, so `strict`
+turns executed-only laws into failures here too. Watch mode, `-t`, the UI and
+editor integrations work as they do for any test.
+
+Each file is proved by its own Pudding run when its first law starts, so a
+law file costs a few hundred milliseconds more under Vitest than under
+`pudding`, which reads all of them in one go. Vitest is an optional peer
+dependency, version 3 or newer.
+
 ## Configuration
 
 A `pudding.config.ts` is optional.

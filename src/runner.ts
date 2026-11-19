@@ -5,11 +5,11 @@
 import { execFileSync } from "node:child_process"
 import { createHash } from "node:crypto"
 import { createRequire } from "node:module"
-import { existsSync, globSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs"
+import { existsSync, globSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { dirname, isAbsolute, join, relative, resolve } from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
-import { Worker } from "node:worker_threads"
+import { threadId, Worker } from "node:worker_threads"
 import { SyntaxKind as K } from "typescript/unstable/ast"
 import { API, DiagnosticCategory, SymbolFlags, type Checker, type Program } from "typescript/unstable/sync"
 import type { Config } from "./index.ts"
@@ -31,6 +31,8 @@ export interface RunOptions extends Config {
   cwd?: string
   /** Only check law files whose path contains one of these. */
   files?: string[]
+  /** Check exactly these files, whatever the configuration includes. */
+  lawFiles?: string[]
   /** Only check laws whose full name matches this regular expression. */
   name?: string
   /** Write the generated Lean source to this file. */
@@ -178,8 +180,18 @@ function leanVersion(lean: string, cache: Cache): string {
   return version
 }
 
+/** The most proofs remembered. Only runs over part of the laws can reach it, since a full run forgets what it did not use. */
+const CACHE_LIMIT = 50_000
+
 function cachePath(cwd: string): string {
   return existsSync(join(cwd, "node_modules")) ? join(cwd, "node_modules", ".cache", "pudding", "cache.json") : join(cwd, ".pudding", "cache.json")
+}
+
+/** Write a file so that another run reading it at the same moment never sees half of it. */
+function replaceFile(file: string, text: string): void {
+  const partial = `${file}.${process.pid}.${threadId}.tmp`
+  writeFileSync(partial, text)
+  renameSync(partial, file)
 }
 
 function loadCache(file: string): Cache {
@@ -198,12 +210,15 @@ function loadCache(file: string): Cache {
  * files need no entry in anyone's `include`, and why a project without a
  * tsconfig still works.
  */
-function writeProject(directory: string, base: string | undefined, lawFiles: string[]): string {
+function writeProject(directory: string, base: string | undefined, lawFiles: string[], partial: boolean): string {
   const defaults = join(directory, "tsconfig.defaults.json")
-  const project = join(directory, "tsconfig.json")
+  // A run over some of the law files gets a project of its own, because
+  // several of them can be going at once: Vitest proves each file in its own worker.
+  const subset = createHash("sha256").update(lawFiles.join("\0")).digest("hex").slice(0, 12)
+  const project = join(directory, partial ? `tsconfig.${subset}.json` : "tsconfig.json")
   const write = (file: string, value: unknown) => {
     const text = JSON.stringify(value, null, 2) + "\n"
-    if (!existsSync(file) || readFileSync(file, "utf8") !== text) writeFileSync(file, text)
+    if (!existsSync(file) || readFileSync(file, "utf8") !== text) replaceFile(file, text)
   }
   mkdirSync(directory, { recursive: true })
   write(defaults, {
@@ -340,7 +355,7 @@ export async function run(options: RunOptions = {}): Promise<Report> {
   const given = Object.fromEntries(Object.entries(options).filter(([, value]) => value !== undefined)) as RunOptions
   const config: RunOptions = { ...loaded.config, ...given }
   const filters = config.files ?? []
-  const lawFiles = globSync(config.include ?? ["**/*.law.ts"], {
+  const lawFiles = config.lawFiles?.map(file => resolve(cwd, file)) ?? globSync(config.include ?? ["**/*.law.ts"], {
     cwd, exclude: ["**/node_modules/**", "**/.toolchain/**", ...(config.exclude ?? [])],
   }).sort().map(file => resolve(cwd, file)).filter(file => !filters.length || filters.some(filter => displayPath(cwd, file).includes(filter)))
   const base = resolve(cwd, config.tsconfig ?? "tsconfig.json")
@@ -373,7 +388,8 @@ export async function run(options: RunOptions = {}): Promise<Report> {
     }
   }
 
-  const tsconfig = writeProject(dirname(cacheFile), existsSync(base) ? base : undefined, lawFiles)
+  const partial = config.lawFiles !== undefined || filters.length > 0 || config.name !== undefined
+  const tsconfig = writeProject(dirname(cacheFile), existsSync(base) ? base : undefined, lawFiles, partial)
 
   // Read and translate the laws.
   const reading = performance.now()
@@ -679,9 +695,13 @@ export async function run(options: RunOptions = {}): Promise<Report> {
   finish()
 
   if (config.cache !== false) {
-    const saved: Cache = { version: CACHE_VERSION, lean: cache.lean, proved: [...used] }
+    // A full run keeps only what it used. A run over part of the laws must not
+    // forget the rest, so it adds to what is there now, which another run may
+    // have written since this one started.
+    const kept = partial ? loadCache(cacheFile).proved.filter(hash => !used.has(hash)) : []
+    const saved: Cache = { version: CACHE_VERSION, lean: cache.lean, proved: [...kept, ...used].slice(-CACHE_LIMIT) }
     mkdirSync(dirname(cacheFile), { recursive: true })
-    writeFileSync(cacheFile, JSON.stringify(saved))
+    replaceFile(cacheFile, JSON.stringify(saved))
   }
   return report
 }
