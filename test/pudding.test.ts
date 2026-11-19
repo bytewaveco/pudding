@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { after, before, describe, test } from "node:test"
 import * as ir from "../src/ir.ts"
@@ -76,6 +76,39 @@ describe("the suite project", () => {
   test("strict mode refuses laws that were only executed", async () => {
     const strict = await run({ cwd: join(fixtures, "suite"), cache: false, strict: true })
     assert.equal(law(strict, "CHECKED: initials are one character").status, "failed")
+  })
+})
+
+describe("grouping and selection", () => {
+  const cwd = join(fixtures, "grouped")
+  const statuses = (report: Report) => Object.fromEntries(report.laws.map(entry => [entry.name, entry.status]))
+
+  test("describe prefixes names and scopes its declarations; skip, todo and only behave as in Vitest", async () => {
+    const report = await run({ cwd, cache: false })
+    assert.equal(report.ok, true)
+    assert.deepEqual(statuses(report), {
+      "three steps return to the start": "proved",
+      "a single step > always changes the light": "proved",
+      "a single step > stops only after amber": "proved",
+      "a single step > from red > goes to green": "proved",
+      "a single step > FALSE but skipped: never reaches amber": "skipped",
+      "a single step > flashing amber": "todo",
+      "a group that is switched off > FALSE but skipped: red is green": "skipped",
+      "the one law that runs": "proved",
+      "FALSE but not selected: red is terminal": "skipped",
+    })
+  })
+
+  test("file and name filters narrow the run", async () => {
+    const report = await run({ cwd, cache: false, files: ["lights"], name: "from red" })
+    assert.deepEqual(report.laws.filter(entry => entry.status === "proved").map(entry => entry.name), ["a single step > from red > goes to green"])
+    assert.ok(report.laws.every(entry => entry.file.endsWith("lights.law.ts")))
+    const none = await run({ cwd, cache: false, files: ["no-such-file"] })
+    assert.match(none.errors[0] ?? "", /no law file matches/)
+  })
+
+  test("the project needs no tsconfig of its own", () => {
+    assert.equal(existsSync(join(cwd, "tsconfig.json")), false)
   })
 })
 

@@ -47,6 +47,8 @@ export interface Law {
   column: number
   /** Position among the `law()` calls of the file. */
   index: number
+  /** `skip` and `todo` laws are listed but not checked. */
+  mode: "run" | "skip" | "todo"
   /** A Lean tactic script supplied by the author for symbolic obligations. */
   proof: string | undefined
   /** One instance per alternative of a union-typed input. */
@@ -95,6 +97,7 @@ const MODULE_DECLARATIONS = new Set<number>([
   K.ImportDeclaration, K.ExportDeclaration, K.ExportAssignment, K.VariableStatement, K.FunctionDeclaration, K.ClassDeclaration,
   K.InterfaceDeclaration, K.TypeAliasDeclaration, K.EnumDeclaration, K.ModuleDeclaration, K.ImportEqualsDeclaration, K.EmptyStatement,
 ])
+const DECLARATIONS_WITHOUT_VALUE = new Set<number>([K.ImportDeclaration, K.InterfaceDeclaration, K.TypeAliasDeclaration, K.EmptyStatement])
 const ARRAY_MUTATORS = new Set(["push", "pop", "shift", "unshift", "splice", "sort", "reverse", "fill", "copyWithin", "set", "delete", "clear", "add"])
 
 export function locate(node: Node): Location {
@@ -130,7 +133,7 @@ export class Translator {
   private stack: N[] = []
   private pc: Expr[] = []
   private instance: LawInstance | undefined
-  private names = { law: new Set<string>(), domain: new Set<string>(), expect: new Set<string>() }
+  private names = { law: new Set<string>(), domain: new Set<string>(), expect: new Set<string>(), describe: new Set<string>() }
 
   constructor(program: Program, checker: Checker, moduleName = "pudding") {
     this.program = program
@@ -138,49 +141,128 @@ export class Translator {
     this.moduleName = moduleName
   }
 
-  translateFile(file: SourceFile): Law[] {
+  /**
+   * Translate every law of a file. `selected` decides by full name which laws
+   * to check; the rest are reported as skipped without being read.
+   */
+  translateFile(file: SourceFile, selected: (name: string) => boolean = () => true): Law[] {
     this.reached.add(file.fileName)
-    this.names = { law: new Set(), domain: new Set(), expect: new Set() }
+    this.names = { law: new Set(), domain: new Set(), expect: new Set(), describe: new Set() }
     for (const statement of file.statements as readonly N[]) {
       if (statement.kind !== K.ImportDeclaration || statement.moduleSpecifier.text !== this.moduleName) continue
       const bindings = statement.importClause?.namedBindings
       if (bindings?.kind !== K.NamedImports) continue
       for (const element of bindings.elements) {
-        const imported = (element.propertyName ?? element.name).text as "law" | "domain" | "expect"
+        const imported = (element.propertyName ?? element.name).text as "law" | "domain" | "expect" | "describe"
         if (imported in this.names) this.names[imported].add(element.name.text)
       }
     }
-    const laws: Law[] = []
-    for (const statement of file.statements as readonly N[]) {
-      if (statement.kind !== K.ExpressionStatement) continue
-      const call = statement.expression
-      if (this.isCallTo(call, this.names.law)) laws.push(this.translateLaw(call, laws.length))
-      else {
-        laws.push({
-          name: sourceText(statement), ...locate(statement), index: -1, proof: undefined, instances: [], expectSites: new Map(),
-          problem: { kind: "invalid", message: "only law() calls and declarations are allowed at the top level of a law file", ...locate(statement) },
-        })
-      }
-    }
+    const laws: (Law & { only?: boolean })[] = []
+    this.translateBlock(file.statements as readonly N[], undefined, [], "run", laws, selected)
+    // As in Vitest, `.only` narrows the file to the laws that carry it.
+    if (laws.some(law => law.only)) for (const law of laws) if (!law.only && law.mode === "run") this.skip(law)
     return laws
+  }
+
+  private skip(law: Law) {
+    law.mode = "skip"
+    law.instances = []
+    law.problem = undefined
+  }
+
+  /** The `law` or `describe` call a statement makes, with its `.skip`, `.only` or `.todo` modifier. */
+  private testCall(node: N): { kind: "law" | "describe"; modifier: string | undefined } | undefined {
+    if (node?.kind !== K.CallExpression) return undefined
+    let callee = node.expression
+    let modifier: string | undefined
+    if (callee.kind === K.PropertyAccessExpression && callee.expression.kind === K.Identifier) {
+      modifier = callee.name.text
+      callee = callee.expression
+    }
+    if (callee.kind !== K.Identifier) return undefined
+    const kind = this.names.law.has(callee.text) ? "law" : this.names.describe.has(callee.text) ? "describe" : undefined
+    return kind && { kind, modifier }
+  }
+
+  /**
+   * Walk the statements of a law file or of a `describe` callback. At the top
+   * level, declarations are resolved on demand through the checker; inside
+   * `describe` they are local, so they are evaluated into `env` as they appear.
+   */
+  private translateBlock(
+    statements: readonly N[], env: Env | undefined, path: string[], mode: "run" | "skip" | "only",
+    laws: (Law & { only?: boolean })[], selected: (name: string) => boolean,
+  ) {
+    const invalid = (statement: N, message: string) => laws.push({
+      name: sourceText(statement), ...locate(statement), index: -1, mode: "run", proof: undefined, instances: [], expectSites: new Map(),
+      problem: { kind: "invalid", message, ...locate(statement) },
+    })
+    for (const statement of statements) {
+      if (statement.kind !== K.ExpressionStatement) {
+        if (!env || DECLARATIONS_WITHOUT_VALUE.has(statement.kind)) continue
+        try {
+          if (statement.kind === K.VariableStatement) this.declare(statement, env)
+          else if (statement.kind === K.FunctionDeclaration) env.set(statement.name.text, { k: "closure", node: statement, env })
+          else invalid(statement, "only laws and declarations are allowed inside describe()")
+        } catch (error) {
+          if (!(error instanceof Unsupported)) throw error
+          invalid(error.node ?? statement, error.message)
+        }
+        continue
+      }
+      const call = statement.expression
+      const test = this.testCall(call)
+      if (!test) {
+        invalid(statement, "only law() and describe() calls and declarations are allowed in a law file")
+        continue
+      }
+      const { modifier } = test
+      if (modifier !== undefined && modifier !== "skip" && modifier !== "only" && !(modifier === "todo" && test.kind === "law")) {
+        invalid(statement, `\`.${modifier}\` is not a modifier Pudding knows; use .skip, .only or .todo`)
+        continue
+      }
+      const own = modifier === "skip" || mode === "skip" ? "skip" : modifier === "only" || mode === "only" ? "only" : "run"
+      const nameNode = call.arguments[0]
+      if (nameNode?.kind !== K.StringLiteral && nameNode?.kind !== K.NoSubstitutionTemplateLiteral) {
+        invalid(statement, `the first argument of ${test.kind}() must be a string literal`)
+        continue
+      }
+      if (test.kind === "describe") {
+        const body = call.arguments[1]
+        if ((body?.kind !== K.ArrowFunction && body?.kind !== K.FunctionExpression) || body.body.kind !== K.Block || body.parameters.length) {
+          invalid(statement, "describe() takes a name and a callback with a block body")
+          continue
+        }
+        this.translateBlock(body.body.statements, (env ?? new Env()).child(), [...path, nameNode.text], own, laws, selected)
+        continue
+      }
+      const name = [...path, nameNode.text].join(" > ")
+      const index = laws.filter(law => law.index >= 0).length
+      if (modifier === "todo" || own === "skip" || !selected(name)) {
+        laws.push({
+          name, ...locate(call), index, mode: modifier === "todo" ? "todo" : "skip", proof: undefined, instances: [], expectSites: new Map(), problem: undefined,
+        })
+        continue
+      }
+      const law: Law & { only?: boolean } = this.translateLaw(call, index, name, env)
+      if (own === "only") law.only = true
+      laws.push(law)
+    }
   }
 
   private isCallTo(node: N, names: Set<string>): boolean {
     return node?.kind === K.CallExpression && node.expression.kind === K.Identifier && names.has(node.expression.text)
   }
 
-  private translateLaw(call: N, index: number): Law {
+  private translateLaw(call: N, index: number, name: string, scope: Env | undefined): Law {
     const args = call.arguments as N[]
     const law: Law = {
-      name: sourceText(call), ...locate(call), index, proof: undefined, instances: [], expectSites: new Map(), problem: undefined,
+      name, ...locate(call), index, mode: "run", proof: undefined, instances: [], expectSites: new Map(), problem: undefined,
     }
     const invalid = (message: string, node: Node) => {
       law.problem = { kind: "invalid", message, ...locate(node) }
       return law
     }
-    const nameNode = args[0]
-    if (nameNode?.kind !== K.StringLiteral && nameNode?.kind !== K.NoSubstitutionTemplateLiteral) return invalid("the first argument of law() must be a string literal", call)
-    law.name = nameNode.text
     const hasDomain = this.isCallTo(args[1], this.names.domain)
     const callback = args[hasDomain ? 2 : 1]
     const options = args[hasDomain ? 3 : 2]
@@ -215,7 +297,7 @@ export class Translator {
         this.instance = instance
         this.pc = []
         this.stack = []
-        const env = new Env()
+        const env = scope ? scope.child() : new Env()
         if (instance.arg) this.bind(callback.parameters[0].name, this.valueOf(instance.arg), env, true)
         const body = callback.body
         if (body.kind === K.Block) this.execLaw(body.statements, 0, env, () => {})

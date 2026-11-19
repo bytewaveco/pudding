@@ -9,7 +9,11 @@ export interface Config {
   include?: string[]
   /** Globs to leave out. `node_modules` is always left out. */
   exclude?: string[]
-  /** Path of the tsconfig that contains the law files. Default: `tsconfig.json`. */
+  /**
+   * The tsconfig whose compiler options (paths, module resolution, strictness)
+   * the law files are read with. Default: `tsconfig.json` when it exists. The
+   * law files do not have to be included by it.
+   */
   tsconfig?: string
   /** Fail when a law is checked by execution only, without a proof. */
   strict?: boolean
@@ -19,6 +23,8 @@ export interface Config {
   cache?: boolean
   /** Path of the Lean binary. */
   lean?: string
+  /** How results are printed. Default: `default`, or `github` inside GitHub Actions. */
+  reporter?: "default" | "verbose" | "json" | "github"
 }
 
 export function defineConfig(config: Config): Config {
@@ -47,7 +53,7 @@ export interface Matchers<T> {
 
 interface Registered {
   name: string
-  callback: (input: unknown) => void
+  callback: ((input: unknown) => void) | undefined
 }
 
 const REGISTRY = Symbol.for("pudding.registry")
@@ -57,15 +63,39 @@ export function domain<T>(): Domain<T> {
   return {} as Domain<T>
 }
 
-/** State a law that must hold for every value of the domain. */
-export function law<T>(name: string, inputs: Domain<T>, check: (input: T) => void, options?: LawOptions): void
-/** State a law about fixed values. */
-export function law(name: string, check: () => void, options?: LawOptions): void
-export function law(name: string, second: unknown, third?: unknown): void {
+function register(name: string, second?: unknown, third?: unknown): void {
   const registry = (globalThis as Record<symbol, unknown>)[REGISTRY] as Registered[] | undefined
-  const callback = (typeof second === "function" ? second : third) as Registered["callback"]
+  const callback = (typeof second === "function" ? second : typeof third === "function" ? third : undefined) as Registered["callback"]
   registry?.push({ name, callback })
 }
+
+export interface LawFunction {
+  /** State a law that must hold for every value of the domain. */
+  <T>(name: string, inputs: Domain<T>, check: (input: T) => void, options?: LawOptions): void
+  /** State a law about fixed values. */
+  (name: string, check: () => void, options?: LawOptions): void
+}
+
+export interface Law extends LawFunction {
+  /** List the law without checking it. */
+  skip: LawFunction
+  /** Check only the laws of this file that are marked `only`. */
+  only: LawFunction
+  /** Record a law that is still to be written. */
+  todo(name: string): void
+}
+
+export const law: Law = Object.assign(register as LawFunction, { skip: register as LawFunction, only: register as LawFunction, todo: register })
+
+export interface Describe {
+  /** Group laws under a shared name. */
+  (name: string, body: () => void): void
+  skip(name: string, body: () => void): void
+  only(name: string, body: () => void): void
+}
+
+const group = (_name: string, body: () => void) => body()
+export const describe: Describe = Object.assign(group, { skip: group, only: group })
 
 export class ExpectationFailed extends Error {}
 

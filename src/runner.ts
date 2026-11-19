@@ -23,11 +23,15 @@ const RUNTIME_BUDGET = 4_000
 export interface RunOptions extends Config {
   /** Project directory. Default: the current directory. */
   cwd?: string
+  /** Only check law files whose path contains one of these. */
+  files?: string[]
+  /** Only check laws whose full name matches this regular expression. */
+  name?: string
   /** Write the generated Lean source to this file. */
   emit?: string
 }
 
-export type Status = "proved" | "checked" | "sampled" | "failed"
+export type Status = "proved" | "checked" | "sampled" | "failed" | "skipped" | "todo"
 
 export interface Finding {
   kind: "counterexample" | "unproved" | "vacuous" | "throws" | "mismatch" | "unsupported" | "invalid"
@@ -71,6 +75,8 @@ export interface Report {
   timings: { typescript: number; prove: number; retry: number; crossCheck: number }
   /** True when nothing changed since the previous run and its result was reused. */
   replayed: boolean
+  /** The reporter the project's configuration asks for, if any. */
+  reporter?: Config["reporter"]
   lean: string
 }
 
@@ -87,9 +93,11 @@ export function displayPath(cwd: string, file: string): string {
   return path === "" || path.startsWith("..") ? file : path
 }
 
-const hash = (text: string) => createHash("sha256").update(text).digest("hex").slice(0, 32)
 const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)))
+/** The name law files import from, read from this package so a rename needs no code change. */
+export const packageName = (JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8")) as { name: string }).name
 
+const hash = (text: string) => createHash("sha256").update(text).digest("hex").slice(0, 32)
 async function loadConfig(cwd: string): Promise<{ config: Config; file: string | undefined }> {
   for (const name of ["pudding.config.ts", "pudding.config.mts", "pudding.config.js", "pudding.config.mjs"]) {
     const file = join(cwd, name)
@@ -164,6 +172,33 @@ function stamp(file: string): string {
 function signatureOf(parts: unknown, files: string[]): string {
   const own = dirname(fileURLToPath(import.meta.url))
   return hash(JSON.stringify([parts, files.map(stamp), readdirSync(own).map(name => stamp(join(own, name)))]))
+}
+
+/**
+ * Write the TypeScript project Pudding reads the laws through: the law files
+ * as roots, on top of the project's own compiler options. This is why law
+ * files need no entry in anyone's `include`, and why a project without a
+ * tsconfig still works.
+ */
+function writeProject(directory: string, base: string | undefined, lawFiles: string[]): string {
+  const defaults = join(directory, "tsconfig.defaults.json")
+  const project = join(directory, "tsconfig.json")
+  const write = (file: string, value: unknown) => {
+    const text = JSON.stringify(value, null, 2) + "\n"
+    if (!existsSync(file) || readFileSync(file, "utf8") !== text) writeFileSync(file, text)
+  }
+  mkdirSync(directory, { recursive: true })
+  write(defaults, {
+    compilerOptions: { target: "ESNext", module: "Preserve", moduleResolution: "Bundler", strict: true, skipLibCheck: true },
+  })
+  write(project, {
+    extends: base ? [defaults, base] : [defaults],
+    compilerOptions: { noEmit: true, allowImportingTsExtensions: true, composite: false, incremental: false, declaration: false },
+    files: lawFiles,
+    include: [],
+    exclude: [],
+  })
+  return project
 }
 
 // ------------------------------------------------------------------ search
@@ -294,7 +329,7 @@ function buildArgument(shape: ArgShape, env: Map<string, Scalar>): unknown {
 
 interface RuntimeLaw {
   name: string
-  callback: (input: unknown) => void
+  callback: ((input: unknown) => void) | undefined
 }
 
 async function loadRuntime(file: string): Promise<RuntimeLaw[] | string> {
@@ -321,9 +356,9 @@ function modelHolds(instance: LawInstance, env: Map<string, Scalar>): boolean {
   }
 }
 
-function runtimeHolds(law: RuntimeLaw, argument: unknown): boolean {
+function runtimeHolds(callback: (input: unknown) => void, argument: unknown): boolean {
   try {
-    law.callback(argument)
+    callback(argument)
     return true
   } catch {
     return false
@@ -341,7 +376,7 @@ interface Pending {
 
 function emptyReport(lean: string): Report {
   return {
-    ok: false, laws: [], errors: [], counts: { proved: 0, checked: 0, sampled: 0, failed: 0 },
+    ok: false, laws: [], errors: [], counts: { proved: 0, checked: 0, sampled: 0, failed: 0, skipped: 0, todo: 0 },
     obligations: 0, cachedObligations: 0, cases: 0, durationMs: 0, replayed: false, lean,
     retried: 0, timings: { typescript: 0, prove: 0, retry: 0, crossCheck: 0 },
   }
@@ -353,32 +388,45 @@ export async function run(options: RunOptions = {}): Promise<Report> {
   const loaded = await loadConfig(cwd)
   const given = Object.fromEntries(Object.entries(options).filter(([, value]) => value !== undefined)) as RunOptions
   const config: RunOptions = { ...loaded.config, ...given }
+  const filters = config.files ?? []
   const lawFiles = globSync(config.include ?? ["**/*.law.ts"], {
     cwd, exclude: ["**/node_modules/**", "**/.toolchain/**", ...(config.exclude ?? [])],
-  }).sort().map(file => resolve(cwd, file))
-  const tsconfig = resolve(cwd, config.tsconfig ?? "tsconfig.json")
+  }).sort().map(file => resolve(cwd, file)).filter(file => !filters.length || filters.some(filter => displayPath(cwd, file).includes(filter)))
+  const base = resolve(cwd, config.tsconfig ?? "tsconfig.json")
   const cacheFile = cachePath(cwd)
   const cache = config.cache === false ? loadCache("") : loadCache(cacheFile)
   const lean = locateLean(config, cwd)
   const version = leanVersion(lean, cache)
   const report = emptyReport(version)
+  if (config.reporter) report.reporter = config.reporter
   const finish = () => {
     report.durationMs = Math.round(performance.now() - started)
     return report
   }
   if (!lawFiles.length) {
-    report.errors.push("no law files were found")
+    report.errors.push(filters.length ? `no law file matches ${filters.map(f => `\`${f}\``).join(" or ")}` : "no law files were found")
     return finish()
   }
-  if (!existsSync(tsconfig)) {
-    report.errors.push(`${displayPath(cwd, tsconfig)} was not found; Pudding reads law files through a TypeScript project`)
+  if (config.tsconfig && !existsSync(base)) {
+    report.errors.push(`the tsconfig \`${config.tsconfig}\` named in the configuration was not found`)
     return finish()
+  }
+  let selected: (name: string) => boolean = () => true
+  if (config.name) {
+    try {
+      const pattern = new RegExp(config.name)
+      selected = name => pattern.test(name)
+    } catch {
+      report.errors.push(`\`${config.name}\` is not a valid regular expression`)
+      return finish()
+    }
   }
 
-  const identity = { cache: CACHE_VERSION, version, lawFiles, tsconfig: stamp(tsconfig), config: { ...config, emit: undefined, cwd: undefined } }
+  const identity = { cache: CACHE_VERSION, version, lawFiles, tsconfig: stamp(base), config: { ...config, emit: undefined, cwd: undefined, reporter: undefined } }
   if (config.cache !== false && !config.emit && cache.replay && cache.replay.signature === signatureOf(identity, cache.replay.sources)) {
     return { ...cache.replay.report, replayed: true, durationMs: Math.round(performance.now() - started) }
   }
+  const tsconfig = writeProject(dirname(cacheFile), existsSync(base) ? base : undefined, lawFiles)
 
   // Read and translate the laws.
   const reading = performance.now()
@@ -389,7 +437,7 @@ export async function run(options: RunOptions = {}): Promise<Report> {
     const snapshot = api.updateSnapshot({ openProjects: [tsconfig] })
     const project = snapshot.getProject(tsconfig) ?? snapshot.getProjects()[0]
     if (!project) {
-      report.errors.push(`${displayPath(cwd, tsconfig)} could not be opened as a TypeScript project`)
+      report.errors.push("TypeScript could not open the project Pudding generated for the law files")
       return finish()
     }
     const { program, checker } = project
@@ -403,13 +451,13 @@ export async function run(options: RunOptions = {}): Promise<Report> {
     }
     const readable = lawFiles.filter(file => {
       if (program.getSourceFile(file)) return true
-      report.errors.push(`${displayPath(cwd, file)} is not included by ${displayPath(cwd, tsconfig)}`)
+      report.errors.push(`${displayPath(cwd, file)} could not be read by TypeScript`)
       return false
     })
     readable.forEach(diagnose)
     if (report.errors.length) return finish()
-    const translator = new Translator(program, checker)
-    for (const file of readable) laws.push(...translator.translateFile(program.getSourceFile(file)!))
+    const translator = new Translator(program, checker, packageName)
+    for (const file of readable) laws.push(...translator.translateFile(program.getSourceFile(file)!, selected))
     for (const file of translator.reached) if (!readable.includes(file)) diagnose(file)
     if (report.errors.length) return finish()
     sources = program.getSourceFileNames().filter(name => isAbsolute(name) && !name.includes("/node_modules/") && existsSync(name))
@@ -426,7 +474,7 @@ export async function run(options: RunOptions = {}): Promise<Report> {
       name: law.name, file: law.file, line: law.line, column: law.column, status: "proved", findings: [], notes: [], obligations: 0, cases: 0,
     }
     lawReports.set(law, entry)
-    if (law.problem) continue
+    if (law.problem || law.mode !== "run") continue
     try {
       const batch: Pending[] = []
       for (const instance of law.instances) {
@@ -518,7 +566,7 @@ export async function run(options: RunOptions = {}): Promise<Report> {
   // An expectation whose condition can never be true proves nothing.
   const vacuityChecks: { entry: LawReport; site: { line: number; column: number; text: string }; law: Law; checks: Check[] }[] = []
   for (const law of laws) {
-    if (law.problem) continue
+    if (law.problem || law.mode !== "run") continue
     const entry = lawReports.get(law)!
     for (const [key, site] of law.expectSites) {
       const reaching = law.instances.flatMap(instance => instance.obligations
@@ -561,12 +609,13 @@ export async function run(options: RunOptions = {}): Promise<Report> {
         : runtime.length !== inFile.length ? "the law file registered a different number of laws when executed" : undefined
       for (const law of inFile) {
         const entry = lawReports.get(law)!
-        if (law.problem?.kind === "invalid") continue
-        if (reason || typeof runtime === "string") {
-          entry.notes.push(`not compared with the running code: ${reason}`)
+        if (law.problem?.kind === "invalid" || law.mode !== "run") continue
+        const real = typeof runtime === "string" ? undefined : runtime[law.index]
+        if (reason || !real?.callback) {
+          entry.notes.push(`not compared with the running code: ${reason ?? "the law was not registered when the file was executed"}`)
           continue
         }
-        const real = runtime[law.index]!
+        const callback = real.callback
         let exhaustive = true
         let executed = 0
         for (const instance of law.instances) {
@@ -574,7 +623,7 @@ export async function run(options: RunOptions = {}): Promise<Report> {
           exhaustive &&= space.exhaustive
           space.each(env => {
             executed++
-            const actual = runtimeHolds(real, instance.arg ? buildArgument(instance.arg, env) : undefined)
+            const actual = runtimeHolds(callback, instance.arg ? buildArgument(instance.arg, env) : undefined)
             if (law.problem) {
               if (actual) return false
               entry.findings.push({
@@ -602,6 +651,7 @@ export async function run(options: RunOptions = {}): Promise<Report> {
   // Settle each law's status.
   for (const law of laws) {
     const entry = lawReports.get(law)!
+    if (law.mode !== "run") entry.status = law.mode === "todo" ? "todo" : "skipped"
     if (law.problem) {
       const { kind, message, file, line, column } = law.problem
       if (kind === "invalid") entry.findings.push({ kind, message, file, line, column })
@@ -613,7 +663,7 @@ export async function run(options: RunOptions = {}): Promise<Report> {
       }
     }
     if (entry.findings.length) entry.status = "failed"
-    if (config.strict && entry.status !== "proved" && entry.status !== "failed") {
+    if (config.strict && (entry.status === "checked" || entry.status === "sampled")) {
       entry.status = "failed"
       entry.findings.push({ kind: "unsupported", message: "strict mode requires a proof, and this law was only executed", file: law.file, line: law.line, column: law.column })
     }
@@ -627,7 +677,7 @@ export async function run(options: RunOptions = {}): Promise<Report> {
   if (config.cache !== false) {
     const saved: Cache = { version: CACHE_VERSION, lean: cache.lean, proved: [...used] }
     if (!config.emit) {
-      const files = [...new Set([...sources, tsconfig, ...(loaded.file ? [loaded.file] : []), join(cwd, "package.json")])]
+      const files = [...new Set([...sources, base, ...(loaded.file ? [loaded.file] : []), join(cwd, "package.json")])]
       saved.replay = { signature: signatureOf(identity, files), sources: files, report }
     }
     mkdirSync(dirname(cacheFile), { recursive: true })
