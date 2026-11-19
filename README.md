@@ -138,7 +138,10 @@ law("a product of positives is positive", domain<[bigint, bigint]>(), ([a, b]) =
 
 `pudding --emit laws.lean` writes the theorems, so you or an agent can work on
 a proof with ordinary Lean tooling. Nobody has to review the script: Lean
-rejects it if it is wrong or unfinished. The trimmed Lean that `install-lean` leaves holds
+rejects it if it is wrong or unfinished. A script is a sequence of tactics and
+nothing else. It is checked in a file of its own, and it may not contain
+comments, string literals or unbalanced parentheses, so that it cannot go on
+to define anything. The trimmed Lean that `install-lean` leaves holds
 only the part of Lean's library Pudding itself uses; a proof that names other
 lemmas needs `pudding install-lean --full` or your own Lean.
 

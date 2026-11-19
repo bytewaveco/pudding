@@ -36,10 +36,28 @@ const FALLBACK_TACTIC = "first | grind | (intros; simp_all; done) | (intros; sim
 const MAX_TERM_SIZE = 200_000
 const MAX_SPECIALIZATIONS = 512
 
+/**
+ * Why an author's proof script cannot be used, if it cannot. The script is
+ * placed inside parentheses in the theorem, and that only confines it if every
+ * parenthesis in its text is one Lean sees. So the things that can hide a
+ * parenthesis from Lean (comments, string and character literals, quoted
+ * names) are not allowed, and the parentheses must balance.
+ */
+export function scriptProblem(script: string): string | undefined {
+  if (/--|\/-|"|«/.test(script)) return "a proof script may not contain comments, string literals or «quoted names»"
+  if (/'[()\[\]{}⟨⟩\\]/.test(script)) return "a proof script may not contain character literals"
+  let depth = 0
+  for (const char of script) {
+    if (char === "(") depth++
+    else if (char === ")" && --depth < 0) break
+  }
+  return depth === 0 ? undefined : "the parentheses in the proof script do not balance"
+}
+
 /** How a statement is proved: by evaluating every case, by the default automation, or by the author's script. */
 export function proofKind(statement: string): "finite" | "automatic" | "authored" {
   if (statement.endsWith(` := by ${FINITE_TACTIC}`)) return "finite"
-  return statement.endsWith(` := by ${DEFAULT_TACTIC}`) ? "automatic" : "authored"
+  return statement.endsWith(` := by ${DEFAULT_TACTIC}`) || statement.endsWith(` := by ${FALLBACK_TACTIC}`) ? "automatic" : "authored"
 }
 
 /** The same statement with the stronger, slower automation. Only meaningful for an automatic statement. */
@@ -196,7 +214,9 @@ export function checksFor(binders: readonly Binder[], guard: Expr, claim: Expr, 
   if (combinations > MAX_SPECIALIZATIONS) {
     throw new TooLarge(`the finite inputs have ${combinations} combinations alongside unbounded ones; the limit is ${MAX_SPECIALIZATIONS}`)
   }
-  const script = tactic === undefined ? DEFAULT_TACTIC : tactic.includes("\n") ? "\n  " + tactic.trim().split("\n").join("\n  ") : tactic
+  // An author's script goes inside parentheses, so that it has to be a complete
+  // tactic sequence and nothing after it can be read as part of it.
+  const script = tactic === undefined ? DEFAULT_TACTIC : `(\n  ${tactic.trim().split("\n").join("\n  ")}\n)`
   const checks: Check[] = []
   const visit = (index: number, values: Map<string, Expr>) => {
     if (index < finite.length) {
@@ -257,7 +277,7 @@ function runFile(lean: string, source: string, directory: string, name: string):
 /** The axioms of Lean's own logic. A proof that rests on anything else, `sorry` above all, is not a proof. */
 const ACCEPTED_AXIOMS = new Set(["propext", "Classical.choice", "Quot.sound"])
 
-async function runChunk(lean: string, header: string, statements: string[], directory: string, name: string): Promise<LeanOutcome[]> {
+async function runChunk(lean: string, header: string, statements: string[], directory: string, name: string, strict = false): Promise<LeanOutcome[]> {
   // Each theorem is followed by a question about it: which axioms does it
   // rest on? A theorem counts as proved only when Lean reports no error for
   // it *and* answers that question acceptably. Silence is never taken for
@@ -290,7 +310,9 @@ async function runChunk(lean: string, header: string, statements: string[], dire
     let index = -1
     for (let i = 0; i < firstLine.length && firstLine[i]! <= line; i++) index = i
     if (message.severity === "error") {
-      if (index < 0 || line >= sentinel) throw new Error(`Lean rejected the generated preamble: ${message.data}`)
+      // An error after the last theorem means something in the file disturbed what follows it. Trust none of it.
+      if (line >= sentinel) return statements.map(() => ({ ok: false, message: `Lean reported an error after the theorems: ${message.data}` }))
+      if (index < 0) throw new Error(`Lean rejected the generated preamble: ${message.data}`)
       // An error on the question itself only repeats that the theorem above it failed.
       if (line !== askedAt[index] || !failed.has(index)) reject(index, message.data)
     } else if (index >= 0 && line === askedAt[index] && message.severity === "information") {
@@ -303,21 +325,39 @@ async function runChunk(lean: string, header: string, statements: string[], dire
     }
   }
   for (const index of failed) outcomes[index]!.ok = false
+  // A file holding an author's script must be clean throughout: an error anywhere means Lean read something as more than a proof.
+  if (strict && messages.some(message => message.severity === "error")) for (const outcome of outcomes) outcome.ok = false
   for (const outcome of outcomes) if (!outcome.ok && !outcome.message) outcome.message = "Lean did not confirm this theorem"
   return outcomes
 }
 
-/** Check each statement, in parallel across processes when there are many. */
-export async function prove(lean: string, header: string, statements: string[], processes = availableParallelism()): Promise<LeanOutcome[]> {
+/**
+ * Check each statement, in parallel across processes when there are many.
+ *
+ * Statements Pudding generated share files. A statement that carries an
+ * author's proof script gets a file of its own (`alone`), with any error in
+ * that file counting against it: Lean recovers from a syntax error by reading
+ * on from the next command, so text in a script could otherwise define things
+ * that change what the theorems after it mean.
+ */
+export async function prove(lean: string, header: string, statements: string[], processes = availableParallelism(), alone = false): Promise<LeanOutcome[]> {
   if (!statements.length) return []
   const directory = await mkdtemp(join(tmpdir(), "pudding-"))
   try {
-    // Starting Lean costs little next to proving, so spread the work widely.
-    const workers = Math.max(1, Math.min(processes, Math.ceil(statements.length / 8)))
-    const size = Math.ceil(statements.length / workers)
     const chunks: string[][] = []
-    for (let i = 0; i < statements.length; i += size) chunks.push(statements.slice(i, i + size))
-    const results = await Promise.all(chunks.map((chunk, i) => runChunk(lean, header, chunk, directory, `Proof${i}.lean`)))
+    if (alone) for (const statement of statements) chunks.push([statement])
+    else {
+      // Starting Lean costs little next to proving, so spread the work widely.
+      const workers = Math.max(1, Math.min(processes, Math.ceil(statements.length / 8)))
+      const size = Math.ceil(statements.length / workers)
+      for (let i = 0; i < statements.length; i += size) chunks.push(statements.slice(i, i + size))
+    }
+    const results: LeanOutcome[][] = []
+    // At most one process per core at a time.
+    for (let i = 0; i < chunks.length; i += Math.max(1, processes)) {
+      const wave = chunks.slice(i, i + Math.max(1, processes))
+      results.push(...await Promise.all(wave.map((chunk, n) => runChunk(lean, header, chunk, directory, `Proof${i + n}.lean`, alone))))
+    }
     return results.flat()
   } finally {
     await rm(directory, { recursive: true, force: true })

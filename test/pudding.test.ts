@@ -386,6 +386,40 @@ describe("the Lean encoding", () => {
   })
 })
 
+describe("proof scripts", () => {
+  test("a script can only be a proof of its own theorem", async () => {
+    const report = await run({ cwd: join(fixtures, "scripts"), cache: false })
+    for (const entry of report.laws) {
+      const expected = /^(REJECTED|FALSE)/.test(entry.name) ? "failed" : "proved"
+      assert.equal(entry.status, expected, `${entry.name}: ${JSON.stringify(entry.findings)}`)
+    }
+    // The law after the tampering script is refuted on its merits, so the script changed nothing for it.
+    assert.equal(law(report, "FALSE: a law after the tampering script").findings[0]?.kind, "counterexample")
+    assert.match(law(report, "REJECTED: a script that closes its own parentheses").findings[0]?.message ?? "", /parentheses in the proof script do not balance/)
+    assert.match(law(report, "REJECTED: a script that hides a parenthesis in a comment").findings[0]?.message ?? "", /may not contain comments/)
+  })
+
+  test("a script that rests on anything but the standard axioms is rejected", async () => {
+    const statement = (script: string) => ` : (((2 : Int) + 2) == 4) = true := by (\n  ${script}\n)`
+    const [kernel, compiler, unfinished] = await prove(lean, "import Init", [statement("decide"), statement("native_decide"), statement("sorry")], undefined, true)
+    assert.equal(kernel?.ok, true)
+    assert.equal(compiler?.ok, false)
+    assert.match(compiler?.message ?? "", /which Pudding does not accept/)
+    assert.equal(unfinished?.ok, false)
+    assert.match(unfinished?.message ?? "", /unfinished/)
+  })
+
+  test("a script that defines things after its proof cannot change another theorem in the same file", async () => {
+    // Not how Pudding runs scripts (each gets its own file), but the reason it does.
+    const tampering = " (x : Int) : (x == x) = true := by (\n  simp\n  macro_rules | `($a == $b) => `(true)\n)"
+    const victim = " (x : Int) : (x == x + 1) = true := by rfl"
+    const together = await prove(lean, "import Init", [tampering, victim], 1)
+    assert.equal(together[0]?.ok, false)
+    const apart = await prove(lean, "import Init", [tampering, victim], undefined, true)
+    assert.deepEqual(apart.map(outcome => outcome.ok), [false, false])
+  })
+})
+
 test("random programs: a true law is proved or refused, a false one is never proved", () => {
   // A small fixed sample of the differential fuzzer (scripts/fuzz.mjs), with and without executing the laws.
   for (const extra of [[], ["--cross-check"], ["--unbounded"]]) {

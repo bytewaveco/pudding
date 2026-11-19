@@ -18,7 +18,7 @@ import * as ir from "./ir.ts"
 import type { Obligation } from "./ir.ts"
 import type { FileOutcome, Job, RuntimeMap } from "./crosscheck.ts"
 import { findInput, showInputs, showValue } from "./search.ts"
-import { checksFor, FALLBACK_HEADER, FAST_HEADER, FULL_HEADER, proofKind, prove, render, TooLarge, withFallback, type Check } from "./lean.ts"
+import { checksFor, FALLBACK_HEADER, FAST_HEADER, FULL_HEADER, proofKind, prove, render, scriptProblem, TooLarge, withFallback, type Check } from "./lean.ts"
 import { Translator, type Law, type LawInstance } from "./translate.ts"
 
 export const MINIMUM_LEAN = [4, 36, 0] as const
@@ -424,6 +424,11 @@ export async function run(options: RunOptions = {}): Promise<Report> {
     }
     lawReports.set(law, entry)
     if (law.problem || law.mode !== "run") continue
+    const unusable = law.proof === undefined ? undefined : scriptProblem(law.proof)
+    if (unusable) {
+      law.problem = { kind: "invalid", message: unusable, file: law.file, line: law.line, column: law.column }
+      continue
+    }
     try {
       const batch: Pending[] = []
       for (const instance of law.instances) {
@@ -483,12 +488,16 @@ export async function run(options: RunOptions = {}): Promise<Report> {
   // name lemmas from anywhere in Lean's core library, so one that fails is
   // tried again with all of it, where the installed Lean has all of it.
   const proving = performance.now()
-  const first = await prove(lean, FAST_HEADER, fresh)
-  fresh.forEach((statement, i) => outcomes.set(statement, first[i]!))
-  const authored = fresh.filter((statement, i) => !first[i]!.ok && proofKind(statement) === "authored")
+  const generated = fresh.filter(statement => proofKind(statement) !== "authored")
+  const scripted = fresh.filter(statement => proofKind(statement) === "authored")
+  // A theorem with an author's script is checked in a file of its own.
+  const [first, own] = await Promise.all([prove(lean, FAST_HEADER, generated), prove(lean, FAST_HEADER, scripted, undefined, true)])
+  generated.forEach((statement, i) => outcomes.set(statement, first[i]!))
+  scripted.forEach((statement, i) => outcomes.set(statement, own[i]!))
+  const authored = scripted.filter((_, i) => !own[i]!.ok)
   if (authored.length) {
     try {
-      const again = await prove(lean, FULL_HEADER, authored)
+      const again = await prove(lean, FULL_HEADER, authored, undefined, true)
       authored.forEach((statement, i) => outcomes.set(statement, again[i]!))
     } catch {
       for (const statement of authored) {
@@ -514,7 +523,7 @@ export async function run(options: RunOptions = {}): Promise<Report> {
   // What the default automation could not close gets a slower second attempt
   // before the rejection is reported. Lean's first message is kept, because it
   // describes the goal best.
-  const retry = fresh.filter((statement, i) => !first[i]!.ok && proofKind(statement) === "automatic" && unexplained.has(statement))
+  const retry = generated.filter((statement, i) => !first[i]!.ok && proofKind(statement) === "automatic" && unexplained.has(statement))
   const second = await prove(lean, FALLBACK_HEADER, retry.map(withFallback))
   retry.forEach((statement, i) => {
     if (second[i]!.ok) outcomes.set(statement, second[i]!)
