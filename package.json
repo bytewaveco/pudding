@@ -69,5 +69,11 @@
     "laws",
     "property",
     "testing"
-  ]
+  ],
+  "optionalDependencies": {
+    "@bytewaveco/pudding-lean-darwin-arm64": "4.36.0",
+    "@bytewaveco/pudding-lean-darwin-x64": "4.36.0",
+    "@bytewaveco/pudding-lean-linux-arm64": "4.36.0",
+    "@bytewaveco/pudding-lean-linux-x64": "4.36.0"
+  }
 }
