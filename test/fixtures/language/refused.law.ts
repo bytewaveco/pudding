@@ -9,11 +9,11 @@ law("CHECKED: a closure that reads a reassigned variable", domain<boolean>(), fl
   expect(readsLater(flag)).toEqual(flag ? 2n : 1n)
 })
 
-law("SAMPLED: mutating an object in place", domain<bigint>(), amount => {
+law("an object the function made itself may be changed in place", domain<bigint>(), amount => {
   expect(mutatesObject(amount)).toEqual(amount)
 })
 
-law("SAMPLED: mutating an array in place", domain<bigint>(), amount => {
+law("an array the function made itself may be pushed to", domain<bigint>(), amount => {
   expect(pushes(amount)).toEqual(amount)
 })
 

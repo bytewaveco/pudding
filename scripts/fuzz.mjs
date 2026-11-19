@@ -145,6 +145,13 @@ class Generator {
       }
       return `(${literal(this.value(type))} as ${TS[type]})`
     }
+    // What an object or a list holds right now, which depends on every change made to it so far, through any name.
+    const stored = scope.visible().filter(e => (e.kind === "box" || e.kind === "list") && e.type === type)
+    if (stored.length && r.chance(0.3)) {
+      const chosen = r.pick(stored)
+      scope.noteRead(chosen.name)
+      return chosen.kind === "box" ? `${chosen.name}.${r.pick(["v", "w"])}` : `${chosen.name}[${r.chance(0.5) ? "0" : `${chosen.name}.length - 1`}]!`
+    }
     if (depth <= 0 || r.chance(0.2)) return leaf()
     const sub = t => this.expr(t, scope, depth - 1)
     const calls = scope.visible().filter(e => e.kind === "fn" && e.type === type && e.ready && !e.busy)
@@ -451,6 +458,136 @@ class Generator {
       scope.names.set(k, { kind: "var", type, mutable: false })
       return lines
     })
+    // Objects and lists changed in place. Two names may hold one object, a
+    // function may change what it is given, and a change may sit behind a
+    // condition or an early return: Node decides what each of those does.
+    const BOX = type => `{ v: ${TS[type]}; w: ${TS[type]} }`
+    const field = () => r.pick(["v", "w"])
+    const boxes = scope.visible().filter(e => e.kind === "box")
+    const lists = scope.visible().filter(e => e.kind === "list")
+    const update = (target, type) => {
+      const value = this.expr(type, scope, 2)
+      if (type === "big" || type === "num") {
+        if (r.chance(0.15)) return `${target}${r.pick(["++", "--"])}`
+        return `${target} ${r.pick(type === "num" || context.loop ? ["=", "+=", "-="] : ["=", "+=", "-=", "*="])} ${value}`
+      }
+      return `${target} ${type === "str" && !context.loop ? r.pick(["=", "+="]) : "="} ${value}`
+    }
+    add(1.6, () => {
+      const type = r.pick(TYPES)
+      const name = `b${this.counter++}`
+      const same = boxes.filter(b => b.type === type)
+      const other = () => {
+        const chosen = r.pick(same)
+        scope.noteRead(chosen.name)
+        return chosen.name
+      }
+      const roll = r.next()
+      const value = same.length && roll < 0.25 ? other()
+        : same.length && roll < 0.4 ? `{ ...${other()} }`
+        : same.length && roll < 0.5 ? `(${this.expr("bool", scope, 2)} ? ${other()} : ${other()})`
+        : `{ v: ${this.expr(type, scope, 2)}, w: ${this.expr(type, scope, 2)} }`
+      scope.names.set(name, { kind: "box", type })
+      return [`const ${name}: ${BOX(type)} = ${value}`]
+    })
+    add(1.2, () => {
+      const type = r.pick(TYPES)
+      const name = `l${this.counter++}`
+      const same = lists.filter(l => l.type === type)
+      const other = () => {
+        const chosen = r.pick(same)
+        scope.noteRead(chosen.name)
+        return chosen.name
+      }
+      const roll = r.next()
+      const value = same.length && roll < 0.25 ? other()
+        : same.length && roll < 0.4 ? `[...${other()}]`
+        : `[${Array.from({ length: 1 + r.int(2) }, () => this.expr(type, scope, 2)).join(", ")}]`
+      scope.names.set(name, { kind: "list", type })
+      return [`const ${name}: ${TS[type]}[] = ${value}`]
+    })
+    if (boxes.length) {
+      const pickBox = type => {
+        const chosen = r.pick(type ? boxes.filter(b => b.type === type) : boxes)
+        scope.noteRead(chosen.name)
+        return chosen
+      }
+      add(3, () => {
+        const box = pickBox()
+        return [update(`${box.name}.${field()}`, box.type)]
+      })
+      // A function that changes the object it is given, perhaps only on some paths.
+      add(1.5, () => {
+        const box = pickBox()
+        const type = box.type
+        const [fn, o, k] = [`g${this.counter++}`, `o${this.counter++}`, `v${this.counter++}`]
+        const inner = new Scope(scope, true)
+        inner.names.set(o, { kind: "box", type })
+        const body = []
+        if (r.chance(0.5)) body.push(`if (${this.expr("bool", inner, 2)}) return ${this.expr(type, inner, 1)}`)
+        body.push(`${o}.${field()} = ${this.expr(type, inner, 2)}`)
+        const lines = [`const ${fn} = (${o}: ${BOX(type)}): ${TS[type]} => {`, ...body.map(l => "  " + l), `  return ${o}.${field()}`, "}"]
+        const roll = r.next()
+        const call = roll < 0.5 ? `${fn}(${box.name})`
+          : roll < 0.8 ? `(${this.expr("bool", scope, 2)} ? ${fn}(${box.name}) : ${fn}(${pickBox(type).name}))`
+          : `${fn}({ ...${box.name} })`
+        lines.push(`const ${k}: ${TS[type]} = ${call}`)
+        if (r.chance(0.3)) lines.push(`${fn}(${pickBox(type).name})`)
+        scope.names.set(k, { kind: "var", type, mutable: false })
+        return lines
+      })
+      // A function that keeps changing the object it closed over.
+      add(0.8, () => {
+        const box = pickBox()
+        const t = `t${this.counter++}`
+        const inner = new Scope(scope, true)
+        const lines = [`const ${t} = (): void => {`, `  ${box.name}.${field()} = ${this.expr(box.type, inner, 2)}`, "}", `${t}()`]
+        if (r.chance(0.5)) lines.push(r.chance(0.5) ? `${t}()` : `if (${this.expr("bool", scope, 2)}) ${t}()`)
+        return lines
+      })
+      // One loop over two names, which may be two names for one object.
+      add(1, () => {
+        const box = pickBox()
+        const o = `o${this.counter++}`
+        const operator = box.type === "big" || box.type === "num" ? r.pick(["=", "+=", "-="]) : "="
+        return [`for (const ${o} of [${box.name}, ${pickBox(box.type).name}]) ${o}.${field()} ${operator} ${this.expr(box.type, scope, 1)}`]
+      })
+      // A change JavaScript may skip, where the model would always make it: this has to be refused.
+      add(0.4, () => {
+        const box = pickBox()
+        const k = `v${this.counter++}`
+        const change = `((o: ${BOX(box.type)}): boolean => { o.${field()} = ${this.expr(box.type, new Scope(scope, true), 1)}; return ${r.chance(0.5)} })(${box.name})`
+        const line = r.chance(0.6)
+          ? `const ${k}: boolean = (${this.expr("bool", scope, 2)} ${r.pick(["&&", "||"])} ${change})`
+          : `const ${k}: boolean = [${this.expr("bool", scope, 1)}, ${this.expr("bool", scope, 1)}].${r.pick(["some", "every"])}(e => e && ${change})`
+        scope.names.set(k, { kind: "var", type: "bool", mutable: false })
+        return [line]
+      })
+    }
+    if (lists.length) {
+      const pickList = () => {
+        const chosen = r.pick(lists)
+        scope.noteRead(chosen.name)
+        return chosen
+      }
+      add(2, () => {
+        const list = pickList()
+        const value = this.expr(list.type, scope, 2)
+        const roll = r.next()
+        return [roll < 0.5 ? `${list.name}.push(${value})` : `${list.name}[${roll < 0.75 ? "0" : `${list.name}.length - 1`}] = ${value}`]
+      })
+      // Everything in the list, folded into a value the rest of the function can use.
+      add(1, () => {
+        const list = pickList()
+        const k = `v${this.counter++}`
+        if (list.type === "big") {
+          scope.names.set(k, { kind: "var", type: "big", mutable: true })
+          return [`let ${k}: bigint = 0n`, `for (const x of ${list.name}) ${k} += x`]
+        }
+        scope.names.set(k, { kind: "var", type: "num", mutable: false })
+        return [`const ${k}: number = ${list.name}.length`]
+      })
+    }
     const total = choices.reduce((sum, [weight]) => sum + weight, 0)
     let roll = r.next() * total
     for (const [weight, make] of choices) if ((roll -= weight) < 0) return make()

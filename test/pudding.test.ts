@@ -131,8 +131,6 @@ describe("imperative code", () => {
     const note = (name: string) => law(report, name).notes[0] ?? ""
     assert.match(note("SAMPLED: a closure that writes an outer variable"), /uses `count`, a variable that is reassigned outside it/)
     assert.match(note("CHECKED: a closure that reads a reassigned variable"), /uses `value`, a variable that is reassigned outside it/)
-    assert.match(note("SAMPLED: mutating an object in place"), /changing an object or array in place is not modeled/)
-    assert.match(note("SAMPLED: mutating an array in place"), /changing an object or array in place is not modeled/)
     assert.match(note("SAMPLED: assignment used as a value"), /assignment used as a value/)
     assert.match(note("counted loops > SAMPLED: a loop bounded by a large input cannot be unrolled"), /how many times this loop runs depends on a value that is not known here/)
   })
@@ -447,6 +445,27 @@ test("a value that grows with every round of a loop is refused quickly, not hand
   assert.equal(entry.status, "sampled")
   assert.match(entry.notes.join("\n"), /too large to check/)
   assert.ok(report.durationMs < 20_000, `took ${report.durationMs} ms`)
+})
+
+test("objects changed in place: aliases, early exits and evaluation order follow JavaScript", async () => {
+  const report = await run({ cwd: join(fixtures, "mutation"), cache: false })
+  assert.deepEqual(report.errors, [])
+  assert.deepEqual(report.warnings, [])
+  assert.ok(report.laws.length >= 40)
+  for (const entry of report.laws) {
+    const name = entry.name.split(" > ").at(-1)!
+    // A refused law is executed instead, so it is never proved and never fails here.
+    const expected = name.startsWith("FALSE") ? ["failed"] : name.startsWith("REFUSED") ? ["checked", "sampled"] : ["proved"]
+    assert.ok(expected.includes(entry.status), `${entry.name}: ${entry.status} ${JSON.stringify(entry.findings)} ${entry.notes.join(" ")}`)
+  }
+  const note = (name: string) => law(report, name).notes[0] ?? ""
+  assert.match(note("REFUSED: changing an input in place"), /one of the law's inputs, a shared constant/)
+  assert.match(note("REFUSED: changing a module constant"), /one of the law's inputs, a shared constant/)
+  assert.match(note("REFUSED: an object that may be either of two is no longer changed"), /a condition choosing between two objects/)
+  assert.match(note("REFUSED: a push on one side of a condition that is not known"), /grows on only one side of a condition/)
+  assert.match(note("REFUSED: a change on the right of &&"), /the right side of `&&` changes an object in place/)
+  assert.match(note("REFUSED: a change inside a callback of some"), /a callback of `\.some` changes an object in place/)
+  assert.match(note("REFUSED: an object stored inside itself"), /inside itself/)
 })
 
 test("strings too long for Lean to compare are refused, never called false", async () => {

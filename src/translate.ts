@@ -82,8 +82,8 @@ export interface Law {
 type Value =
   /** `num` marks an integer expression that stands for a `number` rather than a bigint. */
   | { k: "scalar"; e: Expr; num?: boolean }
-  | { k: "record"; fields: Map<string, Value> }
-  | { k: "array"; items: Value[] }
+  | { k: "record"; fields: Map<string, Value>; own?: Ownership }
+  | { k: "array"; items: Value[]; own?: Ownership }
   | { k: "closure"; node: N; env: Env }
   | { k: "choice"; cond: Expr; a: Value; b: Value }
   /** The result of a path that throws. It never reaches a caller, so it merges away. */
@@ -92,6 +92,38 @@ type Value =
   | { k: "void" }
   /** A `const` or `let` whose block has been entered but whose declaration has not run yet. */
   | { k: "uninitialized" }
+
+/** An object or an array: a value that code can change in place. */
+type Stored = Extract<Value, { k: "record" | "array" }>
+
+/**
+ * What lets an object be changed in place. Values here are shared exactly
+ * where JavaScript shares them: two names for one object hold one `Stored`,
+ * so a change through either is seen through both. That only holds for an
+ * object the code being translated created itself, in the run of code that
+ * is still going on (`epoch`), and that has not been copied into a merge of
+ * two objects since. Everything else has no `own` and cannot be changed: the
+ * law's inputs, module constants, values a `describe` shares between laws.
+ */
+interface Ownership {
+  /** The run of code that created the object: one translation of a law, or one module constant's initializer. */
+  epoch: number
+  /** Creation order, to tell objects that existed at a saved moment from ones created after it. */
+  born: number
+}
+
+/** One change to an object, kept so that it can be undone. `previous` is undefined where an array had no such position. */
+interface Write {
+  target: Stored
+  slot: string | number
+  previous: Value | undefined
+}
+
+/** For each object changed since some moment, the values its changed slots ended up with. */
+type Changes = Map<Stored, Map<string | number, Value | undefined>>
+
+let epochs = 0
+let objectsCreated = 0
 
 type Shape =
   | { k: "scalar"; ty: Ty; values?: Scalar[]; num?: boolean; range?: [bigint, bigint] }
@@ -148,11 +180,13 @@ class Env {
   }
 }
 
-/** The variable state at one moment: values of the live reassignable variables, and how far the binding log had got. */
+/** The state at one moment: values of the live reassignable variables, how far the logs had got, and what existed. */
 interface Saved {
   values: Value[]
   logged: number
   scopes: number
+  written: number
+  objects: number
 }
 
 /** Where control goes when a statement list ends, breaks out of, or continues a loop. */
@@ -245,6 +279,10 @@ export class Translator {
   private readonly exportsUsed = new Map<Node, string>()
   /** Set when some file of the program replaces part of a built-in, which the models of built-ins cannot see. */
   private tampering: { message: string; node: Node } | undefined | null = null
+  /** The run of code whose objects may be changed in place right now. */
+  private epoch = 0
+  /** Every change made to an object in place since the current law instance started, oldest first. */
+  private writes: Write[] = []
   private readonly facts = new Map<Node, { assigned: Set<string>; mentioned: Set<string>; returnsValue: boolean; usesVar: Node | undefined }>()
   private instance: LawInstance | undefined
 
@@ -323,6 +361,9 @@ export class Translator {
         if (!env && !MODULE_DECLARATIONS.has(statement.kind)) invalid(statement, "only law() and describe() calls and declarations are allowed in a law file")
         if (!env || DECLARATIONS_WITHOUT_VALUE.has(statement.kind)) continue
         try {
+          // What a describe declares is shared by its laws, so no law may change it: its epoch ends here.
+          this.writes = []
+          this.epoch = ++epochs
           if (statement.kind === K.VariableStatement) this.declare(statement, env)
           else if (statement.kind !== K.FunctionDeclaration) invalid(statement, "only laws and declarations are allowed inside describe()")
         } catch (error) {
@@ -430,6 +471,8 @@ export class Translator {
         this.stack = []
         this.cells = []
         bindingLog.length = 0
+        this.writes = []
+        this.epoch = ++epochs
         this.steps = 0
         const facts = this.factsOf(callback)
         if (facts.usesVar) throw new Unsupported("`var` is not supported; use `const` or `let`", facts.usesVar)
@@ -736,7 +779,109 @@ export class Translator {
   }
 
   private save(): Saved {
-    return { values: this.cells.map(cell => cell.value), logged: bindingLog.length, scopes: scopesCreated }
+    return { values: this.cells.map(cell => cell.value), logged: bindingLog.length, scopes: scopesCreated, written: this.writes.length, objects: objectsCreated }
+  }
+
+  /** Mark an object as created here and now, which is what allows changing it in place. */
+  private fresh<T extends Stored>(value: T): T {
+    value.own = { epoch: this.epoch, born: objectsCreated++ }
+    return value
+  }
+
+  /** Take away the right to change objects in place. Epochs start at 1, so 0 is never the current one. */
+  private freeze(...values: Stored[]) {
+    for (const value of values) if (value.own) value.own.epoch = 0
+  }
+
+  private slot(target: Stored, slot: string | number): Value | undefined {
+    return target.k === "record" ? target.fields.get(slot as string) : target.items[slot as number]
+  }
+
+  private put(target: Stored, slot: string | number, value: Value | undefined) {
+    if (target.k === "record") target.fields.set(slot as string, value!)
+    else if (value === undefined) target.items.length = slot as number
+    else target.items[slot as number] = value
+  }
+
+  /** Change an object in place, remembering what was there. */
+  private write(target: Stored, slot: string | number, value: Value) {
+    this.writes.push({ target, slot, previous: this.slot(target, slot) })
+    this.put(target, slot, value)
+  }
+
+  /**
+   * Check that an object may be changed in place and that storing `value` in
+   * it would not make it contain itself, which nothing here could walk.
+   */
+  private assertChangeable(target: Stored, value: Value, at: N) {
+    if (target.own?.epoch !== this.epoch) {
+      throw new Unsupported("changing this object in place is not modeled: it is one of the law's inputs, a shared constant, or the result of a condition choosing between two objects. Copy it first, as in `{ ...value }` or `[...value]`", at)
+    }
+    const seen = new Set<Value>()
+    const inside = (part: Value): boolean => {
+      if (part === target) return true
+      if (seen.has(part)) return false
+      seen.add(part)
+      return part.k === "record" ? [...part.fields.values()].some(inside) : part.k === "array" ? part.items.some(inside)
+        : part.k === "choice" ? inside(part.a) || inside(part.b) : false
+    }
+    if (inside(value)) throw new Unsupported("storing an object inside itself is not supported", at)
+  }
+
+  /** What each object that existed at `since` holds now in the slots changed after it. */
+  private changesSince(since: Saved): Changes | undefined {
+    if (this.writes.length === since.written) return undefined
+    const changes: Changes = new Map()
+    for (let i = since.written; i < this.writes.length; i++) {
+      const { target, slot } = this.writes[i]!
+      if (target.own!.born >= since.objects) continue
+      let slots = changes.get(target)
+      if (!slots) changes.set(target, slots = new Map())
+      slots.set(slot, this.slot(target, slot))
+    }
+    return changes.size ? changes : undefined
+  }
+
+  /**
+   * After the two sides of a condition have each been run and undone, give
+   * every object they changed the value of whichever side is taken. `dead`
+   * names a side that never continues, so only the other side's changes count.
+   */
+  private mergeChanges(cond: Expr, whenTrue: Changes | undefined, whenFalse: Changes | undefined, dead?: "true" | "false") {
+    if (!whenTrue && !whenFalse) return
+    for (const target of new Set([...(whenTrue?.keys() ?? []), ...(whenFalse?.keys() ?? [])])) {
+      const a = whenTrue?.get(target)
+      const b = whenFalse?.get(target)
+      // An array grows one position at a time, so its positions are settled in order.
+      const slots = [...new Set([...(a?.keys() ?? []), ...(b?.keys() ?? [])])]
+      if (target.k === "array") slots.sort((x, y) => (x as number) - (y as number))
+      for (const slot of slots) {
+        const now = this.slot(target, slot)
+        let onTrue = a?.has(slot) ? a.get(slot) : now
+        let onFalse = b?.has(slot) ? b.get(slot) : now
+        if (dead === "true") onTrue = onFalse
+        if (dead === "false") onFalse = onTrue
+        if (onTrue === undefined && onFalse === undefined) continue
+        if (onTrue === undefined || onFalse === undefined) throw new Unsupported("an array that grows on only one side of a condition is not supported", undefined)
+        const merged = this.merge(cond, onTrue, onFalse)
+        if (merged !== now) this.write(target, slot, merged)
+      }
+    }
+  }
+
+  /**
+   * Run code that JavaScript may skip or stop part-way, where the model runs
+   * all of it. That is the same thing only if the code changes no object that
+   * existed before it, so anything else is refused.
+   */
+  private unchanging<T>(what: string, at: N, run: () => T): T {
+    const written = this.writes.length
+    const objects = objectsCreated
+    const result = run()
+    for (let i = written; i < this.writes.length; i++) {
+      if (this.writes[i]!.target.own!.born < objects) throw new Unsupported(`${what} changes an object in place, which is not modeled there; make the change in a statement of its own`, at)
+    }
+    return result
   }
 
   /** Put variables and bindings back to a saved state, forgetting any declared since. */
@@ -747,13 +892,21 @@ export class Translator {
       const entry = bindingLog.pop()!
       if (entry.env.serial < saved.scopes) entry.env.revert(entry.name, entry.previous)
     }
+    // An object created since then is left as it is: only what was produced after the save can still refer to it.
+    while (this.writes.length > saved.written) {
+      const { target, slot, previous } = this.writes.pop()!
+      if (target.own!.born < saved.objects) this.put(target, slot, previous)
+    }
   }
 
   /**
    * Evaluate both sides of a condition and merge their results. Each side
-   * starts from the same variable state. The state afterwards is the state
+   * starts from the same state. The variables afterwards are as they were
    * before: an expression cannot assign, and a statement branch evaluated
    * this way has already run to the end of its function on both sides.
+   * Objects are different, because a change to one outlives the function
+   * that made it: each object changed on either side ends up holding the
+   * value of the side taken.
    */
   private branch(cond: Expr, whenTrue: () => Value, whenFalse: () => Value, control = false): Value {
     if (cond.t === "lit") return cond.value ? whenTrue() : whenFalse()
@@ -764,9 +917,12 @@ export class Translator {
     if (control && this.merging > 0) throw new Unsupported("this combination of branches and assignments is not supported", undefined)
     const before = this.save()
     const a = this.under(cond, whenTrue)
+    const changedA = this.changesSince(before)
     this.restore(before)
     const b = this.under(ir.not(cond), whenFalse)
+    const changedB = this.changesSince(before)
     this.restore(before)
+    this.mergeChanges(cond, changedA, changedB, a.k === "bottom" ? "true" : b.k === "bottom" ? "false" : undefined)
     return this.merge(cond, a, b)
   }
 
@@ -781,16 +937,21 @@ export class Translator {
     this.merging++
     let afterTrue: Value[]
     let afterFalse: Value[]
+    let changedTrue: Changes | undefined
+    let changedFalse: Changes | undefined
     try {
       this.under(cond, whenTrue)
       afterTrue = this.cells.slice(0, kept).map(cell => cell.value)
+      changedTrue = this.changesSince(before)
       this.restore(before)
       this.under(ir.not(cond), whenFalse)
       afterFalse = this.cells.slice(0, kept).map(cell => cell.value)
+      changedFalse = this.changesSince(before)
       this.restore(before)
     } finally {
       this.merging--
     }
+    this.mergeChanges(cond, changedTrue, changedFalse)
     this.cells.forEach((cell, i) => {
       const a = afterTrue[i]!
       const b = afterFalse[i]!
@@ -799,13 +960,20 @@ export class Translator {
   }
 
   private merge(cond: Expr, a: Value, b: Value): Value {
+    // One object on both sides stays that object, and stays changeable.
+    if (a === b) return a
     if (a.k === "bottom") return b
     if (b.k === "bottom") return a
     if (a.k === "scalar" && b.k === "scalar" && a.e.ty === b.e.ty && !!a.num === !!b.num) return scalar(ir.ite(cond, a.e, b.e), a.num)
+    // Two objects merged field by field give a third that is neither of them,
+    // holding what they hold now. That stays true only while none of the three
+    // changes, so all three lose the right to be changed in place.
     if (a.k === "array" && b.k === "array" && a.items.length === b.items.length) {
+      this.freeze(a, b)
       return { k: "array", items: a.items.map((item, i) => this.merge(cond, item, b.items[i]!)) }
     }
     if (a.k === "record" && b.k === "record" && a.fields.size === b.fields.size && [...a.fields.keys()].every(key => b.fields.has(key))) {
+      this.freeze(a, b)
       return { k: "record", fields: new Map([...a.fields].map(([key, field]) => [key, this.merge(cond, field, b.fields.get(key)!)])) }
     }
     if (a.k === "closure" && b.k === "closure" && a.node === b.node && a.env === b.env) return a
@@ -1151,6 +1319,14 @@ export class Translator {
       const operator = node.operatorToken.kind
       const base = COMPOUND.get(operator)
       if (operator !== K.EqualsToken && base === undefined) throw new Unsupported("this assignment operator is not supported", node)
+      const place = this.place(node.left, env)
+      if (place) {
+        // JavaScript's order: the object and the key, then the old value, then the right-hand side, then the store.
+        const old = base === undefined ? undefined : place.read()
+        const right = this.evalExpr(node.right, env)
+        place.store(old === undefined ? right : this.arithmetic(base!, old, right, node))
+        return
+      }
       const cell = this.assignable(node.left, env)
       // The right-hand side is evaluated first; it cannot change the variable, because closures over it are refused.
       const right = this.evalExpr(node.right, env)
@@ -1159,6 +1335,12 @@ export class Translator {
     }
     if ((node.kind === K.PrefixUnaryExpression || node.kind === K.PostfixUnaryExpression) &&
       (node.operator === K.PlusPlusToken || node.operator === K.MinusMinusToken)) {
+      const place = this.place(node.operand, env)
+      if (place) {
+        const old = place.read()
+        place.store(this.arithmetic(node.operator === K.PlusPlusToken ? K.PlusToken : K.MinusToken, old, scalar(ir.lit(1n), isNumber(old)), node))
+        return
+      }
       const cell = this.assignable(node.operand, env)
       const one = scalar(ir.lit(1n), isNumber(cell.value))
       cell.value = this.arithmetic(node.operator === K.PlusPlusToken ? K.PlusToken : K.MinusToken, cell.value, one, node)
@@ -1172,11 +1354,63 @@ export class Translator {
     throw new Unsupported("this statement does nothing that is modeled", node)
   }
 
+  /**
+   * Where an assignment to a property or to a position of an array lands, or
+   * undefined when the target is a plain variable. The object and the key are
+   * evaluated here, once. The object may be one of several depending on a
+   * condition; then each is read and stored to under its own condition.
+   */
+  private place(target: N, env: Env): { read: () => Value; store: (value: Value) => void } | undefined {
+    while (target.kind === K.ParenthesizedExpression || target.kind === K.NonNullExpression) target = target.expression
+    if (target.kind !== K.PropertyAccessExpression && target.kind !== K.ElementAccessExpression) return undefined
+    if (target.questionDotToken) throw new Unsupported("optional chaining is not supported", target)
+    if (target.kind === K.PropertyAccessExpression && this.isNamespace(target.expression, env)) throw new Unsupported("assigning to something a module exports is not supported", target)
+    const holder = this.evalExpr(target.expression, env)
+    const key = target.kind === K.PropertyAccessExpression ? undefined : this.evalExpr(target.argumentExpression, env)
+    const slotOf = (object: Value): [Stored, string | number] => {
+      if (object.k === "array" && key) {
+        const refusal = () => new Unsupported("an array can only be assigned to at a position that is known here", target)
+        if (!isNumber(key) || key.k !== "scalar") throw refusal()
+        const position = this.settle(key.e, refusal).value as bigint
+        if (position < 0n || position >= BigInt(object.items.length)) throw new Unsupported("assigning outside the array, which would grow it, is not supported; use `.push`", target)
+        return [object, Number(position)]
+      }
+      if (object.k !== "record") throw new Unsupported(`assigning to a property of ${describe(object)} is not supported`, target)
+      const name = key ? this.scalarOf(key, target.argumentExpression, "str") : ir.lit(target.name.text as string)
+      if (name.t !== "lit") throw new Error("a key that is not known is settled before this")
+      if (name.value === "__proto__") throw new Unsupported("assigning to `__proto__` is not modeled", target)
+      if (!object.fields.has(name.value as string)) throw new Unsupported(`assigning to \`${name.value}\` would add a property to the object, which is not modeled; give it the property where it is created`, target)
+      return [object, name.value as string]
+    }
+    // A key that is not known here is compared with every property name, as
+    // it is when reading. Matching none would add a property, so that case
+    // has to be proved impossible.
+    const each = (object: Value, apply: (stored: Stored, slot: string | number) => Value): Value => {
+      if (object.k === "bottom") return BOTTOM
+      const name = object.k === "record" && key ? this.scalarOf(key, target.argumentExpression, "str") : undefined
+      if (object.k !== "record" || !name || name.t === "lit") return apply(...slotOf(object))
+      const names = [...object.fields.keys()]
+      const pick = (i: number): Value => {
+        if (i === names.length) {
+          this.emit("missing", ir.FALSE, target)
+          return BOTTOM
+        }
+        return this.branch(ir.eq(name, ir.lit(names[i]!)), () => apply(object, names[i]!), () => pick(i + 1))
+      }
+      return pick(0)
+    }
+    return {
+      read: () => this.over(holder, object => each(object, (stored, slot) => this.slot(stored, slot)!)),
+      store: value => void this.over(holder, object => each(object, (stored, slot) => {
+        this.assertChangeable(stored, value, target)
+        this.write(stored, slot, value)
+        return VOID
+      })),
+    }
+  }
+
   private assignable(target: N, env: Env): Cell {
     if (target.kind === K.ParenthesizedExpression) return this.assignable(target.expression, env)
-    if (target.kind === K.PropertyAccessExpression || target.kind === K.ElementAccessExpression) {
-      throw new Unsupported("changing an object or array in place is not modeled, because two names can refer to the same object; build a new value instead", target)
-    }
     if (target.kind !== K.Identifier) throw new Unsupported("this assignment target is not supported", target)
     const cell = env.cell(target.text)
     if (!cell) throw new Unsupported(`\`${target.text}\` is not a local variable, so assigning to it is not supported`, target)
@@ -1262,7 +1496,7 @@ export class Translator {
             fields.set(property.name.text, this.evalExpr(property.initializer, env))
           } else throw new Unsupported("methods, accessors and computed property names are not supported in object literals", property)
         }
-        return { k: "record", fields }
+        return this.fresh({ k: "record", fields })
       }
       case K.ArrayLiteralExpression: {
         const items: Value[] = []
@@ -1274,7 +1508,7 @@ export class Translator {
           } else if (element.kind === K.OmittedExpression) throw new Unsupported("array holes are not supported", node)
           else items.push(this.evalExpr(element, env))
         }
-        return { k: "array", items }
+        return this.fresh({ k: "array", items })
       }
       case K.PropertyAccessExpression: {
         if (node.questionDotToken) throw new Unsupported("optional chaining is not supported", node)
@@ -1362,7 +1596,7 @@ export class Translator {
       const isAnd = operator === K.AmpersandAmpersandToken
       const left = this.bool(node.left, env)
       if (left.t === "lit" && left.value !== isAnd) return scalar(left)
-      const right = this.under(isAnd ? left : ir.not(left), () => this.bool(node.right, env))
+      const right = this.under(isAnd ? left : ir.not(left), () => this.unchanging(`the right side of \`${isAnd ? "&&" : "||"}\``, node.right, () => this.bool(node.right, env)))
       return scalar(isAnd ? ir.and(left, right) : ir.or(left, right))
     }
     const leftValue = this.evalExpr(node.left, env)
@@ -1486,7 +1720,7 @@ export class Translator {
         }
         if (receiver.k === "array") {
           this.assertBuiltinsIntact(node)
-          return this.arrayMethod(receiver.items, method, args(), node)
+          return this.arrayMethod(receiver, method, args(), node)
         }
         if (receiver.k === "record" && receiver.fields.has(method)) return this.call(receiver.fields.get(method)!, args(), node)
         throw new Unsupported(`calling \`.${method}\` on ${describe(receiver)} is not supported`, node)
@@ -1587,10 +1821,16 @@ export class Translator {
     return !!declaration && this.program.isSourceFileDefaultLibrary(declaration.getSourceFile())
   }
 
-  private arrayMethod(items: Value[], method: string, args: Value[], node: N): Value {
-    if (ARRAY_MUTATORS.has(method)) {
-      throw new Unsupported("changing an object or array in place is not modeled, because two names can refer to the same object; build a new value instead", node)
+  private arrayMethod(array: Extract<Value, { k: "array" }>, method: string, args: Value[], node: N): Value {
+    const items = array.items
+    if (method === "push") {
+      for (const value of args) {
+        this.assertChangeable(array, value, node)
+        this.write(array, items.length, value)
+      }
+      return scalar(ir.lit(BigInt(items.length)), true)
     }
+    if (ARRAY_MUTATORS.has(method)) throw new Unsupported(`\`.${method}\` changes the array in place in a way that is not modeled; only \`.push\` and assigning to a position are`, node)
     if (!["includes", "some", "every", "map", "reduce"].includes(method)) throw new Unsupported(`the array method \`.${method}\` is not supported`, node)
     const [first, second] = args
     const expected = method === "reduce" ? 2 : 1
@@ -1616,11 +1856,12 @@ export class Translator {
       }
       case "some":
       case "every": {
-        const results = items.map((item, index) => this.scalarOf(invoke(first, [item, position(index)]), node, "bool"))
+        // JavaScript stops at the first element that settles the answer; the model asks every element.
+        const results = this.unchanging(`a callback of \`.${method}\``, node, () => items.map((item, index) => this.scalarOf(invoke(first, [item, position(index)]), node, "bool")))
         return scalar(method === "some" ? results.reduce(ir.or, ir.FALSE) : results.reduce(ir.and, ir.TRUE))
       }
       case "map":
-        return { k: "array", items: items.map((item, index) => invoke(first, [item, position(index)])) }
+        return this.fresh({ k: "array", items: items.map((item, index) => invoke(first, [item, position(index)])) })
       default:
         throw new Unsupported(`the array method \`.${method}\` is not supported`, node)
     }
@@ -1660,7 +1901,9 @@ export class Translator {
       if (early) throw new Unsupported(`\`${node.text}\` is read while its module is loading, before its own declaration has run, which throws`, node)
       const known = this.constants.get(declaration)
       if (known) return known
-      const saved = { pc: this.pc, stack: this.stack, instance: this.instance, cells: this.cells, assigned: this.assigned }
+      // The initializer runs once, in an epoch of its own: it may build its value step by step, and nothing after it may change that value.
+      const saved = { pc: this.pc, stack: this.stack, instance: this.instance, cells: this.cells, assigned: this.assigned, epoch: this.epoch }
+      this.epoch = ++epochs
       this.pc = []
       this.stack = []
       this.instance = undefined
@@ -1684,7 +1927,7 @@ export class Translator {
    * Refuse a module constant whose contents may differ from its initializer
    * by the time a law runs. Only two kinds of code run before then: the
    * module's own loading, and whatever the law calls (which is translated,
-   * and refused if it changes anything in place). So the value is stable
+   * and refused if it changes a module constant in place). So the value is stable
    * unless the file changes it by name, hands it to something while loading,
    * or runs its own functions while loading.
    */

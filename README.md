@@ -263,15 +263,18 @@ Pudding reads only the code a law reaches. A module may contain anything else.
 
 - **Values:** `boolean`, `bigint`, `string`, whole `number`s, `undefined`, object literals, array literals and tuples, functions.
 - **Operators:** `===` `!==` `&&` `||` `!` `?:`; `+ - * % < <= > >=` on bigint and number; `/` on bigint; string `+` and template literals.
-- **Statements:** `const` and `let`, assignment and `+=`-style updates of local variables, `if`/`else`, `switch`, `for…of` over an array of known length, `for`, `while` and `do` loops whose condition is settled at each round, `break`, `continue`, `return`, `throw`.
+- **Statements:** `const` and `let`, assignment and `+=`-style updates of local variables, of properties and of array positions, `if`/`else`, `switch`, `for…of` over an array of known length, `for`, `while` and `do` loops whose condition is settled at each round, `break`, `continue`, `return`, `throw`.
 - **Functions:** declarations and arrows, in any module of the project, with defaults and destructured parameters.
-- **Data:** module-level `const` tables, indexed by a key whose type guarantees it is present; `.includes`, `.some`, `.every`, `.map`, `.reduce` and `.length` on arrays of known length.
+- **Data:** module-level `const` tables, indexed by a key whose type guarantees it is present; `.includes`, `.some`, `.every`, `.map`, `.reduce`, `.push` and `.length` on arrays of known length.
+- **Changes in place:** `total.sum += x`, `list[0] = x` and `list.push(x)` on an object or array that the code under the law created itself. Two names for one object see each other's changes, a function changes what it is given, and a change behind a condition or an early return happens only on that path, all as in JavaScript.
 - **Numbers:** `Math.floor`, `ceil` and `trunc` of a quotient or a value, `Math.abs`, `sign`, `min`, `max`, and `String`, `Number` and `BigInt` conversions.
 
 Refused, with the reason, at the exact expression:
 
 - fractions, plain `number` division and `Math.round` of a quotient;
-- changing an object or array in place, because two names can refer to the same object;
+- changing in place an object the code did not just create: one of the law's inputs, a module constant, something a `describe` shares between its laws, or the result of a condition choosing between two objects. Copy it first, as in `{ ...value }`;
+- a change in place where JavaScript may skip it but a model must decide: on the right of `&&` or `||`, in a callback of `.some` or `.every`, and a `.push` on only one side of a condition;
+- adding a property to an object, and array methods that reorder or shrink, such as `.sort` and `.pop`;
 - a function that uses a variable which is reassigned outside it;
 - reading a `const` or `let` before its declaration has run, and `__proto__`;
 - an import such as `./x.js` when both `x.js` and `x.ts` exist, because TypeScript reads one and Node runs the other;
@@ -286,7 +289,7 @@ A *proved* law is a theorem about a model of your code. These things stand
 between the theorem and the code that runs.
 
 1. **The translation.** Pudding's translator and its constant folding are trusted. To catch mistakes, every law is also executed against the real code and compared with the model, on all inputs of a small finite domain or a sample of a large one that includes the constants the law mentions. A disagreement fails the law. If the law file cannot be executed, the run says so in a warning. With `--no-cross-check` none of this happens, including noticing that a module throws when it loads.
-2. **Inputs are plain data.** An object input has exactly the properties its type declares, held as ordinary values. TypeScript would also accept an object with extra properties, or one whose properties are getters; those are not covered.
+2. **Inputs are plain data.** An object input has exactly the properties its type declares, held as ordinary values. TypeScript would also accept an object with extra properties, or one whose properties are getters; those are not covered. Inputs are never changed in place by a proved law, so it does not matter whether two of them are the same object.
 3. **Module data.** A table such as `const transitions = {...}` is assumed to hold its initial value when a law runs. Anywhere in its module, a table may only be read in ways known to change nothing; anything else, such as passing it to a function, calling a method it defines, or giving it another name, makes Pudding refuse it. Two things are taken on trust: an installed package given a table declared `as const` does not change it, and no other module changes an exported table.
 4. **Built-ins.** `Math`, `String`, array methods, iteration and the like are modeled as the language defines them. If any file of the project assigns to a built-in, no law is proved; they are executed instead. Pudding does not look inside installed packages.
 5. **The files that run are the files TypeScript read.** Laws are executed against the files TypeScript resolved each import to. Where Node on its own would load a different file, as with some conditional `imports` and `exports`, the run says so in a warning.
