@@ -305,7 +305,7 @@ are equal must not be proved. Programs that expose a problem are kept under
 - [src/crosscheck.ts](src/crosscheck.ts): executing laws against the real code.
 - [scripts/pack-runtime.mjs](scripts/pack-runtime.mjs): builds the trimmed Lean runtime for a platform.
 - [scripts/fuzz.mjs](scripts/fuzz.mjs): the differential fuzzer.
-- [examples/](examples): laws that pass.
+- [examples/](examples): laws that pass, over small modules of the kind business code is made of: money, orders, stock, leave requests.
 - [test/fixtures/](test/fixtures): laws that are meant to fail, be vacuous, or fall back, with the tests that pin each outcome.
 
 ### Shipping Lean as a package
