@@ -40,9 +40,10 @@ There is nothing to configure. Law files do not have to be listed in a
 tsconfig, and a project without a tsconfig works.
 
 `install-lean` downloads the official Lean release into a cache shared by all
-your projects and keeps only the parts Pudding uses. Run without it, `pudding`
-offers to download Lean the first time. To use a Lean you already have, set
-`PUDDING_LEAN` to the binary; a Lean installed with elan is found on its own.
+your projects and keeps only the parts Pudding uses, about 370 MB of the 3 GB.
+Run without it, `pudding` offers to download Lean the first time. To use a Lean
+you already have, set `PUDDING_LEAN` to the binary; a Lean installed with elan
+is found on its own.
 
 ## The command line
 
@@ -133,7 +134,9 @@ law("a product of positives is positive", domain<[bigint, bigint]>(), ([a, b]) =
 
 `pudding --emit laws.lean` writes the theorems, so you or an agent can work on
 a proof with ordinary Lean tooling. Nobody has to review the script: Lean
-rejects it if it is wrong.
+rejects it if it is wrong. The trimmed Lean that `install-lean` leaves holds
+only the part of Lean's library Pudding itself uses; a proof that names other
+lemmas needs `pudding install-lean --full` or your own Lean.
 
 ## What a run reports
 
@@ -232,8 +235,28 @@ npm run proof     # builds, then checks the examples
 - [src/lean.ts](src/lean.ts): obligations to Lean theorems, and running Lean.
 - [src/runner.ts](src/runner.ts): the run, caching and explaining failures.
 - [src/crosscheck.ts](src/crosscheck.ts): executing laws against the real code.
+- [scripts/pack-runtime.mjs](scripts/pack-runtime.mjs): builds the trimmed Lean runtime for a platform.
 - [examples/](examples): laws that pass.
 - [test/fixtures/](test/fixtures): laws that are meant to fail, be vacuous, or fall back, with the tests that pin each outcome.
+
+### Shipping Lean as a package
+
+Pudding looks for a package named `<its own name>-lean-<platform>-<arch>`
+before anything else, so Lean can be an ordinary optional dependency instead
+of a separate download. `scripts/pack-runtime.mjs` builds that package from an
+official toolchain: the `lean` binary, its stripped shared libraries and the
+264 compiled modules the generated theorems import.
+
+```sh
+npm run build
+node scripts/pack-runtime.mjs .toolchain/lean-4.36.0-darwin_aarch64 out --package pudding-lean-darwin-arm64@4.36.0
+```
+
+For macOS arm64 the result is 359 MB on disk and 109 MB as the `.tar.gz` npm
+uploads (69 MB as `.tar.xz`). It gives the same verdicts as the full toolchain
+on the tests, the examples and a benchmark of 4,661 generated theorems. The
+script has been run for macOS arm64 and Linux arm64; the x64 builds use the
+same code paths but have not been run.
 
 ## Limits worth knowing
 
