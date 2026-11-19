@@ -325,8 +325,9 @@ npm run pack:runtime -- .toolchain/lean-4.36.0-darwin_aarch64 runtime --package
 The result is about 360 MB on disk and 108 to 116 MB as the `.tar.gz` npm
 uploads, depending on the platform. On macOS arm64 it gives the same verdicts
 as the full toolchain on the tests, the examples and a benchmark of 4,661
-generated theorems, and on Linux arm64 and x64 the tests and the examples pass
-against it. The Intel macOS package has been built but not run. The package is versioned
+generated theorems. The release workflow builds each platform's package on
+that platform and runs the tests and the examples against it before
+publishing. The package is versioned
 after Lean: Lean 4.36.0 gives 4.36.0, and `--build 1` gives 4.36.1 when the
 set of modules changes under the same Lean.
 
