@@ -29,7 +29,8 @@
     "typecheck": "tsc --noEmit",
     "proof": "npm run build --silent && node dist/cli.js",
     "test": "npm run build --silent && node --test test/*.test.ts",
-    "prepack": "npm run build --silent"
+    "prepack": "npm run build --silent",
+    "test:package": "npm run build --silent && node scripts/smoke-package.mjs"
   },
   "dependencies": {
     "typescript": "7.0.2"

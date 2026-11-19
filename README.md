@@ -6,17 +6,18 @@ Pudding proves it for **every** input instead of the ones you thought of. Lean 4
 checks the proofs.
 
 ```ts
-// orders.law.ts
-import { domain, expect, law } from "pudding"
-import { canMove, isTerminal, ship, type Order, type Status } from "./orders.ts"
+// cart.law.ts
+import { describe, domain, expect, law, type Integer } from "pudding"
+import { subtotal, pageCount, type Item } from "./cart"
 
-law("a paid, placed order ships", domain<Order>(), order => {
-  if (order.status !== "placed" || !order.paid) return
-  expect(ship(order)).toEqual({ status: "shipped", paid: true })
-})
+describe("cart", () => {
+  law("adding an item adds its cost", domain<[Item, Item]>(), ([first, second]) => {
+    expect(subtotal([first, second])).toEqual(subtotal([first]) + second.price * second.quantity)
+  })
 
-law("nothing leaves a terminal status", domain<[Status, Status]>(), ([from, to]) => {
-  if (isTerminal(from)) expect(canMove(from, to)).toBe(false)
+  law("pages cover every item", domain<[Integer<0, 1000000>, Integer<1, 50>]>(), ([items, perPage]) => {
+    expect(pageCount(items, perPage) * perPage >= items).toBe(true)
+  })
 })
 ```
 
@@ -25,82 +26,100 @@ TypeScript: they type-check, format and refactor with the rest of the project.
 
 ## Getting started
 
-Pudding needs Node 24, TypeScript 7 and Lean 4.36.
+Pudding needs Node 24. It brings its own TypeScript 7 for reading your code,
+and it needs Lean 4.36 for the proofs.
 
 ```sh
-npm install
-npx pudding install-lean   # downloads Lean 4.36.0 into .toolchain/
-npm run proof              # builds, then checks every *.law.ts
-npm test
+npm install --save-dev pudding
+npx pudding install-lean    # once per machine
+npx pudding                 # check every *.law.ts
+npx pudding watch           # check again on every change
 ```
 
-`install-lean` keeps only the parts of the toolchain Pudding uses: about
-570 MB on disk instead of 3 GB. Pass `--full` to keep everything. To use a Lean
-you already have, set `PUDDING_LEAN` to the binary. The installer's download
-step has not been exercised end to end; the pruning step has.
+There is nothing to configure. Law files do not have to be listed in a
+tsconfig, and a project without a tsconfig works.
 
-Law files must be included by the project's `tsconfig.json`.
+`install-lean` downloads the official Lean release into a cache shared by all
+your projects and keeps only the parts Pudding uses. Run without it, `pudding`
+offers to download Lean the first time. To use a Lean you already have, set
+`PUDDING_LEAN` to the binary; a Lean installed with elan is found on its own.
 
-## What a run reports
+## The command line
 
 ```
- ✗ money.law.ts (3 laws)
-   ✓ clamp stays within its bounds
-   ✗ clamp is idempotent
-      the expectation does not hold
-      money.law.ts:12:3  expect(clamp(clamp(x, lo, hi), lo, hi)).toEqual(clamp(x, lo, hi))
-      with x = 0n, lo = 0n, hi = -1n
-      actual:   0n
-      expected: -1n
-   ~ cents survive a round trip  executed on sampled inputs, not proved
-      note: not proved: only strings can be interpolated, but this is a bigint (money.ts:38:37)
+pudding [filters...]        check law files whose path contains a filter
+pudding watch [filters...]  check again whenever a file changes
+pudding install-lean        download the Lean runtime
 ```
 
-Each law ends in one of four states.
-
-| State | Meaning |
+| Option | Effect |
 |---|---|
-| **proved** | Lean accepted a proof for every input. |
-| **checked** | The code is outside the supported subset, so the law was executed against the real code for every input of a finite domain. |
-| **sampled** | As above, but the domain is unbounded, so the law was executed on a sample. |
-| **failed** | The law is false, proves nothing, or could not be verified at all. |
+| `-t, --name <pattern>` | only laws whose full name matches the regular expression |
+| `-w, --watch` | same as the `watch` command |
+| `--strict` | fail when a law was only executed, not proved |
+| `--reporter <name>` | `default`, `verbose`, `json` or `github` |
+| `--no-cache` | ignore results from earlier runs |
+| `--no-cross-check` | do not execute laws against the real code |
+| `--emit <file>` | also write the generated Lean source |
+| `--cwd <dir>` | project directory |
 
-A failed law says why:
+The `github` reporter is chosen automatically inside GitHub Actions and
+annotates the lines that failed. The same run is available from code as
+`run()` in `pudding/runner`.
 
-- **A counterexample.** The inputs are named as the law names them, with both sides of the failed equality.
-- **A throw or a division by zero that can be reached.** A law holds only if the code it calls cannot throw for the inputs it covers.
-- **An expectation that is never reached.** A guard that is never true would otherwise pass silently.
-- **No proof and no counterexample.** The law may be true but beyond the automation. Supply a proof (see below).
-- **A disagreement between the model and the running code.** See "What a proof means".
+## Configuration
 
-`--strict` turns *checked* and *sampled* into failures, for CI on modules where
-only a proof will do.
+A `pudding.config.ts` is optional.
+
+```ts
+import { defineConfig } from "pudding"
+
+export default defineConfig({
+  include: ["src/**/*.law.ts"],        // default: **/*.law.ts
+  exclude: ["src/legacy/**"],
+  tsconfig: ".nuxt/tsconfig.app.json", // whose paths and options to read the laws with
+  strict: false,                       // fail laws that were only executed
+  crossCheck: true,                    // execute laws against the real code
+  reporter: "default",
+})
+```
+
+`tsconfig` matters when your imports use path aliases that the root
+`tsconfig.json` does not define, as in a Nuxt project.
 
 ## Writing laws
 
 ```ts
 law(name, domain<T>(), input => { ... }, options?)
 law(name, () => { ... }, options?)          // fixed values, no domain
+law.skip(...)   law.only(...)   law.todo(name)
+describe(name, () => { ... })               // also describe.skip, describe.only
 ```
 
 `domain<T>()` describes the inputs by type.
 
 | Type | Inputs covered |
 |---|---|
-| `boolean`, a union of string or bigint literals | every member |
+| `boolean`, a union of string, bigint or number literals | every member |
 | `bigint`, `string` | every value |
+| `Integer` | every whole number a `number` holds exactly |
+| `Integer<Min, Max>` | every whole number from `Min` to `Max` |
 | an object type | every combination of its properties |
 | a tuple | every combination of its elements |
 | a union of object types | every alternative |
 
-Inside the callback you can declare `const` values, guard with `if`, leave early
-with `return`, and assert with `expect(a).toEqual(b)`, `expect(a).toBe(b)` and
-their `.not` forms.
+A plain `number` cannot be an input, because it also covers fractions, NaN and
+infinities. Functions that take a `number` accept an `Integer`.
+
+Inside a law you can use anything from the supported subset below: declare
+values, loop, guard with `if`, leave early with `return`, call helpers that
+assert, and assert with `expect(a).toEqual(b)`, `expect(a).toBe(b)` and their
+`.not` forms.
 
 ### Supplying a proof
 
 Laws over finite inputs are decided by evaluation and never need help. Laws
-over `bigint` and `string` use Lean's `grind`, which handles linear arithmetic,
+over unbounded inputs use Lean's `grind`, which handles linear arithmetic,
 case splits, and division and remainder by constants. When that is not enough,
 pass a Lean tactic script:
 
@@ -114,83 +133,105 @@ law("a product of positives is positive", domain<[bigint, bigint]>(), ([a, b]) =
 a proof with ordinary Lean tooling. Nobody has to review the script: Lean
 rejects it if it is wrong.
 
+## What a run reports
+
+```
+ ✗ money.law.ts (3 laws)
+   ✓ clamp stays within its bounds
+   ✗ clamp is idempotent
+      the expectation does not hold
+      money.law.ts:12:3  expect(clamp(clamp(x, lo, hi), lo, hi)).toEqual(clamp(x, lo, hi))
+      with x = 0n, lo = 0n, hi = -1n
+      actual:   0n
+      expected: -1n
+   ~ cents survive a round trip  executed on sampled inputs, not proved
+      note: not proved: calling `.padStart` on a string is not supported (money.ts:38:56)
+```
+
+| State | Meaning |
+|---|---|
+| **proved** | Lean accepted a proof for every input. |
+| **checked** | The code is outside the supported subset, so the law was executed against the real code for every input of a finite domain. |
+| **sampled** | As above, but the domain is unbounded, so the law was executed on a sample. |
+| **failed** | The law is false, proves nothing, or could not be verified at all. |
+| **skipped**, **todo** | Marked that way, or filtered out. |
+
+A failed law says why:
+
+- **A counterexample.** The inputs are named as the law names them, with both sides of the failed equality.
+- **A throw that can be reached**, including division by zero and a function that ends without returning. A law holds only if the code it calls cannot throw for the inputs it covers.
+- **A number that stops being exact.** A result beyond 2^53 − 1, or a remainder by zero.
+- **An expectation that is never reached.** A guard that is never true would otherwise pass silently.
+- **No proof and no counterexample.** The law may be true but beyond the automation. Supply a proof.
+- **A disagreement between the model and the running code.** See "What a proof means".
+
+`--strict` turns *checked* and *sampled* into failures, for CI on modules where
+only a proof will do.
+
 ## The supported subset
 
 Pudding reads only the code a law reaches. A module may contain anything else.
 
-- **Values:** `boolean`, `bigint`, `string`, object literals, array literals and tuples, arrow functions.
-- **Operators:** `===` `!==` `&&` `||` `!` `?:`, bigint `+ - * / % < <= > >=`, string `+` and template literals.
-- **Statements in functions:** `const`, `if`/`else`, `switch`, `return`, `throw`, nested functions.
+- **Values:** `boolean`, `bigint`, `string`, whole `number`s, object literals, array literals and tuples, functions.
+- **Operators:** `===` `!==` `&&` `||` `!` `?:`; `+ - * % < <= > >=` on bigint and number; `/` on bigint; string `+` and template literals.
+- **Statements:** `const` and `let`, assignment and `+=`-style updates of local variables, `if`/`else`, `switch`, `for…of` over an array of known length, `for`, `while` and `do` loops whose condition is settled at each round, `break`, `continue`, `return`, `throw`.
 - **Functions:** declarations and arrows, in any module of the project, with defaults and destructured parameters.
-- **Data:** module-level `const` tables, indexed by a key whose type guarantees it is present; `.includes`, `.some`, `.every` and `.map` on arrays of known length.
+- **Data:** module-level `const` tables, indexed by a key whose type guarantees it is present; `.includes`, `.some`, `.every`, `.map`, `.reduce` and `.length` on arrays of known length.
+- **Numbers:** `Math.floor`, `ceil` and `trunc` of a quotient or a value, `Math.abs`, `sign`, `min`, `max`, and `String`, `Number` and `BigInt` conversions.
 
-Not supported: `number` (it is floating point; use `bigint` for quantities),
-`let` and loops, recursion, classes, async code, regular expressions, and
-library calls. Pudding refuses these at the exact expression and falls back to
-executing the law, so a law can always be written and gets promoted to
-*proved* when the subset grows.
+Refused, with the reason, at the exact expression:
+
+- fractions, plain `number` division and `Math.round` of a quotient;
+- changing an object or array in place, because two names can refer to the same object;
+- a function that uses a variable which is reassigned outside it;
+- loops whose length depends on an input, recursion, classes, async code, regular expressions and library calls.
+
+A refused law is executed instead and reported as *checked* or *sampled*, so a
+law can always be written and gets promoted to *proved* when the subset grows.
 
 ## What a proof means
 
-A *proved* law is a theorem about a model of your code. Four things stand
+A *proved* law is a theorem about a model of your code. These things stand
 between the theorem and the code that runs.
 
-1. **The translation.** Pudding's translator and its constant folding are trusted. To catch mistakes, every law is also executed against the real code and compared with the model on all inputs of a small finite domain or a sample of a large one. A disagreement fails the law.
+1. **The translation.** Pudding's translator and its constant folding are trusted. To catch mistakes, every law is also executed against the real code and compared with the model, on all inputs of a small finite domain or a sample of a large one. A disagreement fails the law. If the law file cannot be executed, the run says so in a warning.
 2. **Module data.** A table such as `const transitions = {...}` is assumed to keep its initial value. Pudding refuses a table that is assigned to or mutated by name in its module, or whose module runs statements on load. It does not follow other names for the same object.
-3. **Strings.** `string` inputs range over well-formed Unicode text. JavaScript strings with unpaired surrogates are not covered.
-4. **Lean.** Finite laws are checked by Lean's kernel. Other proofs are found by tactics and checked by the kernel.
-
-## Configuration
-
-```ts
-// pudding.config.ts
-import { defineConfig } from "pudding"
-
-export default defineConfig({
-  include: ["src/**/*.law.ts"],   // default: **/*.law.ts
-  strict: false,                  // fail laws that were only executed
-  crossCheck: true,               // execute laws against the real code
-})
-```
-
-| CLI option | Effect |
-|---|---|
-| `--strict` | fail when a law was only executed, not proved |
-| `--no-cache` | ignore earlier results |
-| `--no-cross-check` | do not execute laws against the real code |
-| `--emit <file>` | also write the generated Lean source |
-| `--json` | print the report as JSON |
-| `--verbose` | list every law |
-| `--cwd <dir>` | project directory |
-
-The same run is available from code as `run()` in `pudding/runner`.
+3. **Numbers.** A `number` is modeled as the whole number it holds, and every result must be proved to stay within 2^53 − 1, where that model is exact. Zero and negative zero are one value, as `===` treats them.
+4. **Strings.** `string` inputs range over well-formed Unicode text. JavaScript strings with unpaired surrogates are not covered.
+5. **Lean.** Finite laws are checked by Lean's kernel. Other proofs are found by tactics and checked by the kernel.
 
 ## How it works
 
 1. **Read.** The TypeScript 7 compiler API type-checks the law files and resolves every name and type. Type errors stop the run.
-2. **Translate.** Each law is evaluated symbolically. Functions are inlined, objects and arrays are resolved, and what remains is a set of obligations over booleans, integers and strings: one per `expect`, plus one per reachable `throw` or division.
-3. **Prove.** Obligations over finite inputs become one Lean theorem each, decided by evaluating every case in the kernel. Obligations with unbounded inputs are specialized over their finite inputs and handed to `grind`, with a slower fallback under the full library before a rejection is reported.
+2. **Translate.** Each law is evaluated symbolically. Functions are inlined, objects, arrays and loops are resolved, and what remains is a set of obligations over booleans, integers and strings: one per `expect`, plus one per reachable `throw`, division, or number that could stop being exact.
+3. **Prove.** Obligations over finite inputs become one Lean theorem each, decided by evaluating every case in the kernel. Obligations with unbounded inputs are handed to `grind`, with a slower fallback under the full library before a rejection is reported.
 4. **Explain.** For a rejected obligation Pudding searches for a counterexample by evaluating the model in JavaScript.
-5. **Cross-check.** Each law is executed against the real code and compared with the model.
+5. **Cross-check.** In a worker thread, each law is executed against the real code and compared with the model.
 
 Proved theorems are cached by their text and the Lean version, and a run over
-an unchanged project reuses the previous report. On an Apple M-series laptop
-the 20 example laws take about 0.4 s from scratch, under 0.1 s when only
-unrelated code changed, and about 60 ms when nothing changed.
+an unchanged project reuses the previous report.
 
-## Repository layout
+## Developing
+
+```sh
+npm install
+npx pudding install-lean
+npm test          # builds, then runs the tests
+npm run proof     # builds, then checks the examples
+```
 
 - [src/translate.ts](src/translate.ts): TypeScript to obligations.
 - [src/ir.ts](src/ir.ts): the expression language, its simplifier and its evaluator.
 - [src/lean.ts](src/lean.ts): obligations to Lean theorems, and running Lean.
-- [src/runner.ts](src/runner.ts): the run, caching, counterexamples and the cross-check.
+- [src/runner.ts](src/runner.ts): the run, caching and explaining failures.
+- [src/crosscheck.ts](src/crosscheck.ts): executing laws against the real code.
 - [examples/](examples): laws that pass.
-- [test/fixtures/suite/](test/fixtures/suite): laws that are meant to fail, be vacuous, or fall back, with the tests that pin each outcome.
+- [test/fixtures/](test/fixtures): laws that are meant to fail, be vacuous, or fall back, with the tests that pin each outcome.
 
 ## Limits worth knowing
 
 - The TypeScript API Pudding uses is published under `typescript/unstable`, so the TypeScript version is pinned.
-- Symbolic strings support equality and concatenation only, and proofs about them rarely go beyond what simplification settles.
-- Products of two unknowns are outside `grind`'s arithmetic; such laws need a supplied proof.
+- Division by an unknown and products of two unknowns are outside `grind`'s arithmetic. Bound the divisor with a small `Integer<Min, Max>`, which is checked value by value, or supply a proof.
+- Symbolic strings support equality and concatenation only.
 - Each obligation is printed as a tree, so deeply nested calls of functions that use an argument several times grow quickly. Pudding refuses terms past a size limit.
-- There is no watch mode, and the prebuilt Lean download covers macOS and Linux only.
+- Prebuilt Lean downloads exist for macOS and Linux only.
