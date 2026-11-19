@@ -180,7 +180,7 @@ describe("constructs that once produced a wrong proof", () => {
   for (const crossCheck of [true, false]) {
     test(`nothing is proved ${crossCheck ? "with" : "without"} executing the laws`, async () => {
       const report = await run({ cwd: join(fixtures, "soundness"), cache: false, crossCheck })
-      assert.equal(report.laws.length, 24)
+      assert.equal(report.laws.length, 32)
       for (const entry of report.laws) assert.equal(entry.status, "failed", `${entry.name}: ${JSON.stringify(entry.findings)}`)
     })
   }
@@ -213,12 +213,25 @@ describe("constructs that once produced a wrong proof", () => {
     }
   })
 
-  test("a law that is registered but cannot be read stops the run", async () => {
+  test("a law that cannot be read as written is an error, never a pass", async () => {
     for (const crossCheck of [true, false]) {
       const report = await run({ cwd: join(fixtures, "unreadable"), cache: false, crossCheck })
       assert.equal(report.ok, false)
-      assert.match(JSON.stringify(report.laws), /only law\(\) and describe\(\) calls and declarations are allowed/)
+      assert.ok(report.laws.length >= 4)
+      for (const entry of report.laws) assert.equal(entry.status, "failed", entry.name)
+      const messages = report.laws.flatMap(entry => entry.findings.map(f => f.message)).join(" | ")
+      assert.match(messages, /only law\(\) and describe\(\) calls and declarations are allowed/)
+      assert.match(messages, /a law callback must be an ordinary synchronous function/)
+      assert.match(messages, /the callback's parameter must be plain/)
     }
+  })
+
+  test("a module that replaces a built-in loses the model of that built-in", async () => {
+    const unchecked = await run({ cwd: join(fixtures, "patched"), cache: false, crossCheck: false })
+    assert.match(law(unchecked, "FALSE: a magnitude is never negative").findings[0]?.message ?? "", /`Math` is modified at .*patched\.ts:3/)
+    // With execution the law is run on a sample, which does not happen to include the one value that breaks it.
+    const executed = await run({ cwd: join(fixtures, "patched"), cache: false })
+    assert.equal(law(executed, "FALSE: a magnitude is never negative").status, "sampled")
   })
 
   test("an import that TypeScript and Node resolve to different files stops the run", async () => {

@@ -184,6 +184,11 @@ const MODULE_DECLARATIONS = new Set<number>([
   K.InterfaceDeclaration, K.TypeAliasDeclaration, K.EnumDeclaration, K.ModuleDeclaration, K.ImportEqualsDeclaration, K.EmptyStatement,
 ])
 const DECLARATIONS_WITHOUT_VALUE = new Set<number>([K.ImportDeclaration, K.InterfaceDeclaration, K.TypeAliasDeclaration, K.EmptyStatement])
+/** Array methods that change nothing and return no reference into the array, given elements that are plain values. */
+const READING_METHODS = new Set([
+  "includes", "some", "every", "map", "reduce", "reduceRight", "filter", "find", "findIndex", "findLast", "findLastIndex", "indexOf", "lastIndexOf",
+  "join", "slice", "concat", "at", "flat", "flatMap", "keys", "values", "entries", "toString",
+])
 const ARRAY_MUTATORS = new Set(["push", "pop", "shift", "unshift", "splice", "sort", "reverse", "fill", "copyWithin", "set", "delete", "clear", "add"])
 
 export function locate(node: Node): Location {
@@ -228,10 +233,11 @@ export class Translator {
   /** Module constants whose initializers are being evaluated, innermost last. */
   private loading: { file: string; position: number }[] = []
   private mentioned: Expr[] = []
-  private readonly expects = new Map<Node, boolean>()
-  private readonly facts = new Map<Node, { assigned: Set<string>; mentioned: Set<string>; returnsValue: boolean }>()
+  private readonly exportsUsed = new Map<Node, string>()
+  /** Set when some file of the program replaces part of a built-in, which the models of built-ins cannot see. */
+  private tampering: { message: string; node: Node } | undefined | null = null
+  private readonly facts = new Map<Node, { assigned: Set<string>; mentioned: Set<string>; returnsValue: boolean; usesVar: Node | undefined }>()
   private instance: LawInstance | undefined
-  private names = { law: new Set<string>(), domain: new Set<string>(), expect: new Set<string>(), describe: new Set<string>() }
 
   constructor(program: Program, checker: Checker, moduleName = "pudding") {
     this.program = program
@@ -245,16 +251,6 @@ export class Translator {
    */
   translateFile(file: SourceFile, selected: (name: string) => boolean = () => true): Law[] {
     this.reached.add(file.fileName)
-    this.names = { law: new Set(), domain: new Set(), expect: new Set(), describe: new Set() }
-    for (const statement of file.statements as readonly N[]) {
-      if (statement.kind !== K.ImportDeclaration || statement.moduleSpecifier.text !== this.moduleName) continue
-      const bindings = statement.importClause?.namedBindings
-      if (bindings?.kind !== K.NamedImports) continue
-      for (const element of bindings.elements) {
-        const imported = (element.propertyName ?? element.name).text as "law" | "domain" | "expect" | "describe"
-        if (imported in this.names) this.names[imported].add(element.name.text)
-      }
-    }
     const laws: (Law & { only?: boolean })[] = []
     this.translateBlock(file.statements as readonly N[], undefined, [], "run", laws, selected)
     // As in Vitest, `.only` narrows the file to the laws that carry it.
@@ -278,8 +274,24 @@ export class Translator {
       callee = callee.expression
     }
     if (callee.kind !== K.Identifier) return undefined
-    const kind = this.names.law.has(callee.text) ? "law" : this.names.describe.has(callee.text) ? "describe" : undefined
-    return kind && { kind, modifier }
+    const name = this.libraryExport(callee)
+    return name === "law" || name === "describe" ? { kind: name, modifier } : undefined
+  }
+
+  /**
+   * The export of this library that an identifier refers to, if any. Decided
+   * by following the name to its import, because a local declaration can
+   * reuse any of these names and the code being read may be in any module.
+   */
+  private libraryExport(identifier: N): string | undefined {
+    let known = this.exportsUsed.get(identifier)
+    if (known === undefined) {
+      const declaration = this.checker.getSymbolAtLocation(identifier)?.declarations[0]?.resolve() as N
+      known = declaration?.kind === K.ImportSpecifier && declaration.parent.parent.parent.moduleSpecifier.text === this.moduleName
+        ? ((declaration.propertyName ?? declaration.name).text as string) : ""
+      this.exportsUsed.set(identifier, known)
+    }
+    return known || undefined
   }
 
   /**
@@ -352,8 +364,8 @@ export class Translator {
     }
   }
 
-  private isCallTo(node: N, names: Set<string>): boolean {
-    return node?.kind === K.CallExpression && node.expression.kind === K.Identifier && names.has(node.expression.text)
+  private isCallTo(node: N, name: string): boolean {
+    return node?.kind === K.CallExpression && node.expression.kind === K.Identifier && this.libraryExport(node.expression) === name
   }
 
   private translateLaw(call: N, index: number, name: string, scope: Env | undefined): Law {
@@ -365,11 +377,14 @@ export class Translator {
       law.problem = { kind: "invalid", message, ...locate(node) }
       return law
     }
-    const hasDomain = this.isCallTo(args[1], this.names.domain)
+    const hasDomain = this.isCallTo(args[1], "domain")
     const callback = args[hasDomain ? 2 : 1]
     const options = args[hasDomain ? 3 : 2]
     if (callback?.kind !== K.ArrowFunction && callback?.kind !== K.FunctionExpression) return invalid("law() needs a callback", call)
     if (callback.parameters.length !== (hasDomain ? 1 : 0)) return invalid(hasDomain ? "the callback takes exactly one parameter" : "a law without a domain takes no parameter", callback)
+    if (callback.asteriskToken || callback.modifiers?.some((m: N) => m.kind === K.AsyncKeyword)) return invalid("a law callback must be an ordinary synchronous function", callback)
+    const [parameter] = callback.parameters as N[]
+    if (parameter && (parameter.dotDotDotToken || parameter.initializer || parameter.questionToken)) return invalid("the callback's parameter must be plain: no rest, default or optional marker", parameter)
     if (options) {
       if (options.kind !== K.ObjectLiteralExpression) return invalid("law() options must be an object literal", options)
       for (const property of options.properties as N[]) {
@@ -406,7 +421,9 @@ export class Translator {
         this.cells = []
         bindingLog.length = 0
         this.steps = 0
-        this.assigned = [this.factsOf(callback).assigned]
+        const facts = this.factsOf(callback)
+        if (facts.usesVar) throw new Unsupported("`var` is not supported; use `const` or `let`", facts.usesVar)
+        this.assigned = [facts.assigned]
         const env = scope ? scope.child() : new Env()
         try {
           if (instance.arg) this.bind(callback.parameters[0].name, this.valueOf(instance.arg), env, true, true)
@@ -518,6 +535,8 @@ export class Translator {
       const fields: [string, Shape][] = []
       for (const property of this.checker.getPropertiesOfType(type)) {
         if (property.flags & SymbolFlags.Optional) throw new Unsupported(`optional property \`${property.name}\` is not supported in an input`, at)
+        // A property keyed by a symbol has no string name; its compiler name starts like this.
+        if (String(property.escapedName).startsWith("__@")) throw new Unsupported(`${name()} has a property keyed by a symbol, which is not supported in an input`, at)
         const propertyType = this.checker.getTypeOfSymbol(property)
         if (!propertyType) throw new Unsupported(`the type of \`${property.name}\` could not be resolved`, at)
         fields.push([property.name, this.shapeOf(propertyType, at)])
@@ -594,16 +613,7 @@ export class Translator {
    * was imported from, since the code being read may be in any module.
    */
   private isExpect(node: N): boolean {
-    if (node?.kind !== K.CallExpression || node.expression.kind !== K.Identifier) return false
-    const callee = node.expression
-    let known = this.expects.get(callee)
-    if (known === undefined) {
-      const declaration = this.checker.getSymbolAtLocation(callee)?.declarations[0]?.resolve() as N
-      known = declaration?.kind === K.ImportSpecifier && (declaration.propertyName ?? declaration.name).text === "expect" &&
-        declaration.parent.parent.parent.moduleSpecifier.text === this.moduleName
-      this.expects.set(callee, known)
-    }
-    return known
+    return this.isCallTo(node, "expect")
   }
 
   private startsWithExpect(node: N): boolean {
@@ -761,7 +771,7 @@ export class Translator {
   private factsOf(fn: N) {
     let facts = this.facts.get(fn)
     if (facts) return facts
-    facts = { assigned: new Set<string>(), mentioned: new Set<string>(), returnsValue: false }
+    facts = { assigned: new Set<string>(), mentioned: new Set<string>(), returnsValue: false, usesVar: undefined }
     const isFunction = (node: N) => node.kind === K.ArrowFunction || node.kind === K.FunctionExpression || node.kind === K.FunctionDeclaration
     const visit = (node: N, nested: boolean) => {
       if (node.kind === K.Identifier) facts!.mentioned.add(node.text)
@@ -771,6 +781,8 @@ export class Translator {
       if ((node.kind === K.PrefixUnaryExpression || node.kind === K.PostfixUnaryExpression) &&
         (node.operator === K.PlusPlusToken || node.operator === K.MinusMinusToken)) collectNames(node.operand, facts!.assigned)
       if (node.kind === K.ReturnStatement && node.expression && !nested) facts!.returnsValue = true
+      // A `var` belongs to the whole function wherever it is written, even in a block that never runs.
+      if (node.kind === K.VariableDeclarationList && !(node.flags & (NodeFlags.Let | NodeFlags.Const)) && !nested) facts!.usesVar ??= node
       node.forEachChild((child: N) => visit(child, nested || isFunction(child)))
     }
     for (const parameter of parametersOf(fn)) visit(parameter, false)
@@ -836,6 +848,7 @@ export class Translator {
     if (node.asteriskToken || node.modifiers?.some((m: N) => m.kind === K.AsyncKeyword)) throw new Unsupported("async functions and generators are not supported", at)
     if (!node.body) throw new Unsupported("this function has no body to translate", at)
     const facts = this.factsOf(node)
+    if (facts.usesVar) throw new Unsupported("`var` is not supported; use `const` or `let`", facts.usesVar)
     // A function that reads or writes a variable someone reassigns would need
     // that variable's value at the moment of the call, on every path. That is
     // not tracked, so such closures are refused.
@@ -847,6 +860,8 @@ export class Translator {
     this.stack.push(node)
     this.assigned.push(facts.assigned)
     try {
+      // A function expression with a name can call itself by it, whatever the name means outside.
+      if (node.kind === K.FunctionExpression && node.name) env.set(node.name.text, fn)
       // Every parameter is in scope, uninitialized, while the defaults before it run.
       const parameters = parametersOf(node)
       for (const parameter of parameters) for (const name of boundNames(parameter.name)) env.set(name, UNINITIALIZED)
@@ -865,7 +880,8 @@ export class Translator {
       // Reaching the end of a function that returns values elsewhere yields
       // undefined where a value is expected. Like a throw, that is allowed
       // only where it is proved unreachable.
-      return this.block(node.body.statements, env, {
+      // The body has a scope of its own, so a closure made by a default does not see what the body declares.
+      return this.block(node.body.statements, env.child(), {
         next: () => {
           if (!facts.returnsValue) return VOID
           this.emit("falloff", ir.FALSE, node)
@@ -1332,6 +1348,7 @@ export class Translator {
       return this.evalExpr(argument, env)
     })
     if (callee.kind === K.Identifier && !env.get(callee.text) && node.arguments.length === 1 && this.isBuiltin(callee)) {
+      this.assertBuiltinsIntact(node)
       if (callee.text === "String") return this.text(args()[0]!, node)
       if (callee.text === "BigInt" || callee.text === "Number") {
         const [value] = args()
@@ -1347,8 +1364,14 @@ export class Translator {
       const method = callee.name.text as string
       return this.over(this.evalExpr(callee.expression, env), receiver => {
         if (receiver.k === "bottom") return BOTTOM
-        if (receiver.k === "scalar" && method === "toString" && node.arguments.length === 0) return this.text(receiver, node)
-        if (receiver.k === "array") return this.arrayMethod(receiver.items, method, args(), node)
+        if (receiver.k === "scalar" && method === "toString" && node.arguments.length === 0) {
+          this.assertBuiltinsIntact(node)
+          return this.text(receiver, node)
+        }
+        if (receiver.k === "array") {
+          this.assertBuiltinsIntact(node)
+          return this.arrayMethod(receiver.items, method, args(), node)
+        }
         if (receiver.k === "record" && receiver.fields.has(method)) return this.call(receiver.fields.get(method)!, args(), node)
         throw new Unsupported(`calling \`.${method}\` on ${describe(receiver)} is not supported`, node)
       })
@@ -1357,7 +1380,46 @@ export class Translator {
   }
 
   /** The `Math` functions that keep whole numbers whole. */
+  /**
+   * Refuse to model a built-in if any file of the program writes to one, as
+   * in `Math.abs = ...` or a patched prototype: the name would no longer mean
+   * what the model assumes. Installed packages are not examined.
+   */
+  private assertBuiltinsIntact(use: Node) {
+    if (this.tampering === null) {
+      this.tampering = undefined
+      const builtins = new Set(["Math", "Object", "Array", "String", "Number", "BigInt", "Boolean", "JSON", "Reflect", "Function", "Symbol", "globalThis"])
+      const rootOf = (node: N): N => {
+        while (node.kind === K.PropertyAccessExpression || node.kind === K.ElementAccessExpression || node.kind === K.ParenthesizedExpression ||
+          node.kind === K.AsExpression || node.kind === K.NonNullExpression) node = node.expression
+        return node
+      }
+      const visit = (node: N) => {
+        if (this.tampering) return
+        const assigns = node.kind === K.BinaryExpression && node.operatorToken.kind >= K.FirstAssignment && node.operatorToken.kind <= K.LastAssignment
+        const target = assigns ? node.left : node.kind === K.DeleteExpression ? node.expression
+          : (node.kind === K.PrefixUnaryExpression || node.kind === K.PostfixUnaryExpression) && (node.operator === K.PlusPlusToken || node.operator === K.MinusMinusToken) ? node.operand : undefined
+        const root = target && target.kind !== K.Identifier ? rootOf(target) : undefined
+        // Also catch a built-in handed over whole, as in Object.assign(Math, ...) or Object.defineProperty(Array.prototype, ...).
+        const handed = node.kind === K.CallExpression ? (node.arguments as N[]).map(rootOf).find(a => a.kind === K.Identifier && builtins.has(a.text)) : undefined
+        const culprit = root?.kind === K.Identifier && builtins.has(root.text) ? root : handed
+        if (culprit && this.isBuiltin(culprit)) {
+          const at = locate(node)
+          this.tampering = { message: `\`${culprit.text}\` is modified at ${at.file}:${at.line}, so built-in behaviour cannot be assumed`, node }
+          return
+        }
+        node.forEachChild(visit)
+      }
+      for (const name of this.program.getSourceFileNames()) {
+        const file = this.program.getSourceFile(name)
+        if (file && !file.isDeclarationFile && !this.program.isSourceFileFromExternalLibrary(file)) visit(file)
+      }
+    }
+    if (this.tampering) throw new Unsupported(this.tampering.message, use)
+  }
+
   private math(name: string, node: N, env: Env): Value {
+    this.assertBuiltinsIntact(node)
     const parameters = node.arguments as N[]
     const number = (argument: N) => {
       const value = this.evalExpr(argument, env)
@@ -1408,6 +1470,10 @@ export class Translator {
   }
 
   private arrayMethod(items: Value[], method: string, args: Value[], node: N): Value {
+    if (ARRAY_MUTATORS.has(method)) {
+      throw new Unsupported("changing an object or array in place is not modeled, because two names can refer to the same object; build a new value instead", node)
+    }
+    if (!["includes", "some", "every", "map", "reduce"].includes(method)) throw new Unsupported(`the array method \`.${method}\` is not supported`, node)
     const [first, second] = args
     const expected = method === "reduce" ? 2 : 1
     if (!first || args.length !== expected) {
@@ -1420,6 +1486,8 @@ export class Translator {
       if (fn.k === "closure" && parametersOf(fn.node).length > values.length) throw new Unsupported("an array callback that takes the array itself is not supported", node)
       return this.call(fn, values, node)
     }
+    const callable = (fn: Value): boolean => fn.k === "closure" || (fn.k === "choice" && callable(fn.a) && callable(fn.b))
+    if (method !== "includes" && !callable(first)) throw new Unsupported(`\`.${method}\` needs a function, but this is ${describe(first)}`, node)
     const position = (index: number) => scalar(ir.lit(BigInt(index)), true)
     switch (method) {
       case "reduce":
@@ -1436,9 +1504,6 @@ export class Translator {
       case "map":
         return { k: "array", items: items.map((item, index) => invoke(first, [item, position(index)])) }
       default:
-        if (ARRAY_MUTATORS.has(method)) {
-          throw new Unsupported("changing an object or array in place is not modeled, because two names can refer to the same object; build a new value instead", node)
-        }
         throw new Unsupported(`the array method \`.${method}\` is not supported`, node)
     }
   }
@@ -1542,10 +1607,14 @@ export class Translator {
       if (clause?.namedBindings?.kind === K.NamespaceImport) imported.add(clause.namedBindings.name.text)
       if (clause?.namedBindings?.kind === K.NamedImports) for (const element of clause.namedBindings.elements as N[]) imported.add(element.name.text)
     }
-    const rootName = (node: N): string => {
-      let root = unwrap(node)
+    const fromPackage = (callee: N): boolean => {
+      let root = unwrap(callee)
       while (root.kind === K.PropertyAccessExpression || root.kind === K.ElementAccessExpression || root.kind === K.CallExpression) root = unwrap(root.expression)
-      return root.kind === K.Identifier ? root.text : ""
+      if (root.kind !== K.Identifier || !imported.has(root.text)) return false
+      let symbol = this.checker.getSymbolAtLocation(root)
+      if (symbol && symbol.flags & SymbolFlags.Alias) symbol = this.checker.getAliasedSymbol(symbol)
+      const source = symbol?.declarations[0]?.resolve()?.getSourceFile()
+      return !!source && this.program.isSourceFileFromExternalLibrary(source)
     }
     const shallow = (value: Value | undefined) =>
       value?.k === "record" ? [...value.fields.values()].every(field => field.k === "scalar")
@@ -1580,15 +1649,21 @@ export class Translator {
           reached = step === undefined || !reached ? undefined
             : reached.k === "record" ? reached.fields.get(step) : reached.k === "array" ? reached.items[Number(step)] : undefined
         }
-        const reads = called || reached?.k === "scalar" || parent.kind === K.TypeQuery || parent.kind === K.TypeOfExpression ||
-          parent.kind === K.ExportSpecifier || parent.kind === K.ExportAssignment ||
-          // A spread copies one level, so it only separates the copy from the table when that level holds no objects.
-          ((parent.kind === K.SpreadElement || parent.kind === K.SpreadAssignment) && shallow(reached)) ||
-          (parent.kind === K.ForOfStatement && parent.expression === outer) ||
-          (parent.kind === K.BinaryExpression && parent.operatorToken.kind !== K.CommaToken && !assigned)
-        // A value declared `as const` may be given to a library while loading:
-        // its type forbids changing it, and schema builders are the common case.
-        const toLibrary = declaredConst && parent.kind === K.CallExpression && parent.expression !== outer && imported.has(rootName(parent.expression))
+        // Only uses that are known to read count as reads. A method call does
+        // when it is one of the array methods that change nothing, on a list
+        // of plain values; a method the table defines itself may do anything.
+        // Spreading and iterating copy one level, so they are reads when that
+        // level holds no objects. `a ?? b` and the like return the table itself.
+        const compares = parent.kind === K.BinaryExpression &&
+          [K.EqualsEqualsEqualsToken, K.ExclamationEqualsEqualsToken, K.EqualsEqualsToken, K.ExclamationEqualsToken, K.InKeyword].includes(parent.operatorToken.kind)
+        const reads = (called && READING_METHODS.has(top.name.text) && shallow(reached)) || (!called && reached?.k === "scalar") ||
+          parent.kind === K.TypeQuery || parent.kind === K.TypeOfExpression || parent.kind === K.ExportSpecifier || parent.kind === K.ExportAssignment ||
+          ((parent.kind === K.SpreadElement || parent.kind === K.SpreadAssignment || (parent.kind === K.ForOfStatement && parent.expression === outer)) && shallow(reached)) ||
+          compares
+        // A value declared `as const` may be given to an installed package
+        // while loading: its type forbids changing it, and schema builders are
+        // the common case. A function of the project itself gets no such trust.
+        const toLibrary = declaredConst && parent.kind === K.CallExpression && parent.expression !== outer && fromPackage(parent.expression)
         if (!reads && !toLibrary) handedOver.push({ at: parent, inFunction })
       }
       node.forEachChild((child: N) => visit(child, inFunction || isFunction(child)))

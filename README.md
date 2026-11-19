@@ -114,6 +114,10 @@ infinities. Functions that take a `number` accept an `Integer`. An object type
 with an index signature, such as `Record<string, boolean>`, cannot be an input
 either, because its values cannot be listed.
 
+A law's callback is an ordinary synchronous function, and a law file contains
+only `law()` and `describe()` calls and declarations at its top level, so that
+every law that would be registered is also read.
+
 Inside a law you can use anything from the supported subset below: declare
 values, loop, guard with `if`, leave early with `return`, call helpers that
 assert, and assert with `expect(a).toEqual(b)`, `expect(a).toBe(b)` and their
@@ -192,7 +196,7 @@ Refused, with the reason, at the exact expression:
 - a function that uses a variable which is reassigned outside it;
 - reading a `const` or `let` before its declaration has run, and `__proto__`;
 - an import such as `./x.js` when both `x.js` and `x.ts` exist, because TypeScript reads one and Node runs the other;
-- loops whose length depends on an input, recursion, classes, async code, regular expressions and library calls.
+- `var`, loops whose length depends on an input, recursion, classes, async code, regular expressions and library calls.
 
 A refused law is executed instead and reported as *checked* or *sampled*, so a
 law can always be written and gets promoted to *proved* when the subset grows.
@@ -204,10 +208,12 @@ between the theorem and the code that runs.
 
 1. **The translation.** Pudding's translator and its constant folding are trusted. To catch mistakes, every law is also executed against the real code and compared with the model, on all inputs of a small finite domain or a sample of a large one that includes the constants the law mentions. A disagreement fails the law. If the law file cannot be executed, the run says so in a warning. With `--no-cross-check` none of this happens, including noticing that a module throws when it loads.
 2. **Inputs are plain data.** An object input has exactly the properties its type declares, held as ordinary values. TypeScript would also accept an object with extra properties, or one whose properties are getters; those are not covered.
-3. **Module data.** A table such as `const transitions = {...}` is assumed to hold its initial value when a law runs. Pudding refuses a table that its own module changes by name, hands to other code while loading, or shares with statements or local function calls that run on load. It does not see another module changing an exported table.
-4. **Numbers.** A `number` is modeled as the whole number it holds, and every result must be proved to stay within 2^53 − 1, where that model is exact. Zero and negative zero are one value, as `===` treats them.
-5. **Strings.** `string` inputs range over well-formed Unicode text. JavaScript strings with unpaired surrogates are not covered.
-6. **Lean.** Finite laws are checked by Lean's kernel. Other proofs are found by tactics and checked by the kernel. A theorem counts only when Lean reports no error for it and confirms that it rests on nothing but Lean's standard axioms, so an unfinished proof (`sorry`) is rejected.
+3. **Module data.** A table such as `const transitions = {...}` is assumed to hold its initial value when a law runs. While its module loads, a table may only be read in ways known to change nothing; anything else, such as passing it to a function, calling a method it defines, or aliasing it, makes Pudding refuse it. Two things are taken on trust: an installed package given a table declared `as const` does not change it, and no other module changes an exported table.
+4. **Built-ins.** `Math`, `String`, array methods and the like are modeled as the language defines them. Pudding refuses to model them if any file of the project assigns to one, but it does not look inside installed packages.
+5. **The files that run are the files TypeScript read.** Laws are executed against the files TypeScript resolved each import to. Where Node on its own would load a different file, as with some conditional `imports` and `exports`, the run says so in a warning.
+6. **Numbers.** A `number` is modeled as the whole number it holds, and every result must be proved to stay within 2^53 − 1, where that model is exact. Zero and negative zero are one value, as `===` treats them.
+7. **Strings.** `string` inputs range over well-formed Unicode text. JavaScript strings with unpaired surrogates are not covered.
+8. **Lean.** Finite laws are checked by Lean's kernel. Other proofs are found by tactics and checked by the kernel. A theorem counts only when Lean reports no error for it and confirms that it rests on nothing but Lean's standard axioms, so an unfinished proof (`sorry`) is rejected.
 
 ## How it works
 

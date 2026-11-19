@@ -605,6 +605,9 @@ export async function run(options: RunOptions = {}): Promise<Report> {
     const { outcomes, timedOut } = await execution
     for (const { file } of job.files) {
       const outcome = outcomes.get(file)
+      for (const note of outcome?.rerouted ?? []) {
+        report.warnings.push(`the laws ran against the files TypeScript read, which are not the ones Node would load: ${note.replaceAll(cwd + "/", "")}`)
+      }
       const reason = outcome?.error ?? (outcome ? undefined : timedOut ? `executing the laws took longer than ${RUNTIME_TIMEOUT_MS / 1000} s` : "the worker that executes laws stopped unexpectedly")
       if (outcome?.throws) {
         // The file itself fails when it is loaded, so nothing in it holds at run time, whatever was proved about the model.

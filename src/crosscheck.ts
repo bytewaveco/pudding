@@ -1,6 +1,7 @@
 // Runs in a worker thread. Executes each law against the real code and
 // compares the outcome with the model the proofs are about.
 
+import { realpathSync } from "node:fs"
 import { registerHooks } from "node:module"
 import { fileURLToPath, pathToFileURL } from "node:url"
 import { parentPort, workerData } from "node:worker_threads"
@@ -50,17 +51,12 @@ export interface FileOutcome {
   error?: string
   /** True when the file itself throws while it loads, as opposed to Node being unable to run TypeScript like it. */
   throws?: boolean
+  /** Imports Node would have resolved to another file than the one TypeScript read, which is the one that was run. */
+  rerouted?: string[]
   /** Set when the file registered a different number of laws than were read from its source. */
   miscounted?: { ran: number; read: number }
   laws: LawOutcome[]
 }
-
-/** Failures that say Node could not run the source as written, not that the code is wrong. */
-const TOOLING = new Set([
-  "ERR_MODULE_NOT_FOUND", "ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX", "ERR_INVALID_TYPESCRIPT_SYNTAX", "ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING",
-  "ERR_UNKNOWN_FILE_EXTENSION", "ERR_PACKAGE_PATH_NOT_EXPORTED", "ERR_UNSUPPORTED_DIR_IMPORT", "ERR_IMPORT_ATTRIBUTE_MISSING", "ERR_REQUIRE_ESM",
-  "ERR_UNSUPPORTED_ESM_URL_SCHEME", "ERR_UNKNOWN_BUILTIN_MODULE",
-])
 
 interface Registered {
   name: string
@@ -101,7 +97,9 @@ function modelHolds(instance: Instance, env: Map<string, Scalar>): boolean | "ou
 
 function runtimeHolds(callback: (input: unknown) => void, argument: unknown): boolean {
   try {
-    callback(argument)
+    const result: unknown = callback(argument)
+    // A law that hands back a promise has not finished, so it has not passed.
+    if (typeof (result as { then?: unknown } | null | undefined)?.then === "function") return false
     return true
   } catch {
     return false
@@ -117,22 +115,35 @@ async function register(file: string): Promise<Registered[] | { message: string;
     await import(pathToFileURL(file).href)
     return registry
   } catch (error) {
-    const code = (error as { code?: unknown } | null)?.code
-    // A SyntaxError is Node's when it comes from linking modules. One raised by the code itself, by JSON.parse say, is the code failing.
-    const linking = error instanceof SyntaxError && /does not provide an export named|The requested module/.test(error.message)
-    const tooling = linking || (typeof code === "string" && TOOLING.has(code))
+    // Node failing to load or link the files raises its error from inside
+    // Node. An error raised while the project's own code was running has a
+    // frame in a project file, and means the module really does not load.
+    const stack = error instanceof Error ? error.stack ?? "" : ""
+    const throws = !(error instanceof Error) || /\n\s+at [^\n]*file:\/\/(?![^\n]*\/node_modules\/)/.test(stack)
     const text = error instanceof Error ? `${error.name}: ${error.message.split("\n")[0]!}` : String(error)
-    return { message: text, throws: !tooling }
+    return { message: text, throws }
   } finally {
     delete globals[key]
   }
 }
 
 async function execute(job: Job, report: (outcome: FileOutcome) => void) {
+  const rerouted = new Set<string>()
   registerHooks({
     resolve(specifier, context, nextResolve) {
       const target = context.parentURL?.startsWith("file:") ? job.map.resolutions.get(pathOf(context.parentURL))?.get(specifier) : undefined
-      return target ? { url: pathToFileURL(target).href, shortCircuit: true } : nextResolve(specifier, context)
+      if (!target) return nextResolve(specifier, context)
+      // The proofs are about the file TypeScript read, so that is the file to
+      // run. Where Node alone would have picked another, say so.
+      try {
+        const native = nextResolve(specifier, context).url
+        if (native.startsWith("file:") && realpathSync(pathOf(native)) !== realpathSync(target)) {
+          rerouted.add(`\`${specifier}\` in ${pathOf(context.parentURL!)}: Node resolves it to ${pathOf(native)}, TypeScript read ${target}`)
+        }
+      } catch {
+        // Node cannot resolve it at all, which is the usual reason the map exists.
+      }
+      return { url: pathToFileURL(target).href, shortCircuit: true }
     },
     load(url, context, nextLoad) {
       const result = nextLoad(url, context)
@@ -175,6 +186,8 @@ async function execute(job: Job, report: (outcome: FileOutcome) => void) {
         outcome.laws.push(result)
       }
     }
+    if (rerouted.size) outcome.rerouted = [...rerouted]
+    rerouted.clear()
     report(outcome)
   }
 }
