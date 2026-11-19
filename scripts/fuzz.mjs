@@ -146,11 +146,16 @@ class Generator {
       return `(${literal(this.value(type))} as ${TS[type]})`
     }
     // What an object or a list holds right now, which depends on every change made to it so far, through any name.
-    const stored = scope.visible().filter(e => (e.kind === "box" || e.kind === "list") && e.type === type)
+    const stored = scope.visible().filter(e => (e.kind === "box" || e.kind === "list" || e.kind === "holder" || e.kind === "queue") && e.type === type)
     if (stored.length && r.chance(0.3)) {
       const chosen = r.pick(stored)
       scope.noteRead(chosen.name)
-      return chosen.kind === "box" ? `${chosen.name}.${r.pick(["v", "w"])}` : `${chosen.name}[${r.chance(0.5) ? "0" : `${chosen.name}.length - 1`}]!`
+      const part = r.pick(["v", "w"])
+      const position = r.chance(0.5) ? "0" : `${chosen.name}.length - 1`
+      return chosen.kind === "box" ? `${chosen.name}.${part}`
+        : chosen.kind === "holder" ? `${chosen.name}.box.${part}`
+        : chosen.kind === "queue" ? `${chosen.name}[${position}]!.${part}`
+        : `${chosen.name}[${position}]!`
     }
     if (depth <= 0 || r.chance(0.2)) return leaf()
     const sub = t => this.expr(t, scope, depth - 1)
@@ -566,6 +571,97 @@ class Generator {
         return [line]
       })
     }
+    // Objects that hold other objects. Storing one and then changing it, or
+    // changing it through where it is stored, has to be seen from every side.
+    const holders = scope.visible().filter(e => e.kind === "holder")
+    const queues = scope.visible().filter(e => e.kind === "queue")
+    const boxOf = type => {
+      const same = boxes.filter(b => b.type === type)
+      if (!same.length || r.chance(0.2)) return `{ v: ${this.expr(type, scope, 1)}, w: ${this.expr(type, scope, 1)} }`
+      const chosen = r.pick(same)
+      scope.noteRead(chosen.name)
+      return chosen.name
+    }
+    const named = entry => {
+      scope.noteRead(entry.name)
+      return entry
+    }
+    add(boxes.length ? 1.4 : 0.3, () => {
+      const type = boxes.length ? r.pick(boxes).type : r.pick(TYPES)
+      const name = `h${this.counter++}`
+      const same = holders.filter(h => h.type === type)
+      const value = same.length && r.chance(0.2) ? named(r.pick(same)).name : `{ box: ${boxOf(type)} }`
+      scope.names.set(name, { kind: "holder", type })
+      return [`const ${name}: { box: ${BOX(type)} } = ${value}`]
+    })
+    add(boxes.length ? 1.2 : 0.2, () => {
+      const type = boxes.length ? r.pick(boxes).type : r.pick(TYPES)
+      const name = `q${this.counter++}`
+      const same = queues.filter(q => q.type === type)
+      const value = same.length && r.chance(0.2) ? named(r.pick(same)).name
+        : same.length && r.chance(0.15) ? `[...${named(r.pick(same)).name}]`
+        : `[${Array.from({ length: 1 + r.int(2) }, () => boxOf(type)).join(", ")}]`
+      scope.names.set(name, { kind: "queue", type })
+      return [`const ${name}: ${BOX(type)}[] = ${value}`]
+    })
+    if (holders.length) {
+      add(2.2, () => {
+        const holder = named(r.pick(holders))
+        return [`${holder.name}.box = ${boxOf(holder.type)}`]
+      })
+      add(1.8, () => {
+        const holder = named(r.pick(holders))
+        return [update(`${holder.name}.box.${field()}`, holder.type)]
+      })
+    }
+    if (queues.length) {
+      add(2, () => {
+        const queue = named(r.pick(queues))
+        const roll = r.next()
+        const position = r.chance(0.5) ? "0" : `${queue.name}.length - 1`
+        if (roll < 0.3) return [`${queue.name}.push(${boxOf(queue.type)})`]
+        if (roll < 0.55) return [`${queue.name}[${position}] = ${boxOf(queue.type)}`]
+        if (roll < 0.85) return [update(`${queue.name}[${position}]!.${field()}`, queue.type)]
+        const o = `o${this.counter++}`
+        return [`for (const ${o} of ${queue.name}) ${o}.${field()} = ${this.expr(queue.type, scope, 1)}`]
+      })
+    }
+    // An object stored somewhere and changed, both behind one condition that
+    // depends on an input. Whatever is read afterwards through the place it
+    // was stored has to be the object as that side left it.
+    add(1.5, () => {
+      const type = r.pick(["big", "num"])
+      const [node, keeper] = [`b${this.counter++}`, `${r.chance(0.5) ? "h" : "q"}${this.counter++}`]
+      const held = keeper.startsWith("h")
+      const place = held ? `${keeper}.box` : `${keeper}[0]`
+      const inputs = scope.visible().filter(e => e.kind === "var" && e.domain)
+      const condition = () => {
+        if (!inputs.length || r.chance(0.2)) return this.expr("bool", scope, 2)
+        const input = named(r.pick(inputs))
+        return `((${input.name} as ${TS[input.type]}) === (${literal(r.pick(input.domain))} as ${TS[input.type]}))`
+      }
+      const fresh = () => `{ v: ${literal(this.value(type))}, w: ${literal(this.value(type))} }`
+      const steps = () => {
+        const store = held || r.chance(0.6) ? `${place} = ${node}` : `${keeper}.push(${node})`
+        const change = `${node}.${field()} ${r.pick(["=", "+=", "-="])} ${this.expr(type, scope, 1)}`
+        const through = `${place}${held ? "" : "!"}.${field()} ${r.pick(["=", "+="])} ${this.expr(type, scope, 1)}`
+        const lines = r.chance(0.5) ? [store, change] : [change, store]
+        if (r.chance(0.4)) lines.push(through)
+        return lines.map(l => "  " + l)
+      }
+      const lines = [
+        `const ${node}: ${BOX(type)} = ${fresh()}`,
+        held ? `const ${keeper}: { box: ${BOX(type)} } = { box: ${fresh()} }` : `const ${keeper}: ${BOX(type)}[] = [${fresh()}]`,
+        `if (${condition()}) {`, ...steps(), "}",
+      ]
+      if (r.chance(0.4)) lines.push("else {", ...steps(), "}")
+      scope.names.set(node, { kind: "box", type })
+      scope.names.set(keeper, { kind: held ? "holder" : "queue", type })
+      // Make the outcome depend on what is read through the place the object was stored.
+      const read = held ? `${keeper}.box.${field()}` : `${keeper}[${r.chance(0.5) ? "0" : `${keeper}.length - 1`}]!.${field()}`
+      lines.push(`if ((${read} as ${TS[type]}) === (${literal(this.value(type))} as ${TS[type]})) return ${this.expr(context.returns, scope, 1)}`)
+      return lines
+    })
     if (lists.length) {
       const pickList = () => {
         const chosen = r.pick(lists)

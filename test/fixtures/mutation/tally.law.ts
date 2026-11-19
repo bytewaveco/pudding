@@ -1,5 +1,8 @@
 import { describe, domain, expect, law } from "@bytewaveco/pudding"
-import { bump, deposit, depositIf, evens, KINDS, POWERS, squares, sumUntilNegative, totals, type Entry, type Kind } from "./tally.ts"
+import {
+  bump, deposit, depositIf, evens, KINDS, POWERS, pushThenChange, squares, sumUntilNegative, totals, visit, visitBySwitch, visitWhenDoubled,
+  type Entry, type Kind,
+} from "./tally.ts"
 
 law("totals add each amount to the total of its kind", domain<[Entry, Entry]>(), ([a, b]) => {
   const result = totals([a, b])
@@ -289,6 +292,67 @@ law("FALSE: a key that names no property", domain<["asset" | "other", bigint]>()
   const sums: Record<string, bigint> = { asset: 0n, liability: 0n }
   sums[kind]! += amount
   expect(sums["asset"]).toEqual(kind === "asset" ? amount : 0n)
+})
+
+// An object stored somewhere and then changed, both behind one condition.
+// These were once proved with the count from before the change: the object
+// was copied into the place it was stored before its own change was merged.
+law("an object stored and then changed is seen changed from where it was stored", domain<boolean>(), go => {
+  const node = { seen: 0n }
+  const cursor = { node: { seen: 5n } }
+  expect(visit(cursor, node, go)).toEqual(go ? 1n : 5n)
+  expect(cursor.node.seen).toEqual(go ? 1n : 5n)
+  expect(node.seen).toEqual(go ? 1n : 0n)
+})
+
+law("FALSE: an object stored and then changed keeps its old value where it was stored", domain<boolean>(), go => {
+  const node = { seen: 0n }
+  const cursor = { node: { seen: 5n } }
+  expect(visit(cursor, node, go)).toEqual(go ? 0n : 5n)
+})
+
+law("an object stored and then changed, behind a condition no sample reaches", domain<[string, string]>(), ([s, t]) => {
+  const node = { seen: 0n }
+  const cursor = { node: { seen: 5n } }
+  expect(visitWhenDoubled(cursor, node, s, t)).toEqual(s === t + t && t !== "" ? 1n : 5n)
+})
+
+law("FALSE: behind a condition no sample reaches, the old value is kept", domain<[string, string]>(), ([s, t]) => {
+  const node = { seen: 0n }
+  const cursor = { node: { seen: 5n } }
+  expect(visitWhenDoubled(cursor, node, s, t)).toEqual(s === t + t && t !== "" ? 0n : 5n)
+})
+
+law("an object stored and then changed inside a switch", domain<"move" | "keep">(), step => {
+  const node = { seen: 0n }
+  const cursor = { node: { seen: 5n } }
+  expect(visitBySwitch(step, cursor, node)).toEqual(step === "move" ? 1n : 5n)
+  expect(cursor.node.seen).toEqual(step === "move" ? 1n : 5n)
+})
+
+law("FALSE: after a switch the caller sees the old value", domain<"move" | "keep">(), step => {
+  const node = { seen: 0n }
+  const cursor = { node: { seen: 5n } }
+  visitBySwitch(step, cursor, node)
+  expect(cursor.node.seen).toEqual(step === "move" ? 0n : 5n)
+})
+
+law("an object pushed and then changed is seen changed in the list", domain<boolean>(), flag => {
+  expect(pushThenChange(flag)).toEqual(flag ? 1n : 2n)
+})
+
+law("FALSE: an object pushed and then changed keeps its old value in the list", domain<boolean>(), flag => {
+  expect(pushThenChange(flag)).toEqual(0n)
+})
+
+law("what a variable holds after a condition is the object as the taken side left it", domain<boolean>(), go => {
+  const node = { seen: 0n }
+  let current = { seen: 5n }
+  if (go) {
+    current = node
+    node.seen += 1n
+  }
+  expect(current.seen).toEqual(go ? 1n : 5n)
 })
 
 // What a group declares is shared by its laws, so a law that changed it would change what the next law sees.

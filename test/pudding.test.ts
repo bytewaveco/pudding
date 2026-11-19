@@ -468,6 +468,16 @@ test("objects changed in place: aliases, early exits and evaluation order follow
   assert.match(note("REFUSED: an object stored inside itself"), /inside itself/)
 })
 
+test("objects changed in place: no false law is proved by the model alone", async () => {
+  // Without the cross-check nothing is executed, so this is what the translation itself claims.
+  const report = await run({ cwd: join(fixtures, "mutation"), cache: false, crossCheck: false })
+  for (const entry of report.laws) {
+    const name = entry.name.split(" > ").at(-1)!
+    if (name.startsWith("FALSE") || name.startsWith("REFUSED")) assert.equal(entry.status, "failed", entry.name)
+    else assert.equal(entry.status, "proved", `${entry.name}: ${JSON.stringify(entry.findings)}`)
+  }
+})
+
 test("padStart and padEnd follow JavaScript for known strings and the text of whole numbers", async () => {
   const report = await run({ cwd: join(fixtures, "padding"), cache: false })
   assert.deepEqual(report.errors, [])

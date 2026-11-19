@@ -863,7 +863,7 @@ export class Translator {
         if (dead === "false") onFalse = onTrue
         if (onTrue === undefined && onFalse === undefined) continue
         if (onTrue === undefined || onFalse === undefined) throw new Unsupported("an array that grows on only one side of a condition is not supported", undefined)
-        const merged = this.merge(cond, onTrue, onFalse)
+        const merged = this.mergeHeld(cond, onTrue, onFalse)
         if (merged !== now) this.write(target, slot, merged)
       }
     }
@@ -959,6 +959,31 @@ export class Translator {
     })
   }
 
+  /**
+   * Merge what one slot of an object holds on the two sides of a condition.
+   * Unlike `merge`, this never copies an object found there. That object may
+   * be waiting for its own slots to be merged, so a copy made now would hold
+   * what it held before the condition and miss the change. Two different
+   * objects become a value that is one or the other, which leaves each of
+   * them the object it is, and whatever reads through it reads what the
+   * object holds then.
+   */
+  private mergeHeld(cond: Expr, a: Value, b: Value): Value {
+    if (a === b) return a
+    if (a.k === "bottom") return b
+    if (b.k === "bottom") return a
+    if (a.k === "scalar" && b.k === "scalar" && a.e.ty === b.e.ty && !!a.num === !!b.num) return scalar(ir.ite(cond, a.e, b.e), a.num)
+    if (a.k === "closure" && b.k === "closure" && a.node === b.node && a.env === b.env) return a
+    if (a.k === "void" && b.k === "void") return a
+    return { k: "choice", cond, a, b }
+  }
+
+  /**
+   * Merge the values of the two sides of a condition. Two different objects
+   * of one shape are copied into a third, field by field, so this is only for
+   * values whose objects have settled: results and variables, after every
+   * change to an object has been merged.
+   */
   private merge(cond: Expr, a: Value, b: Value): Value {
     // One object on both sides stays that object, and stays changeable.
     if (a === b) return a

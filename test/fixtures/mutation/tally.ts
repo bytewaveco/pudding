@@ -73,3 +73,53 @@ export const POWERS: readonly bigint[] = (() => {
   for (let n = 0; n < 4; n++) out.push(out[n]! * 2n)
   return out
 })()
+
+export interface Node {
+  seen: bigint
+}
+
+/** Points the cursor at `node` and then counts the visit on it, when asked to. */
+export function visit(cursor: { node: Node }, node: Node, go: boolean): bigint {
+  if (go) {
+    cursor.node = node
+    node.seen += 1n
+  }
+  return cursor.node.seen
+}
+
+/** The same two steps, taken only when `s` is `t` written twice. */
+export function visitWhenDoubled(cursor: { node: Node }, node: Node, s: string, t: string): bigint {
+  if (s === t + t && t !== "") {
+    cursor.node = node
+    node.seen += 1n
+  }
+  return cursor.node.seen
+}
+
+/** The same two steps inside a switch that is left with `break`. */
+export function visitBySwitch(step: "move" | "keep", cursor: { node: Node }, node: Node): bigint {
+  switch (step) {
+    case "move":
+      cursor.node = node
+      node.seen += 1n
+      break
+    case "keep":
+      break
+  }
+  return cursor.node.seen
+}
+
+/** Puts a different object in the list on each side, and changes it after putting it there. */
+export function pushThenChange(flag: boolean): bigint {
+  const a = { n: 0n }
+  const b = { n: 0n }
+  const list: { n: bigint }[] = []
+  if (flag) {
+    list.push(a)
+    a.n = 1n
+  } else {
+    list.push(b)
+    b.n = 2n
+  }
+  return list[0]!.n
+}
