@@ -31,7 +31,6 @@ and it needs Lean 4.36 for the proofs.
 
 ```sh
 npm install --save-dev @bytewaveco/pudding@beta
-npx pudding install-lean    # once per machine
 npx pudding                 # check every *.law.ts
 npx pudding watch           # check again on every change
 ```
@@ -39,11 +38,15 @@ npx pudding watch           # check again on every change
 There is nothing to configure. Law files do not have to be listed in a
 tsconfig, and a project without a tsconfig works.
 
-`install-lean` downloads the official Lean release into a cache shared by all
-your projects and keeps only the parts Pudding uses, about 370 MB of the 3 GB.
-Run without it, `pudding` offers to download Lean the first time. To use a Lean
-you already have, set `PUDDING_LEAN` to the binary; a Lean installed with elan
-is found on its own.
+On macOS and Linux, arm64 and x64, Lean arrives with `npm install` as an
+optional dependency: a package of about 110 MB holding the part of Lean that
+Pudding uses. Where it did not arrive, because optional dependencies are
+switched off or the package manager skipped it, `pudding` offers to download
+Lean the first time, and `npx pudding install-lean` does the same without
+asking. That fetches the official Lean release, checks it against a recorded
+SHA-256, and keeps the same part of it in a cache shared by all your projects.
+To use a Lean you already have, set `PUDDING_LEAN` to the binary; a Lean
+installed with elan is found on its own.
 
 ## The command line
 
@@ -307,22 +310,48 @@ are equal must not be proved. Programs that expose a problem are kept under
 
 ### Shipping Lean as a package
 
-Pudding looks for a package named `<its own name>-lean-<platform>-<arch>`
-before anything else, so Lean can be an ordinary optional dependency instead
-of a separate download. `scripts/pack-runtime.mjs` builds that package from an
+Pudding looks for a package named `<its own name>-lean-<platform>-<arch>`,
+so Lean is an ordinary optional dependency instead of a separate download.
+Only `PUDDING_LEAN`, the `lean` setting and a whole Lean from
+`install-lean --full` go before it. `scripts/pack-runtime.mjs` builds that package from an
 official toolchain: the `lean` binary, its stripped shared libraries and the
 264 compiled modules the generated theorems import.
 
 ```sh
-npm run build
-node scripts/pack-runtime.mjs .toolchain/lean-4.36.0-darwin_aarch64 out --package @bytewaveco/pudding-lean-darwin-arm64@4.36.0
+npx pudding install-lean --full --local
+npm run pack:runtime -- .toolchain/lean-4.36.0-darwin_aarch64 runtime --package
 ```
 
-For macOS arm64 the result is 359 MB on disk and 109 MB as the `.tar.gz` npm
-uploads (69 MB as `.tar.xz`). It gives the same verdicts as the full toolchain
-on the tests, the examples and a benchmark of 4,661 generated theorems. The
-script has been run for macOS arm64 and Linux arm64; the x64 builds use the
-same code paths but have not been run.
+For macOS arm64 the result is 359 MB on disk and 108 MB as the `.tar.gz` npm
+uploads. It gives the same verdicts as the full toolchain on the tests, the
+examples and a benchmark of 4,661 generated theorems. The package is versioned
+after Lean: Lean 4.36.0 gives 4.36.0, and `--build 1` gives 4.36.1 when the
+set of modules changes under the same Lean.
+
+### Releasing
+
+Two workflows in `.github/workflows` do the work. `ci.yml` runs the tests, the
+examples, the package smoke test and a short fuzzing run on Linux and macOS,
+arm64 and x64. `release.yml` is started by hand and publishes one of two
+things.
+
+1. **The runtime packages**, only when Lean or the imports in `src/lean.ts`
+   change. Run Release with target `runtime`. Each platform builds its own
+   package, runs the tests against it and publishes it. Then pin the new
+   version here and commit:
+
+   ```sh
+   npm install --save-optional --save-exact \
+     @bytewaveco/pudding-lean-darwin-arm64@4.36.0 @bytewaveco/pudding-lean-darwin-x64@4.36.0 \
+     @bytewaveco/pudding-lean-linux-arm64@4.36.0 @bytewaveco/pudding-lean-linux-x64@4.36.0
+   ```
+
+2. **Pudding itself.** Set the version in `package.json`, commit, and run
+   Release with target `package`. It is published under the dist-tag in
+   `publishConfig`, which is `beta` for now.
+
+Both need an `NPM_TOKEN` secret that may publish to the `@bytewaveco` scope.
+Tick `dry-run` to go through everything except the upload.
 
 ## Limits worth knowing
 

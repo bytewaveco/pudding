@@ -6,8 +6,14 @@
 //   node scripts/pack-runtime.mjs <toolchain dir> <output dir> [options]
 //
 // Options:
-//   --package NAME@VERSION  Also write a package.json, so the output can be
+//   --package            Also write a package.json, so the output can be
 //                        published as the runtime package for its platform.
+//                        It is named `<pudding's name>-lean-<os>-<cpu>`, which
+//                        is where Pudding looks, and versioned after Lean:
+//                        Lean 4.36.0 gives 4.36.0. The last number is Lean's
+//                        patch times 100 plus the build.
+//   --build N            With --package: the Nth rebuild for the same Lean,
+//                        when the set of modules changed. Default 0.
 //   --profile fallback   (default) FAST_HEADER plus the fallback header.
 //   --profile fast       FAST_HEADER only. A fallback under it is weaker.
 //   --profile init       All of Init. Works with `import Init` unchanged.
@@ -46,12 +52,13 @@ function fail(message) {
 }
 
 function parseArgs(argv) {
-  const options = { profile: "fallback", imports: [], strip: true, smoke: true, force: false, package: undefined, positional: [] }
+  const options = { profile: "fallback", imports: [], strip: true, smoke: true, force: false, package: false, build: 0, positional: [] }
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]
     if (arg === "--profile") options.profile = argv[++i]
     else if (arg === "--imports") options.imports.push(...argv[++i].split(",").filter(Boolean))
-    else if (arg === "--package") options.package = argv[++i]
+    else if (arg === "--package") options.package = true
+    else if (arg === "--build") options.build = Number(argv[++i])
     else if (arg === "--no-strip") options.strip = false
     else if (arg === "--no-smoke") options.smoke = false
     else if (arg === "--force") options.force = true
@@ -63,6 +70,7 @@ function parseArgs(argv) {
     else options.positional.push(arg)
   }
   if (options.positional.length !== 2) fail("usage: node pack-runtime.mjs <toolchain dir> <output dir> [--profile fallback|fast|init] [--imports A,B] [--no-strip] [--no-smoke] [--force]")
+  if (!Number.isInteger(options.build) || options.build < 0 || options.build > 99) fail("--build takes a number from 0 to 99")
   if (!PROFILES[options.profile]) fail(`unknown profile ${options.profile}; use fallback, fast or init`)
   return options
 }
@@ -358,12 +366,15 @@ function main() {
     const tag = basename(toolchain).replace(/^lean-[^-]+-/, "")
     const os = tag.startsWith("darwin") ? "darwin" : tag.startsWith("linux") ? "linux" : undefined
     if (!os) fail(`cannot tell the platform of ${basename(toolchain)}`)
-    const at = options.package.lastIndexOf("@")
-    if (at <= 0) fail("--package takes NAME@VERSION")
+    const cpu = tag.endsWith("aarch64") ? "arm64" : "x64"
+    const pudding = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"))
+    const [major, minor, patch] = basename(toolchain).split("-")[1].split(".").map(Number)
     writeFileSync(join(out, "package.json"), JSON.stringify({
-      name: options.package.slice(0, at), version: options.package.slice(at + 1),
-      description: `The part of Lean ${basename(toolchain).split("-")[1]} that Pudding uses, for ${os} ${tag.endsWith("aarch64") ? "arm64" : "x64"}`,
-      license: "Apache-2.0", os: [os], cpu: [tag.endsWith("aarch64") ? "arm64" : "x64"],
+      name: `${pudding.name}-lean-${os}-${cpu}`, version: `${major}.${minor}.${patch * 100 + options.build}`,
+      description: `The part of Lean ${major}.${minor}.${patch} that Pudding uses, for ${os} ${cpu}`,
+      license: "Apache-2.0", repository: pudding.repository, os: [os], cpu: [cpu],
+      // The binary has to be a real file on disk, also under package managers that keep packages zipped.
+      preferUnplugged: true,
       files: ["bin", "lib", "LICENSE", "LICENSES", "manifest.json"],
     }, null, 2) + "\n")
   }

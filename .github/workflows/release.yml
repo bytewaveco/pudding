@@ -1,0 +1,78 @@
+name: Release
+
+# Publishing is two separate steps, because the runtime packages change only
+# when Lean or the set of modules Pudding imports does.
+#
+#   runtime  builds the trimmed Lean for each platform on that platform, runs
+#            the tests against it, and publishes the four runtime packages.
+#   package  publishes Pudding itself, at the version in package.json.
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: What to publish
+        type: choice
+        options: [package, runtime]
+        default: package
+      build:
+        description: "runtime only: rebuild number for the same Lean (0 for the first)"
+        default: "0"
+      dry-run:
+        description: Do everything except upload
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write # npm provenance
+
+jobs:
+  runtime:
+    if: inputs.target == 'runtime'
+    name: runtime ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, macos-15-intel]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+          registry-url: https://registry.npmjs.org
+      - run: npm ci
+      - run: npm run build
+      # The whole toolchain: packing reads the sources to find what the theorems import.
+      - run: node dist/cli.js install-lean --full --local
+      - run: node scripts/pack-runtime.mjs .toolchain/lean-* runtime --package --build ${{ inputs.build }}
+      - name: Run the tests against the packed runtime
+        run: |
+          mv .toolchain "$RUNNER_TEMP/toolchain"
+          PUDDING_LEAN="$PWD/runtime/bin/lean" npm test
+          PUDDING_LEAN="$PWD/runtime/bin/lean" npm run proof
+      - run: npm publish ./runtime --access public --provenance ${{ inputs.dry-run && '--dry-run' || '' }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  package:
+    if: inputs.target == 'package'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+          registry-url: https://registry.npmjs.org
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+      - run: node dist/cli.js install-lean --local
+      - run: npm test
+      - run: npm run test:package
+      # The dist-tag comes from publishConfig in package.json.
+      - run: npm publish --provenance ${{ inputs.dry-run && '--dry-run' || '' }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

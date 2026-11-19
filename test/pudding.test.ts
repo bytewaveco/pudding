@@ -440,7 +440,7 @@ describe("proof scripts", () => {
 
   test("a script that rests on anything but the standard axioms is rejected", async () => {
     const statement = (script: string) => ` : (((2 : Int) + 2) == 4) = true := by (\n  ${script}\n)`
-    const [kernel, compiler, unfinished] = await prove(lean, "import Init", [statement("decide"), statement("native_decide"), statement("sorry")], undefined, true)
+    const [kernel, compiler, unfinished] = await prove(lean, FAST_HEADER, [statement("decide"), statement("native_decide"), statement("sorry")], undefined, true)
     assert.equal(kernel?.ok, true)
     assert.equal(compiler?.ok, false)
     assert.match(compiler?.message ?? "", /which Pudding does not accept/)
@@ -452,9 +452,9 @@ describe("proof scripts", () => {
     // Not how Pudding runs scripts (each gets its own file), but the reason it does.
     const tampering = " (x : Int) : (x == x) = true := by (\n  simp\n  macro_rules | `($a == $b) => `(true)\n)"
     const victim = " (x : Int) : (x == x + 1) = true := by rfl"
-    const together = await prove(lean, "import Init", [tampering, victim], 1)
+    const together = await prove(lean, FAST_HEADER, [tampering, victim], 1)
     assert.equal(together[0]?.ok, false)
-    const apart = await prove(lean, "import Init", [tampering, victim], undefined, true)
+    const apart = await prove(lean, FAST_HEADER, [tampering, victim], undefined, true)
     assert.deepEqual(apart.map(outcome => outcome.ok), [false, false])
   })
 })

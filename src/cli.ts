@@ -33,7 +33,7 @@ Options
 const REPORTERS = ["default", "verbose", "json", "github"]
 const IGNORED = /(^|[\\/])(node_modules|\.git|dist|\.pudding|\.toolchain|\.lab)([\\/]|$)/
 
-function main(): Promise<void> | void {
+async function main(): Promise<void> {
   const { values, positionals } = parseArgs({
     allowPositionals: true,
     options: {
@@ -51,7 +51,7 @@ function main(): Promise<void> | void {
     return void console.log(manifest.version)
   }
   if (positionals[0] === "install-lean") {
-    return void installLean(cwd, { full: !!values.full, local: !!values.local, log: line => console.log(line) })
+    return void (await installLean(cwd, { full: !!values.full, local: !!values.local, log: line => console.log(line) }))
   }
 
   const watching = values.watch || positionals[0] === "watch"
@@ -122,7 +122,7 @@ async function offerInstall(): Promise<boolean> {
   const answer = await prompt.question(`Lean ${LEAN_VERSION} is not installed. Download it now? [Y/n] `)
   prompt.close()
   if (answer.trim() !== "" && !/^y/i.test(answer.trim())) return false
-  installLean(process.cwd(), { full: false, local: false, log: line => console.log(line) })
+  await installLean(process.cwd(), { full: false, local: false, log: line => console.log(line) })
   return true
 }
 

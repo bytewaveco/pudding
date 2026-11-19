@@ -3,6 +3,12 @@
   "version": "0.1.0-beta.0",
   "description": "Prove laws about existing TypeScript functions, with Lean doing the checking",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bytewaveco/pudding.git"
+  },
+  "homepage": "https://github.com/bytewaveco/pudding#readme",
+  "bugs": "https://github.com/bytewaveco/pudding/issues",
   "type": "module",
   "engines": {
     "node": ">=24"
@@ -37,7 +43,8 @@
     "test": "npm run build --silent && node --test test/*.test.ts",
     "prepack": "npm run build --silent",
     "test:package": "npm run build --silent && node scripts/smoke-package.mjs",
-    "fuzz": "npm run build --silent && node scripts/fuzz.mjs"
+    "fuzz": "npm run build --silent && node scripts/fuzz.mjs",
+    "pack:runtime": "npm run build --silent && node scripts/pack-runtime.mjs"
   },
   "dependencies": {
     "typescript": "7.0.2"

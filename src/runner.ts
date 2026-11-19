@@ -136,6 +136,17 @@ export function locateLean(config: Config, cwd: string): string {
   const explicit = config.lean ?? process.env["PUDDING_LEAN"]
   if (explicit) return isAbsolute(explicit) ? explicit : resolve(cwd, explicit)
   const suffix = process.platform === "win32" ? ".exe" : ""
+  const name = toolchainName()
+  // What `install-lean` left behind: in the project, next to Pudding itself, or in the shared cache.
+  const installed = [
+    ...[cwd, packageRoot].flatMap(root => globSync(".toolchain/lean-*/bin/lean" + suffix, { cwd: root }).sort().slice(-1).map(found => join(root, found))),
+    ...(name ? [join(cacheDirectory(), name, "bin", "lean" + suffix)] : []),
+  ].filter(candidate => existsSync(candidate))
+  // A whole Lean is only there because someone asked for one, so that a proof
+  // of their own can use more of the library. It goes before the trimmed
+  // runtime package for that reason.
+  const whole = installed.find(candidate => existsSync(join(dirname(dirname(candidate)), "lib", "lean", "Lean.olean")))
+  if (whole) return whole
   try {
     const manifest = createRequire(import.meta.url).resolve(`${packageName}-lean-${process.platform}-${process.arch}/package.json`)
     const bundled = join(dirname(manifest), "bin", "lean" + suffix)
@@ -143,13 +154,8 @@ export function locateLean(config: Config, cwd: string): string {
   } catch {
     // The runtime package is optional.
   }
-  for (const root of [cwd, packageRoot]) {
-    const found = globSync(".toolchain/lean-*/bin/lean" + suffix, { cwd: root }).sort().at(-1)
-    if (found) return join(root, found)
-  }
-  const name = toolchainName()
-  const candidates = [...(name ? [join(cacheDirectory(), name, "bin", "lean" + suffix)] : []), join(homedir(), ".elan", "bin", "lean" + suffix)]
-  return candidates.find(candidate => existsSync(candidate)) ?? "lean"
+  const elan = join(homedir(), ".elan", "bin", "lean" + suffix)
+  return installed[0] ?? (existsSync(elan) ? elan : "lean")
 }
 
 function leanVersion(lean: string, cache: Cache): string {
@@ -518,7 +524,7 @@ export async function run(options: RunOptions = {}): Promise<Report> {
     } catch {
       for (const statement of authored) {
         const outcome = outcomes.get(statement)!
-        outcome.message += "\n(This Lean installation holds only the part of the library Pudding itself uses. A proof that needs more of it needs a full Lean: see PUDDING_LEAN.)"
+        outcome.message += "\n(This Lean installation holds only the part of the library Pudding itself uses. A proof that needs more of it needs a full Lean: run `pudding install-lean --full`, or set PUDDING_LEAN.)"
       }
     }
   }

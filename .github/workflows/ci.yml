@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, macos-15-intel]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+      - uses: actions/cache@v4
+        with:
+          path: .toolchain
+          key: lean-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('src/install.ts', 'src/lean.ts') }}
+      - run: node dist/cli.js install-lean --local
+      - run: npm test
+      - run: npm run proof
+      - run: npm run test:package
+      - run: npm run fuzz -- --seed ${{ github.run_number }} --programs 300
