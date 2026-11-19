@@ -80,7 +80,8 @@ type Modifier = "run" | "skip" | "only" | "todo"
  * Anything else, such as importing it by accident, does nothing.
  */
 const registry = () => (globalThis as Record<symbol, unknown>)[REGISTRY] as Registered[] | undefined
-const vitest = typeof process !== "undefined" && process.env["VITEST"] !== undefined && !registry() ? await import("./vitest.ts") : undefined
+const bridge = typeof process !== "undefined" && process.env["VITEST"] !== undefined && !registry() ? await import("./vitest.ts").catch(() => undefined) : undefined
+const vitest = bridge?.collecting() ? bridge : undefined
 
 const register = (modifier: Modifier) => (name: string, second?: unknown, third?: unknown): void => {
   const collected = registry()

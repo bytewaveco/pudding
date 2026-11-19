@@ -3,7 +3,7 @@
 // when the file's first test starts.
 
 import { resolve } from "node:path"
-import { describe as suite, test } from "vitest"
+import { describe as suite, expect as vitestExpect, test } from "vitest"
 import type { LawReport, Report } from "./runner.ts"
 
 export type Modifier = "run" | "skip" | "only" | "todo"
@@ -41,6 +41,18 @@ function proofs(file: Task["file"]): Promise<Report> {
 
 const path = (task: Task): string[] => (task.suite && task.suite !== task.file ? [...path(task.suite), task.name] : [task.name])
 const tests = (task: Task): Task[] => (task.tasks ?? []).flatMap(child => (child.type === "test" ? [child] : tests(child)))
+
+/**
+ * Whether Vitest is collecting a test file right now. The `VITEST` variable
+ * alone does not say so: every process a test starts inherits it.
+ */
+export function collecting(): boolean {
+  try {
+    return typeof vitestExpect.getState().testPath === "string"
+  } catch {
+    return false
+  }
+}
 
 /** An error that reads like Pudding's own report and points at the line in the law file. */
 function failure(entry: LawReport): Error {
