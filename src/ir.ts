@@ -279,6 +279,15 @@ export function stringLiterals(e: Expr, into = new Set<string>(), seen = new Set
   return into
 }
 
+export function integerLiterals(e: Expr, into = new Set<bigint>(), seen = new Set<Expr>()): Set<bigint> {
+  if (e.t === "lit" && typeof e.value === "bigint") into.add(e.value)
+  else if (e.t === "op" && !seen.has(e)) {
+    seen.add(e)
+    for (const arg of e.args) integerLiterals(arg, into, seen)
+  }
+  return into
+}
+
 export class EvaluationError extends Error {}
 
 /** Evaluate with JavaScript semantics. Only used for diagnostics, never to accept a law. */

@@ -227,7 +227,7 @@ function writeProject(directory: string, base: string | undefined, lawFiles: str
  * only. Node erases type syntax but neither resolves `./cart` to `./cart.ts`
  * nor drops an imported interface, and bundler-style code relies on both.
  */
-function runtimeMap(program: Program, checker: Checker): RuntimeMap {
+function runtimeMap(program: Program, checker: Checker, ambiguous: (message: string) => void): RuntimeMap {
   const map: RuntimeMap = { resolutions: new Map(), elided: new Map() }
   // The compiler's nodes are handled untyped, as in the translator.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -258,7 +258,15 @@ function runtimeMap(program: Program, checker: Checker): RuntimeMap {
       if (specifier?.kind === K.StringLiteral) {
         const symbol = checker.getSymbolAtLocation(specifier)
         const target = (symbol?.valueDeclaration ?? symbol?.declarations[0])?.resolve()?.getSourceFile()
-        if (target && !target.isDeclarationFile && !program.isSourceFileFromExternalLibrary(target)) resolutions.set(specifier.text, target.fileName)
+        if (target && !target.isDeclarationFile && !program.isSourceFileFromExternalLibrary(target)) {
+          // `./x.js` normally means the TypeScript file `./x.ts`. If a real
+          // `./x.js` also exists, Node runs that one, and it may not be what
+          // TypeScript read. Leave the import to Node and say so.
+          const literal = /^\.{1,2}\//.test(specifier.text) ? resolve(dirname(name), specifier.text) : undefined
+          if (literal && literal !== target.fileName && existsSync(literal) && statSync(literal).isFile()) {
+            ambiguous(`${name} imports \`${specifier.text}\`, and both that file and ${target.fileName} exist: TypeScript reads one and Node runs the other, so a proof about the first says nothing certain about the second. Remove one of them or import the TypeScript file by its own name`)
+          } else resolutions.set(specifier.text, target.fileName)
+        }
       }
       if (isImport ? statement.importClause?.phaseModifier === K.TypeKeyword : statement.isTypeOnly) continue
       const bindings: N[] = isImport
@@ -399,7 +407,9 @@ export async function run(options: RunOptions = {}): Promise<Report> {
     for (const file of readable) laws.push(...translator.translateFile(program.getSourceFile(file)!, selected))
     for (const file of translator.reached) if (!readable.includes(file)) diagnose(file)
     if (report.errors.length) return finish()
-    if (config.crossCheck !== false) executable = runtimeMap(program, checker)
+    const map = runtimeMap(program, checker, message => report.errors.push(message.replaceAll(cwd + "/", "")))
+    if (report.errors.length) return finish()
+    if (config.crossCheck !== false) executable = map
   } finally {
     api.close()
     report.timings.typescript = Math.round(performance.now() - reading)
@@ -435,12 +445,13 @@ export async function run(options: RunOptions = {}): Promise<Report> {
   const job: Job | undefined = executable && {
     map: executable,
     budget: RUNTIME_BUDGET,
-    files: [...new Set(candidates.map(law => law.file))].map(file => ({
+    files: lawFiles.map(file => ({
       file,
       registered: candidates.filter(law => law.file === file).length,
       laws: candidates.filter(law => law.file === file && law.mode === "run" && law.problem?.kind !== "invalid").map(law => ({
         index: law.index,
         unproved: law.problem !== undefined,
+        mentioned: law.problem ? law.mentioned : [],
         instances: law.instances.map(instance => ({
           binders: instance.binders, arg: instance.arg, obligations: instance.obligations.map(o => ({ guard: o.guard, claim: o.claim, inexact: o.kind === "overflow" || o.kind === "nan" })),
         })),
@@ -602,6 +613,9 @@ export async function run(options: RunOptions = {}): Promise<Report> {
             kind: "throws", message: `the law file throws when it is loaded (${reason})`, file: law.file, line: law.line, column: law.column,
           })
         }
+      } else if (outcome?.miscounted) {
+        // Laws that exist at run time but were never read would otherwise go unchecked without a word.
+        report.errors.push(`${displayPath(cwd, file)} registers ${outcome.miscounted.ran} ${outcome.miscounted.ran === 1 ? "law" : "laws"} when it runs, but Pudding read ${outcome.miscounted.read} from it; write each law as a plain law() or describe() call`)
       } else if (reason) report.warnings.push(`${displayPath(cwd, file)} was not compared with the running code: ${reason}`)
       for (const result of outcome?.laws ?? []) {
         const law = candidates.find(candidate => candidate.file === file && candidate.index === result.index)!
@@ -615,6 +629,13 @@ export async function run(options: RunOptions = {}): Promise<Report> {
           })
         }
         if (law.problem && result.executed) executedOnly.set(law, result.exhaustive)
+        // Lean accepted every theorem of this law, yet the model those theorems describe fails here.
+        if (!law.problem && !entry.findings.length && result.modelFails) {
+          entry.findings.push({
+            kind: "mismatch", inputs: result.modelFails, file: law.file, line: law.line, column: law.column,
+            message: "Lean accepted the proof, but evaluating the same model on this input says the law fails; the proof cannot be trusted",
+          })
+        }
       }
     }
   }

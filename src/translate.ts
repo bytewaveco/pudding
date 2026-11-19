@@ -72,6 +72,8 @@ export interface Law {
   proof: string | undefined
   /** One instance per alternative of a union-typed input. */
   instances: LawInstance[]
+  /** Constants met while translating, so inputs can be aimed at them even when translation stops early. */
+  mentioned: Expr[]
   /** Every `expect()` in the law, keyed by `line:column`. */
   expectSites: Map<string, { line: number; column: number; text: string }>
   /** Set when the law could not be translated. */
@@ -104,7 +106,17 @@ interface Cell {
   readonly mutable: boolean
 }
 
+/**
+ * Every binding made in a scope is logged, so that evaluating one branch of a
+ * condition can be undone before evaluating the other. Only scopes that
+ * existed before the branch are rolled back; scopes created inside it belong
+ * to whatever the branch produced, such as a closure it returned.
+ */
+let scopesCreated = 0
+const bindingLog: { env: Env; name: string; previous: Cell | undefined }[] = []
+
 class Env {
+  readonly serial = scopesCreated++
   private readonly vars = new Map<string, Cell>()
   private readonly parent: Env | undefined
   constructor(parent?: Env) {
@@ -118,8 +130,14 @@ class Env {
   }
   set(name: string, value: Value, mutable = false): Cell {
     const cell = { value, mutable }
+    bindingLog.push({ env: this, name, previous: this.vars.get(name) })
     this.vars.set(name, cell)
     return cell
+  }
+  /** Put a binding back to what it was, or remove it. */
+  revert(name: string, previous: Cell | undefined) {
+    if (previous) this.vars.set(name, previous)
+    else this.vars.delete(name)
   }
   child() {
     return new Env(this)
@@ -129,6 +147,13 @@ class Env {
     for (const [name, cell] of this.vars) if (cell.mutable) into.add(name)
     return this.parent ? this.parent.mutableNames(into) : into
   }
+}
+
+/** The variable state at one moment: values of the live reassignable variables, and how far the binding log had got. */
+interface Saved {
+  values: Value[]
+  logged: number
+  scopes: number
 }
 
 /** Where control goes when a statement list ends, breaks out of, or continues a loop. */
@@ -202,6 +227,8 @@ export class Translator {
   private steps = 0
   /** Module constants whose initializers are being evaluated, innermost last. */
   private loading: { file: string; position: number }[] = []
+  private mentioned: Expr[] = []
+  private readonly expects = new Map<Node, boolean>()
   private readonly facts = new Map<Node, { assigned: Set<string>; mentioned: Set<string>; returnsValue: boolean }>()
   private instance: LawInstance | undefined
   private names = { law: new Set<string>(), domain: new Set<string>(), expect: new Set<string>(), describe: new Set<string>() }
@@ -266,11 +293,13 @@ export class Translator {
   ) {
     if (env) this.enter(statements, env)
     const invalid = (statement: N, message: string) => laws.push({
-      name: sourceText(statement), ...locate(statement), index: -1, mode: "run", proof: undefined, instances: [], expectSites: new Map(),
+      name: sourceText(statement), ...locate(statement), index: -1, mode: "run", proof: undefined, instances: [], mentioned: [], expectSites: new Map(),
       problem: { kind: "invalid", message, ...locate(statement) },
     })
     for (const statement of statements) {
       if (statement.kind !== K.ExpressionStatement) {
+        // Anything else at the top of a law file could register laws that are never read, such as `if (x) law(...)`.
+        if (!env && !MODULE_DECLARATIONS.has(statement.kind)) invalid(statement, "only law() and describe() calls and declarations are allowed in a law file")
         if (!env || DECLARATIONS_WITHOUT_VALUE.has(statement.kind)) continue
         try {
           if (statement.kind === K.VariableStatement) this.declare(statement, env)
@@ -311,7 +340,9 @@ export class Translator {
       const index = laws.filter(law => law.index >= 0).length
       if (modifier === "todo" || own === "skip" || !selected(name)) {
         laws.push({
-          name, ...locate(call), index, mode: modifier === "todo" ? "todo" : "skip", proof: undefined, instances: [], expectSites: new Map(), problem: undefined,
+          name, ...locate(call), index, mode: modifier === "todo" ? "todo" : "skip", proof: undefined, instances: [], mentioned: [], expectSites: new Map(), problem: undefined,
+          // A law marked `only` narrows its file even when a name filter leaves it out.
+          ...(own === "only" && modifier !== "todo" ? { only: true } : {}),
         })
         continue
       }
@@ -328,7 +359,7 @@ export class Translator {
   private translateLaw(call: N, index: number, name: string, scope: Env | undefined): Law {
     const args = call.arguments as N[]
     const law: Law = {
-      name, ...locate(call), index, mode: "run", proof: undefined, instances: [], expectSites: new Map(), problem: undefined,
+      name, ...locate(call), index, mode: "run", proof: undefined, instances: [], mentioned: [], expectSites: new Map(), problem: undefined,
     }
     const invalid = (message: string, node: Node) => {
       law.problem = { kind: "invalid", message, ...locate(node) }
@@ -349,6 +380,7 @@ export class Translator {
       }
     }
     this.collectExpectSites(callback.body, law)
+    this.mentioned = law.mentioned
     try {
       let alternatives: Shape[] = [{ k: "tuple", items: [] }]
       if (hasDomain) {
@@ -372,6 +404,7 @@ export class Translator {
         this.pc = [...instance.assumptions]
         this.stack = []
         this.cells = []
+        bindingLog.length = 0
         this.steps = 0
         this.assigned = [this.factsOf(callback).assigned]
         const env = scope ? scope.child() : new Env()
@@ -413,7 +446,7 @@ export class Translator {
 
   private collectExpectSites(node: N, law: Law) {
     const visit = (n: N) => {
-      if (n.kind === K.CallExpression && this.isCallTo(n, this.names.expect)) {
+      if (this.isExpect(n)) {
         let statement = n
         while (statement.parent && statement.kind !== K.ExpressionStatement && statement !== node) statement = statement.parent
         const at = locate(statement)
@@ -555,10 +588,28 @@ export class Translator {
   // ------------------------------------------------------------- law bodies
 
   /** Whether a call is rooted in `expect(...)`, however the chain after it is written. */
+  /**
+   * Whether a call is to the `expect` this library exports, and not to
+   * something else that happens to have its name. Decided by where the name
+   * was imported from, since the code being read may be in any module.
+   */
+  private isExpect(node: N): boolean {
+    if (node?.kind !== K.CallExpression || node.expression.kind !== K.Identifier) return false
+    const callee = node.expression
+    let known = this.expects.get(callee)
+    if (known === undefined) {
+      const declaration = this.checker.getSymbolAtLocation(callee)?.declarations[0]?.resolve() as N
+      known = declaration?.kind === K.ImportSpecifier && (declaration.propertyName ?? declaration.name).text === "expect" &&
+        declaration.parent.parent.parent.moduleSpecifier.text === this.moduleName
+      this.expects.set(callee, known)
+    }
+    return known
+  }
+
   private startsWithExpect(node: N): boolean {
     let current = node
     while (current) {
-      if (this.isCallTo(current, this.names.expect)) return true
+      if (this.isExpect(current)) return true
       if (current.kind === K.CallExpression || current.kind === K.PropertyAccessExpression) current = current.expression
       else return false
     }
@@ -576,25 +627,21 @@ export class Translator {
       negated = true
       target = target.expression
     }
-    if (!this.isCallTo(target, this.names.expect) || target.arguments.length !== 1) throw fail()
+    if (!this.isExpect(target) || target.arguments.length !== 1) throw fail()
     const actual = this.evalExpr(target.arguments[0], env)
     const expected = this.evalExpr(node.arguments[0], env)
-    if (matcher === "toBe" && (actual.k !== "scalar" || expected.k !== "scalar")) {
-      throw new Unsupported("toBe compares identity, which is only modeled for booleans, bigints and strings; use toEqual", node)
-    }
-    const equal = this.equal(actual, expected, node)
+    const equal = this.equal(actual, expected, node, matcher === "toBe")
     const sides = actual.k === "scalar" && expected.k === "scalar" ? { actual: actual.e, expected: expected.e, negated, num: !!actual.num } : undefined
     this.emit("expect", negated ? ir.not(equal) : equal, node, sides)
   }
 
-  private equal(a: Value, b: Value, at: Node): Expr {
+  /** Whether two values are equal as `toEqual` sees it, or as `toBe` does when `identity` is set. */
+  private equal(a: Value, b: Value, at: Node, identity = false): Expr {
     if (a.k === "bottom" || b.k === "bottom") return ir.FALSE
-    if (a.k === "choice") return ir.ite(a.cond, this.equal(a.a, b, at), this.equal(a.b, b, at))
-    if (b.k === "choice") return ir.ite(b.cond, this.equal(a, b.a, at), this.equal(a, b.b, at))
-    if (a.k === "scalar" && b.k === "scalar") {
-      if (a.e.ty !== b.e.ty || !!a.num !== !!b.num) throw new Unsupported(`cannot compare ${describe(a)} with ${describe(b)}`, at)
-      return ir.eq(a.e, b.e)
-    }
+    if (a.k === "choice") return ir.ite(a.cond, this.equal(a.a, b, at, identity), this.equal(a.b, b, at, identity))
+    if (b.k === "choice") return ir.ite(b.cond, this.equal(a, b.a, at, identity), this.equal(a, b.b, at, identity))
+    if (this.isPlain(a) && this.isPlain(b)) return this.strictEqual(a, b, at)
+    if (identity) throw new Unsupported("toBe compares identity, which is only modeled for booleans, bigints, numbers and strings; use toEqual", at)
     if (a.k === "array" && b.k === "array") {
       if (a.items.length !== b.items.length) return ir.FALSE
       return ir.all(a.items.map((item, i) => this.equal(item, b.items[i]!, at)))
@@ -636,14 +683,18 @@ export class Translator {
     }
   }
 
-  private save(): Value[] {
-    return this.cells.map(cell => cell.value)
+  private save(): Saved {
+    return { values: this.cells.map(cell => cell.value), logged: bindingLog.length, scopes: scopesCreated }
   }
 
-  /** Put variables back to a saved state, forgetting any declared since. */
-  private restore(saved: Value[]) {
-    this.cells.length = saved.length
-    this.cells.forEach((cell, i) => (cell.value = saved[i]!))
+  /** Put variables and bindings back to a saved state, forgetting any declared since. */
+  private restore(saved: Saved) {
+    this.cells.length = saved.values.length
+    this.cells.forEach((cell, i) => (cell.value = saved.values[i]!))
+    while (bindingLog.length > saved.logged) {
+      const entry = bindingLog.pop()!
+      if (entry.env.serial < saved.scopes) entry.env.revert(entry.name, entry.previous)
+    }
   }
 
   /**
@@ -669,11 +720,12 @@ export class Translator {
    */
   private mergeStates(cond: Expr, whenTrue: () => void, whenFalse: () => void) {
     const before = this.save()
+    const kept = before.values.length
     this.under(cond, whenTrue)
-    const afterTrue = this.save()
+    const afterTrue = this.cells.slice(0, kept).map(cell => cell.value)
     this.restore(before)
     this.under(ir.not(cond), whenFalse)
-    const afterFalse = this.save()
+    const afterFalse = this.cells.slice(0, kept).map(cell => cell.value)
     this.restore(before)
     this.cells.forEach((cell, i) => {
       const a = afterTrue[i]!
@@ -733,8 +785,8 @@ export class Translator {
     if (!reassignable && !(list.flags & NodeFlags.Const)) throw new Unsupported("`var` is not supported; use `const` or `let`", statement)
     for (const declaration of list.declarations as N[]) {
       if (!declaration.initializer && !reassignable) throw new Unsupported("a declaration needs an initializer", declaration)
-      // A `let` without an initializer holds nothing until it is assigned; TypeScript rejects reading it before then.
-      this.bind(declaration.name, declaration.initializer ? this.evalExpr(declaration.initializer, env) : BOTTOM, env, false, reassignable)
+      // A `let` without an initializer holds undefined until it is assigned.
+      this.bind(declaration.name, declaration.initializer ? this.evalExpr(declaration.initializer, env) : VOID, env, false, reassignable)
     }
   }
 
@@ -795,12 +847,17 @@ export class Translator {
     this.stack.push(node)
     this.assigned.push(facts.assigned)
     try {
-      parametersOf(node).forEach((parameter, i) => {
+      // Every parameter is in scope, uninitialized, while the defaults before it run.
+      const parameters = parametersOf(node)
+      for (const parameter of parameters) for (const name of boundNames(parameter.name)) env.set(name, UNINITIALIZED)
+      parameters.forEach((parameter, i) => {
         if (parameter.dotDotDotToken) throw new Unsupported("rest parameters are not supported", parameter)
         let value = args[i]
-        if (!value) {
-          if (!parameter.initializer) throw new Unsupported("a call must pass every parameter that has no default", at)
-          value = this.evalExpr(parameter.initializer, env)
+        // A default applies when the argument is missing or undefined.
+        if (value?.k === "choice" && parameter.initializer) throw new Unsupported("an argument that may or may not be undefined, for a parameter with a default, is not supported", at)
+        if (!value || value.k === "void") {
+          if (parameter.initializer) value = this.evalExpr(parameter.initializer, env)
+          else if (!value) throw new Unsupported("a call must pass every parameter that has no default", at)
         }
         this.bind(parameter.name, value, env, false, true)
       })
@@ -893,14 +950,14 @@ export class Translator {
         return rest()
       }
       case K.SwitchStatement: {
-        const subject = this.scalarOf(this.evalExpr(statement.expression, env), statement.expression)
+        const subject = this.evalExpr(statement.expression, env)
         const clauses = statement.caseBlock.clauses as N[]
+        // The whole switch is one block: its declarations exist before any label is evaluated.
+        const scope = env.child()
+        this.enter(clauses.flatMap(clause => clause.statements as N[]), scope)
         // Entering at a clause runs it and every clause below it until a break.
-        const bodyFrom = (start: number) => {
-          const scope = env.child()
-          this.enter(clauses.flatMap(clause => clause.statements as N[]), scope)
-          return this.exec(clauses.slice(start).flatMap(clause => clause.statements as N[]), 0, scope, { ...flow, next: rest, brk: rest })
-        }
+        const bodyFrom = (start: number) =>
+          this.exec(clauses.slice(start).flatMap(clause => clause.statements as N[]), 0, scope, { ...flow, next: rest, brk: rest })
         const from = (index: number): Value => {
           const clause = clauses[index]
           if (!clause) return rest()
@@ -908,9 +965,9 @@ export class Translator {
             if (index !== clauses.length - 1) throw new Unsupported("`default` must be the last clause of a switch", clause)
             return bodyFrom(index)
           }
-          const label = this.scalarOf(this.evalExpr(clause.expression, env), clause.expression)
-          if (label.ty !== subject.ty) throw new Unsupported("a case label must have the type of the switch subject", clause)
-          return this.branch(ir.eq(subject, label), () => bodyFrom(index), () => from(index + 1))
+          const label = this.evalExpr(clause.expression, scope)
+          const matches = this.scalarOf(this.over(subject, value => this.over(label, candidate => scalar(this.strictEqual(value, candidate, clause)))), clause, "bool")
+          return this.branch(matches, () => bodyFrom(index), () => from(index + 1))
         }
         return from(0)
       }
@@ -922,7 +979,9 @@ export class Translator {
           throw new Unsupported("a loop must be written `for (const item of items)`", statement)
         }
         // The loop is unrolled, so the array must have a length known here.
-        return this.over(this.evalExpr(statement.expression, env), items => {
+        const header = env.child()
+        for (const name of boundNames(declared[0].name)) header.set(name, UNINITIALIZED)
+        return this.over(this.evalExpr(statement.expression, header), items => {
           if (items.k === "bottom") return BOTTOM
           if (items.k !== "array") throw new Unsupported(`a loop needs an array whose length is known here, but this is ${describe(items)}`, statement.expression)
           const iterate = (index: number): Value => {
@@ -945,8 +1004,10 @@ export class Translator {
         // only depends on a counter and on lengths known here.
         const scope = env.child()
         const initializer = statement.kind === K.ForStatement ? statement.initializer : undefined
-        if (initializer?.kind === K.VariableDeclarationList) this.declare(initializer, scope)
-        else if (initializer) this.effect(initializer, scope)
+        if (initializer?.kind === K.VariableDeclarationList) {
+          for (const declaration of initializer.declarations as N[]) for (const name of boundNames(declaration.name)) scope.set(name, UNINITIALIZED)
+          this.declare(initializer, scope)
+        } else if (initializer) this.effect(initializer, scope)
         const condition = statement.kind === K.ForStatement ? statement.condition : statement.expression
         const body = statement.statement
         let rounds = 0
@@ -1043,20 +1104,16 @@ export class Translator {
         return this.evalExpr(node.expression, env)
       case K.StringLiteral:
       case K.NoSubstitutionTemplateLiteral:
-        return scalar(ir.lit(this.wellFormed(node.text, node)))
+        return this.note(ir.lit(this.wellFormed(node.text, node)))
       case K.TrueKeyword: return scalar(ir.TRUE)
       case K.FalseKeyword: return scalar(ir.FALSE)
-      case K.BigIntLiteral: return scalar(ir.lit(BigInt(node.text.replace(/n$/, "").replaceAll("_", ""))))
+      case K.BigIntLiteral: return this.note(ir.lit(BigInt(node.text.replace(/n$/, "").replaceAll("_", ""))))
       case K.NumericLiteral: {
         const value = Number(node.text)
         if (!Number.isSafeInteger(value)) throw new Unsupported("only whole numbers up to 2^53 - 1 are modeled; fractions and larger numbers are not", node)
-        return scalar(ir.lit(BigInt(value)), true)
+        return this.note(ir.lit(BigInt(value)), true)
       }
-      case K.Identifier: {
-        const local = env.get(node.text)
-        if (local?.k === "uninitialized") throw new Unsupported(`\`${node.text}\` is read before its declaration has run, which throws`, node)
-        return local ?? this.global(node)
-      }
+      case K.Identifier: return this.read(node, env)
       case K.ArrowFunction:
       case K.FunctionExpression:
         return { k: "closure", node, env }
@@ -1089,7 +1146,7 @@ export class Translator {
             if (spread.k !== "record") throw new Unsupported(`cannot spread ${describe(spread)} into an object`, property)
             for (const [key, field] of spread.fields) fields.set(key, field)
           } else if (property.kind === K.ShorthandPropertyAssignment) {
-            fields.set(property.name.text, env.get(property.name.text) ?? this.global(property.name, true))
+            fields.set(property.name.text, this.read(property.name, env, true))
           } else if (property.kind === K.PropertyAssignment && (property.name.kind === K.Identifier || property.name.kind === K.StringLiteral)) {
             // In an object literal this name sets the prototype instead of storing a property.
             if (property.name.text === "__proto__") throw new Unsupported("`__proto__` in an object literal sets the prototype, which is not modeled", property)
@@ -1136,6 +1193,37 @@ export class Translator {
     }
   }
 
+  /** A literal from the source, remembered as a value worth trying as an input. */
+  private note(literal: Expr, num = false): Value {
+    if (this.mentioned.length < 256) this.mentioned.push(literal)
+    return scalar(literal, num)
+  }
+
+  /** The value a name stands for: a local binding, or else a module-level declaration. */
+  private read(node: N, env: Env, shorthand = false): Value {
+    const local = env.get(node.text)
+    if (local?.k === "uninitialized") throw new Unsupported(`\`${node.text}\` is read before its declaration has run, which throws`, node)
+    return local ?? this.global(node, shorthand)
+  }
+
+  /**
+   * `a === b` for two values. Values of different kinds are never equal, and
+   * a number is a different kind from a bigint even when both are whole.
+   */
+  private strictEqual(a: Value, b: Value, at: Node): Expr {
+    if (a.k === "void" || b.k === "void") return a.k === b.k ? ir.TRUE : this.isPlain(a) && this.isPlain(b) ? ir.FALSE : this.refuseEquality(a, b, at)
+    if (a.k !== "scalar" || b.k !== "scalar") return this.refuseEquality(a, b, at)
+    return a.e.ty === b.e.ty && !!a.num === !!b.num ? ir.eq(a.e, b.e) : ir.FALSE
+  }
+
+  private isPlain(value: Value): boolean {
+    return value.k === "scalar" || value.k === "void"
+  }
+
+  private refuseEquality(a: Value, b: Value, at: Node): never {
+    throw new Unsupported(`comparing ${describe(a)} with ${describe(b)} is not modeled; only booleans, bigints, numbers, strings and undefined are compared by ===`, at)
+  }
+
   private binary(node: N, env: Env): Value {
     const operator = node.operatorToken.kind
     if (operator === K.AmpersandAmpersandToken || operator === K.BarBarToken) {
@@ -1148,10 +1236,9 @@ export class Translator {
     const leftValue = this.evalExpr(node.left, env)
     const rightValue = this.evalExpr(node.right, env)
     if (operator === K.EqualsEqualsEqualsToken || operator === K.ExclamationEqualsEqualsToken) {
-      if (leftValue.k !== "scalar" || rightValue.k !== "scalar") throw new Unsupported("=== is only modeled for booleans, bigints and strings", node)
-      if (leftValue.e.ty !== rightValue.e.ty || !!leftValue.num !== !!rightValue.num) throw new Unsupported(`cannot compare ${describe(leftValue)} with ${describe(rightValue)}`, node)
-      const equal = ir.eq(leftValue.e, rightValue.e)
-      return scalar(operator === K.EqualsEqualsEqualsToken ? equal : ir.not(equal))
+      const equal = this.over(leftValue, left => this.over(rightValue, right => scalar(this.strictEqual(left, right, node))))
+      const same = this.scalarOf(equal, node, "bool")
+      return scalar(operator === K.EqualsEqualsEqualsToken ? same : ir.not(same))
     }
     if (operator === K.EqualsEqualsToken || operator === K.ExclamationEqualsToken) throw new Unsupported("use === and !==; loose equality is not modeled", node)
     if (operator >= K.FirstAssignment && operator <= K.LastAssignment) throw new Unsupported("an assignment used as a value is not supported; write it as its own statement", node)
@@ -1338,12 +1425,8 @@ export class Translator {
       case "reduce":
         return items.reduce((accumulator, item, index) => invoke(first, [accumulator, item, position(index)]), second!)
       case "includes": {
-        const needle = this.scalarOf(first, node)
-        return scalar(items.map(item => {
-          const element = this.scalarOf(item, node)
-          if (element.ty !== needle.ty) throw new Unsupported("includes() needs elements of the type being searched for", node)
-          return ir.eq(element, needle)
-        }).reduce(ir.or, ir.FALSE))
+        return scalar(items.map(item => this.scalarOf(this.over(item, element => this.over(first, needle => scalar(this.strictEqual(element, needle, node)))), node, "bool"))
+          .reduce(ir.or, ir.FALSE))
       }
       case "some":
       case "every": {
@@ -1451,6 +1534,22 @@ export class Translator {
       const inner = unwrap(node)
       return isFunction(inner) || (inner.kind === K.Identifier && local.has(inner.text))
     }
+    // Names this file imports. Only a function reached through one of them counts as a library.
+    const imported = new Set<string>()
+    for (const statement of file.statements as readonly N[]) {
+      const clause = statement.kind === K.ImportDeclaration ? statement.importClause : undefined
+      if (clause?.name) imported.add(clause.name.text)
+      if (clause?.namedBindings?.kind === K.NamespaceImport) imported.add(clause.namedBindings.name.text)
+      if (clause?.namedBindings?.kind === K.NamedImports) for (const element of clause.namedBindings.elements as N[]) imported.add(element.name.text)
+    }
+    const rootName = (node: N): string => {
+      let root = unwrap(node)
+      while (root.kind === K.PropertyAccessExpression || root.kind === K.ElementAccessExpression || root.kind === K.CallExpression) root = unwrap(root.expression)
+      return root.kind === K.Identifier ? root.text : ""
+    }
+    const shallow = (value: Value | undefined) =>
+      value?.k === "record" ? [...value.fields.values()].every(field => field.k === "scalar")
+        : value?.k === "array" ? value.items.every(item => item.k === "scalar") : false
     let runsOwnCode: N | undefined
     const declaredConst = unwrap(declaration.initializer) !== declaration.initializer && /\bas\s+const\b/.test(declaration.initializer.getText(file))
     const handedOver: { at: N; inFunction: boolean }[] = []
@@ -1482,13 +1581,14 @@ export class Translator {
             : reached.k === "record" ? reached.fields.get(step) : reached.k === "array" ? reached.items[Number(step)] : undefined
         }
         const reads = called || reached?.k === "scalar" || parent.kind === K.TypeQuery || parent.kind === K.TypeOfExpression ||
-          parent.kind === K.ExportSpecifier || parent.kind === K.ExportAssignment || parent.kind === K.SpreadElement || parent.kind === K.SpreadAssignment ||
+          parent.kind === K.ExportSpecifier || parent.kind === K.ExportAssignment ||
+          // A spread copies one level, so it only separates the copy from the table when that level holds no objects.
+          ((parent.kind === K.SpreadElement || parent.kind === K.SpreadAssignment) && shallow(reached)) ||
           (parent.kind === K.ForOfStatement && parent.expression === outer) ||
           (parent.kind === K.BinaryExpression && parent.operatorToken.kind !== K.CommaToken && !assigned)
         // A value declared `as const` may be given to a library while loading:
         // its type forbids changing it, and schema builders are the common case.
-        const toLibrary = declaredConst && parent.kind === K.CallExpression && parent.expression !== outer && !isLocalCode(parent.expression) &&
-          !/^(Object\.(assign|definePropert(y|ies)|setPrototypeOf)|Reflect\.\w+)$/.test(parent.expression.getText(file))
+        const toLibrary = declaredConst && parent.kind === K.CallExpression && parent.expression !== outer && imported.has(rootName(parent.expression))
         if (!reads && !toLibrary) handedOver.push({ at: parent, inFunction })
       }
       node.forEachChild((child: N) => visit(child, inFunction || isFunction(child)))

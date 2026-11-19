@@ -6,7 +6,7 @@ import { fileURLToPath, pathToFileURL } from "node:url"
 import { parentPort, workerData } from "node:worker_threads"
 import * as ir from "./ir.ts"
 import type { Binder, Expr, Scalar } from "./ir.ts"
-import { assignments, showInputs, stringPool } from "./search.ts"
+import { assignments, showInputs, valuePool } from "./search.ts"
 import type { ArgShape } from "./translate.ts"
 
 export interface RuntimeMap {
@@ -30,7 +30,8 @@ export interface Job {
     file: string
     /** How many laws the translator saw; a different count at run time means the two cannot be paired up. */
     registered: number
-    laws: { index: number; unproved: boolean; instances: Instance[] }[]
+    /** `mentioned` holds the constants of a law that could not be translated, so sampling can still aim at them. */
+    laws: { index: number; unproved: boolean; instances: Instance[]; mentioned: Expr[] }[]
   }[]
 }
 
@@ -39,6 +40,8 @@ export interface LawOutcome {
   executed: number
   exhaustive: boolean
   failure?: { kind: "counterexample" | "mismatch"; inputs: Record<string, string>; actual: boolean; expected: boolean }
+  /** An input for which the model itself says the law fails. If Lean accepted the law, something is wrong. */
+  modelFails?: Record<string, string>
 }
 
 export interface FileOutcome {
@@ -47,6 +50,8 @@ export interface FileOutcome {
   error?: string
   /** True when the file itself throws while it loads, as opposed to Node being unable to run TypeScript like it. */
   throws?: boolean
+  /** Set when the file registered a different number of laws than were read from its source. */
+  miscounted?: { ran: number; read: number }
   laws: LawOutcome[]
 }
 
@@ -113,7 +118,9 @@ async function register(file: string): Promise<Registered[] | { message: string;
     return registry
   } catch (error) {
     const code = (error as { code?: unknown } | null)?.code
-    const tooling = error instanceof SyntaxError || (typeof code === "string" && TOOLING.has(code))
+    // A SyntaxError is Node's when it comes from linking modules. One raised by the code itself, by JSON.parse say, is the code failing.
+    const linking = error instanceof SyntaxError && /does not provide an export named|The requested module/.test(error.message)
+    const tooling = linking || (typeof code === "string" && TOOLING.has(code))
     const text = error instanceof Error ? `${error.name}: ${error.message.split("\n")[0]!}` : String(error)
     return { message: text, throws: !tooling }
   } finally {
@@ -143,7 +150,7 @@ async function execute(job: Job, report: (outcome: FileOutcome) => void) {
     if (!Array.isArray(runtime)) {
       outcome.error = runtime.throws ? runtime.message : `it could not be executed (${runtime.message})`
       outcome.throws = runtime.throws
-    } else if (runtime.length !== registered) outcome.error = "it registered a different number of laws when executed than Pudding read from it"
+    } else if (runtime.length !== registered) outcome.miscounted = { ran: runtime.length, read: registered }
     else {
       for (const law of laws) {
         const callback = runtime[law.index]?.callback
@@ -151,11 +158,12 @@ async function execute(job: Job, report: (outcome: FileOutcome) => void) {
         const result: LawOutcome = { index: law.index, executed: 0, exhaustive: true }
         for (const instance of law.instances) {
           const numbers = new Set(instance.binders.filter(b => b.num).map(b => b.name))
-          const space = assignments(instance.binders, stringPool(instance.obligations.flatMap(o => [o.guard, o.claim])), job.budget)
+          const space = assignments(instance.binders, valuePool([...instance.obligations.flatMap(o => [o.guard, o.claim]), ...law.mentioned]), job.budget)
           result.exhaustive &&= space.exhaustive
           space.each(env => {
             const expected = law.unproved ? true : modelHolds(instance, env)
             if (expected === "outside") return false
+            if (expected === false) result.modelFails ??= showInputs(instance.binders, env)
             result.executed++
             const actual = runtimeHolds(callback, instance.arg ? buildArgument(instance.arg, env, numbers) : undefined)
             if (actual === expected) return false

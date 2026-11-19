@@ -164,6 +164,11 @@ describe("grouping and selection", () => {
     assert.match(none.errors[0] ?? "", /no law file matches/)
   })
 
+  test("a focused law narrows its file even when a name filter leaves it out", async () => {
+    const report = await run({ cwd, cache: false, files: ["only"], name: "not selected" })
+    assert.deepEqual(statuses(report), { "the one law that runs": "skipped", "FALSE but not selected: red is terminal": "skipped" })
+  })
+
   test("the project needs no tsconfig of its own", () => {
     assert.equal(existsSync(join(cwd, "tsconfig.json")), false)
   })
@@ -175,7 +180,7 @@ describe("constructs that once produced a wrong proof", () => {
   for (const crossCheck of [true, false]) {
     test(`nothing is proved ${crossCheck ? "with" : "without"} executing the laws`, async () => {
       const report = await run({ cwd: join(fixtures, "soundness"), cache: false, crossCheck })
-      assert.equal(report.laws.length, 9)
+      assert.equal(report.laws.length, 24)
       for (const entry of report.laws) assert.equal(entry.status, "failed", `${entry.name}: ${JSON.stringify(entry.findings)}`)
     })
   }
@@ -186,12 +191,48 @@ describe("constructs that once produced a wrong proof", () => {
     assert.match(message("FALSE: the outer function supplies the result"), /the expectation does not hold/)
     assert.match(message("FALSE: reading the binding succeeds"), /`value` is read before its declaration has run/)
     assert.match(message("FALSE: the erased parameter takes the argument"), /the expectation does not hold/)
-    assert.match(message("FALSE: the callback uses its default index"), /cannot compare a number with a boolean/)
+    assert.match(message("FALSE: the callback uses its default index"), /the expectation does not hold/)
     assert.match(message("FALSE: every flag is set"), /reads a property the object does not have/)
     assert.match(message("FALSE: the literal stores its tag"), /`__proto__`/)
     assert.match(message("FALSE: the initial flag survives configuration"), /`flags` is handed to other code while its module loads at line 36/)
     assert.match(message("FALSE: a flag dictionary is empty"), /allows any number of properties/)
     assert.match(message("FALSE: ready initializes to true"), /`flag` is read while its module is loading/)
+  })
+
+  test("an unfinished proof is rejected by name", async () => {
+    const report = await run({ cwd: join(fixtures, "soundness"), cache: false, crossCheck: false, name: "every bigint is zero" })
+    const entry = law(report, "FALSE: every bigint is zero")
+    assert.equal(entry.status, "failed")
+    assert.deepEqual(entry.findings[0]?.inputs, { n: "1n" })
+  })
+
+  test("values that only misbehave at one constant are found there", async () => {
+    const report = await run({ cwd: join(fixtures, "soundness"), cache: false, crossCheck: false, files: ["state"] })
+    for (const name of ["FALSE: an unset let is always assigned", "FALSE: the default never runs", "FALSE: a number in a list matches a bigint", "FALSE: a number case matches a bigint"]) {
+      assert.deepEqual(law(report, name).findings[0]?.inputs, { n: "424242n" }, name)
+    }
+  })
+
+  test("a law that is registered but cannot be read stops the run", async () => {
+    for (const crossCheck of [true, false]) {
+      const report = await run({ cwd: join(fixtures, "unreadable"), cache: false, crossCheck })
+      assert.equal(report.ok, false)
+      assert.match(JSON.stringify(report.laws), /only law\(\) and describe\(\) calls and declarations are allowed/)
+    }
+  })
+
+  test("an import that TypeScript and Node resolve to different files stops the run", async () => {
+    for (const crossCheck of [true, false]) {
+      const report = await run({ cwd: join(fixtures, "ambiguous"), cache: false, crossCheck })
+      assert.equal(report.ok, false)
+      assert.equal(report.laws.length, 0)
+      assert.match(report.errors[0] ?? "", /both that file and subject\.ts exist/)
+    }
+  })
+
+  test("a module that throws an error of its own while loading fails its laws", async () => {
+    const report = await run({ cwd: join(fixtures, "throwing"), cache: false })
+    assert.match(law(report, "FALSE: the module loads").findings.map(f => f.message).join(), /throws when it is loaded \(SyntaxError/)
   })
 
   test("a law file that throws when loaded fails its laws", async () => {

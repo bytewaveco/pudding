@@ -32,12 +32,12 @@ export interface Assignments {
 }
 
 /** Inputs to try: every combination when the space is small enough, otherwise a sample. */
-export function assignments(binders: readonly Binder[], strings: readonly string[], budget: number): Assignments {
+export function assignments(binders: readonly Binder[], pool: Pool, budget: number): Assignments {
+  const strings = pool.strings
   const integers = (b: Binder): readonly Scalar[] => {
-    if (!b.range) return INTEGERS
-    const [low, high] = b.range
-    const edges = [low, low + 1n, high - 1n, high, (low + high) / 2n]
-    return [...new Set([...INTEGERS, ...edges].filter(value => value >= low && value <= high))]
+    const [low, high] = b.range ?? [undefined, undefined]
+    const edges = low === undefined ? [] : [low, low + 1n, high - 1n, high, (low + high) / 2n]
+    return [...new Set([...INTEGERS, ...pool.integers, ...edges].filter(value => low === undefined || (value >= low && value <= high)))]
   }
   const pools = binders.map(b => b.domain ?? (b.ty === "int" ? integers(b) : b.ty === "bool" ? [true, false] : strings))
   const total = pools.reduce((n, pool) => n * pool.length, 1)
@@ -73,8 +73,25 @@ export function assignments(binders: readonly Binder[], strings: readonly string
   }
 }
 
+/** Values worth trying for unbounded inputs, beyond the standard ones. */
+export interface Pool {
+  strings: string[]
+  integers: bigint[]
+}
+
+/**
+ * The constants a law mentions and their neighbours. A condition such as
+ * `n === 424242n` is only ever true at a value no generic sample contains.
+ */
+export function valuePool(expressions: readonly Expr[]): Pool {
+  const literals = new Set<bigint>()
+  for (const e of expressions) ir.integerLiterals(e, literals)
+  const integers = [...literals].slice(0, 64).flatMap(value => [value, value - 1n, value + 1n])
+  return { strings: stringPool(expressions), integers }
+}
+
 /** Strings worth trying for an unbounded string input: the literals in play and their pieces. */
-export function stringPool(expressions: readonly Expr[]): string[] {
+function stringPool(expressions: readonly Expr[]): string[] {
   const literals = new Set<string>()
   for (const e of expressions) ir.stringLiterals(e, literals)
   const pool = new Set(["", "a", "b", ...literals])
@@ -102,7 +119,7 @@ export function findInput(binders: readonly Binder[], condition: Expr): { found:
   if (condition === ir.TRUE) return { found: new Map(), exhaustive: true }
   const free = ir.freeVariables(condition)
   const used = binders.filter(b => free.has(b.name))
-  const space = assignments(used, stringPool([condition]), SEARCH_BUDGET)
+  const space = assignments(used, valuePool([condition]), SEARCH_BUDGET)
   let found: Map<string, Scalar> | undefined
   space.each(env => {
     if (!truthy(condition, env)) return false

@@ -254,33 +254,56 @@ function runFile(lean: string, source: string, directory: string, name: string):
   })
 }
 
+/** The axioms of Lean's own logic. A proof that rests on anything else, `sorry` above all, is not a proof. */
+const ACCEPTED_AXIOMS = new Set(["propext", "Classical.choice", "Quot.sound"])
+
 async function runChunk(lean: string, header: string, statements: string[], directory: string, name: string): Promise<LeanOutcome[]> {
+  // Each theorem is followed by a question about it: which axioms does it
+  // rest on? A theorem counts as proved only when Lean reports no error for
+  // it *and* answers that question acceptably. Silence is never taken for
+  // success, and neither is an unfinished proof, which Lean only warns about.
   const lines = header.split("\n")
   const firstLine: number[] = []
+  const askedAt: number[] = []
   for (const [i, statement] of statements.entries()) {
     firstLine.push(lines.length + 1)
     lines.push(...`theorem c${i}${statement}`.split("\n"))
+    askedAt.push(lines.length + 1)
+    lines.push(`#print axioms c${i}`)
   }
-  // A theorem counts as proved when Lean reports no error for it. That is only
-  // sound if Lean got to the end of the file, so the file ends with a command
-  // that always answers, and the answer is required.
+  // The file ends with a command that always answers, to show that Lean reached the end.
   const sentinel = lines.length + 1
   lines.push("#check Nat")
   const messages = await runFile(lean, lines.join("\n") + "\n", directory, name)
   if (!messages.some(message => message.severity === "information" && message.pos?.line === sentinel)) {
     throw new Error("Lean stopped before it had checked every theorem, so no result can be trusted")
   }
-  const outcomes: LeanOutcome[] = statements.map(() => ({ ok: true, message: "" }))
+  const outcomes: LeanOutcome[] = statements.map(() => ({ ok: false, message: "" }))
+  const failed = new Set<number>()
+  const reject = (index: number, text: string) => {
+    const outcome = outcomes[index]!
+    outcome.message = outcome.message ? outcome.message + "\n" + text : text
+    failed.add(index)
+  }
   for (const message of messages) {
-    if (message.severity !== "error") continue
     const line = message.pos?.line ?? 0
     let index = -1
     for (let i = 0; i < firstLine.length && firstLine[i]! <= line; i++) index = i
-    if (index < 0 || line >= sentinel) throw new Error(`Lean rejected the generated preamble: ${message.data}`)
-    const outcome = outcomes[index]!
-    outcome.message = outcome.ok ? message.data : outcome.message + "\n" + message.data
-    outcome.ok = false
+    if (message.severity === "error") {
+      if (index < 0 || line >= sentinel) throw new Error(`Lean rejected the generated preamble: ${message.data}`)
+      // An error on the question itself only repeats that the theorem above it failed.
+      if (line !== askedAt[index] || !failed.has(index)) reject(index, message.data)
+    } else if (index >= 0 && line === askedAt[index] && message.severity === "information") {
+      const listed = /depends on axioms: \[([^\]]*)\]/.exec(message.data)
+      const foreign = listed ? listed[1]!.split(",").map(axiom => axiom.trim()).filter(axiom => axiom && !ACCEPTED_AXIOMS.has(axiom)) : []
+      if (foreign.includes("sorryAx")) {
+        if (!failed.has(index)) reject(index, "the proof is unfinished: it uses `sorry`")
+      } else if (foreign.length) reject(index, `the proof rests on ${foreign.map(axiom => `\`${axiom}\``).join(", ")}, which Pudding does not accept`)
+      else if (listed || /does not depend on any axioms/.test(message.data)) outcomes[index]!.ok = true
+    }
   }
+  for (const index of failed) outcomes[index]!.ok = false
+  for (const outcome of outcomes) if (!outcome.ok && !outcome.message) outcome.message = "Lean did not confirm this theorem"
   return outcomes
 }
 

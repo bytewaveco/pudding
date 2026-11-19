@@ -134,7 +134,7 @@ law("a product of positives is positive", domain<[bigint, bigint]>(), ([a, b]) =
 
 `pudding --emit laws.lean` writes the theorems, so you or an agent can work on
 a proof with ordinary Lean tooling. Nobody has to review the script: Lean
-rejects it if it is wrong. The trimmed Lean that `install-lean` leaves holds
+rejects it if it is wrong or unfinished. The trimmed Lean that `install-lean` leaves holds
 only the part of Lean's library Pudding itself uses; a proof that names other
 lemmas needs `pudding install-lean --full` or your own Lean.
 
@@ -191,6 +191,7 @@ Refused, with the reason, at the exact expression:
 - changing an object or array in place, because two names can refer to the same object;
 - a function that uses a variable which is reassigned outside it;
 - reading a `const` or `let` before its declaration has run, and `__proto__`;
+- an import such as `./x.js` when both `x.js` and `x.ts` exist, because TypeScript reads one and Node runs the other;
 - loops whose length depends on an input, recursion, classes, async code, regular expressions and library calls.
 
 A refused law is executed instead and reported as *checked* or *sampled*, so a
@@ -201,12 +202,12 @@ law can always be written and gets promoted to *proved* when the subset grows.
 A *proved* law is a theorem about a model of your code. These things stand
 between the theorem and the code that runs.
 
-1. **The translation.** Pudding's translator and its constant folding are trusted. To catch mistakes, every law is also executed against the real code and compared with the model, on all inputs of a small finite domain or a sample of a large one. A disagreement fails the law. If the law file cannot be executed, the run says so in a warning.
+1. **The translation.** Pudding's translator and its constant folding are trusted. To catch mistakes, every law is also executed against the real code and compared with the model, on all inputs of a small finite domain or a sample of a large one that includes the constants the law mentions. A disagreement fails the law. If the law file cannot be executed, the run says so in a warning. With `--no-cross-check` none of this happens, including noticing that a module throws when it loads.
 2. **Inputs are plain data.** An object input has exactly the properties its type declares, held as ordinary values. TypeScript would also accept an object with extra properties, or one whose properties are getters; those are not covered.
 3. **Module data.** A table such as `const transitions = {...}` is assumed to hold its initial value when a law runs. Pudding refuses a table that its own module changes by name, hands to other code while loading, or shares with statements or local function calls that run on load. It does not see another module changing an exported table.
 4. **Numbers.** A `number` is modeled as the whole number it holds, and every result must be proved to stay within 2^53 − 1, where that model is exact. Zero and negative zero are one value, as `===` treats them.
 5. **Strings.** `string` inputs range over well-formed Unicode text. JavaScript strings with unpaired surrogates are not covered.
-6. **Lean.** Finite laws are checked by Lean's kernel. Other proofs are found by tactics and checked by the kernel.
+6. **Lean.** Finite laws are checked by Lean's kernel. Other proofs are found by tactics and checked by the kernel. A theorem counts only when Lean reports no error for it and confirms that it rests on nothing but Lean's standard axioms, so an unfinished proof (`sorry`) is rejected.
 
 ## How it works
 
