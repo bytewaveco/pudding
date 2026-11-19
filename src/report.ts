@@ -47,7 +47,8 @@ export function format(report: Report, options: { cwd: string; color: boolean; r
   }
   if (files.length) lines.push("")
   for (const error of report.errors) lines.push(` ${paint(31, "error")} ${error}`)
-  if (report.errors.length) lines.push("")
+  for (const warning of report.warnings) lines.push(` ${paint(33, "warning")} ${warning}`)
+  if (report.errors.length || report.warnings.length) lines.push("")
 
   const counts = ORDER.filter(status => report.counts[status]).map(status => paint(COLOR[status], `${report.counts[status]} ${LABEL[status]}`))
   const version = /version ([\d.]+[^\s,]*)/.exec(report.lean)?.[1] ?? "unknown"

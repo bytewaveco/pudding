@@ -8,17 +8,21 @@ import { existsSync, globSync, mkdirSync, readdirSync, readFileSync, statSync, w
 import { homedir } from "node:os"
 import { dirname, isAbsolute, join, relative, resolve } from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
-import { API, DiagnosticCategory } from "typescript/unstable/sync"
+import { Worker } from "node:worker_threads"
+import { SyntaxKind as K } from "typescript/unstable/ast"
+import { API, DiagnosticCategory, SymbolFlags, type Checker, type Program } from "typescript/unstable/sync"
 import type { Config } from "./index.ts"
 import * as ir from "./ir.ts"
-import type { Binder, Expr, Obligation, Scalar } from "./ir.ts"
+import type { Obligation } from "./ir.ts"
+import type { FileOutcome, Job, RuntimeMap } from "./crosscheck.ts"
+import { findInput, showInputs, showValue } from "./search.ts"
 import { checksFor, FAST_HEADER, FULL_HEADER, prove, render, TooLarge, withFallback, type Check } from "./lean.ts"
-import { Translator, type ArgShape, type Law, type LawInstance } from "./translate.ts"
+import { Translator, type Law, type LawInstance } from "./translate.ts"
 
 export const MINIMUM_LEAN = [4, 36, 0] as const
 const CACHE_VERSION = 1
-const SEARCH_BUDGET = 60_000
 const RUNTIME_BUDGET = 4_000
+const RUNTIME_TIMEOUT_MS = 30_000
 
 export interface RunOptions extends Config {
   /** Project directory. Default: the current directory. */
@@ -64,6 +68,8 @@ export interface Report {
   laws: LawReport[]
   /** Problems that prevented checking, such as TypeScript errors. */
   errors: string[]
+  /** Things that weakened the run without failing it, such as a law file that could not be executed. */
+  warnings: string[]
   counts: Record<Status, number>
   obligations: number
   cachedObligations: number
@@ -201,168 +207,93 @@ function writeProject(directory: string, base: string | undefined, lawFiles: str
   return project
 }
 
-// ------------------------------------------------------------------ search
-
-function generator(seed: number) {
-  return () => {
-    seed = (seed + 0x6d2b79f5) | 0
-    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed)
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
-  }
-}
-
-const INTEGERS = [0n, 1n, -1n, 2n, -2n, 3n, -3n, 5n, 7n, 10n, -10n, 99n, 100n, -100n, 101n, 2n ** 31n, -(2n ** 31n), 2n ** 53n + 1n]
-
-function randomInteger(random: () => number): bigint {
-  const kind = random()
-  if (kind < 0.5) return BigInt(Math.floor(random() * 41) - 20)
-  if (kind < 0.85) return BigInt(Math.floor(random() * 2_000_001) - 1_000_000)
-  return BigInt(Math.floor((random() - 0.5) * 2 ** 53)) * BigInt(Math.floor(random() * 2 ** 20) + 1)
-}
-
-interface Assignments {
-  /** True when every possible input is visited. */
-  exhaustive: boolean
-  each(visit: (env: Map<string, Scalar>) => boolean | void): void
-}
-
-/** Inputs to try: every combination when the space is small enough, otherwise a sample. */
-function assignments(binders: readonly Binder[], strings: readonly string[], budget: number): Assignments {
-  const pools = binders.map(b => b.domain ?? (b.ty === "int" ? INTEGERS : b.ty === "bool" ? [true, false] : strings))
-  const total = pools.reduce((n, pool) => n * pool.length, 1)
-  const finite = binders.every(b => b.domain)
-  const grid = total <= budget
-  return {
-    exhaustive: finite && grid,
-    each(visit) {
-      const env = new Map<string, Scalar>()
-      if (grid) {
-        const index = pools.map(() => 0)
-        for (let n = 0; n < total; n++) {
-          binders.forEach((b, i) => env.set(b.name, pools[i]![index[i]!]!))
-          if (visit(env)) return
-          for (let i = pools.length - 1; i >= 0 && ++index[i]! === pools[i]!.length; i--) index[i] = 0
-        }
-      }
-      if (finite && grid) return
-      const random = generator(0x9e3779b9)
-      const draws = Math.min(budget, 5_000)
-      for (let n = 0; n < draws; n++) {
-        binders.forEach((b, i) => {
-          const pool = pools[i]!
-          const fromPool = b.domain || b.ty !== "int" || random() < 0.2
-          env.set(b.name, fromPool ? pool[Math.floor(random() * pool.length)]! : randomInteger(random))
-        })
-        if (visit(env)) return
-      }
-    },
-  }
-}
-
-/** Strings worth trying for an unbounded string input: the literals in play and their pieces. */
-function stringPool(expressions: readonly Expr[]): string[] {
-  const literals = new Set<string>()
-  for (const e of expressions) ir.stringLiterals(e, literals)
-  const pool = new Set(["", "a", "b", ...literals])
-  for (const literal of literals) {
-    for (const token of literal.split(/[^\p{L}\p{N}]+/u)) pool.add(token)
-    const chars = [...literal]
-    for (let n = 1; n < chars.length && n <= 12; n++) {
-      pool.add(chars.slice(0, n).join(""))
-      pool.add(chars.slice(-n).join(""))
-    }
-  }
-  return [...pool].slice(0, 96)
-}
-
-function truthy(e: Expr, env: Map<string, Scalar>): boolean {
-  try {
-    return ir.evaluate(e, env) === true
-  } catch (error) {
-    if (error instanceof ir.EvaluationError) return false
-    throw error
-  }
-}
-
-function findInput(binders: readonly Binder[], condition: Expr): { found: Map<string, Scalar> | undefined; exhaustive: boolean } {
-  if (condition === ir.TRUE) return { found: new Map(), exhaustive: true }
-  const free = ir.freeVariables(condition)
-  const used = binders.filter(b => free.has(b.name))
-  const space = assignments(used, stringPool([condition]), SEARCH_BUDGET)
-  let found: Map<string, Scalar> | undefined
-  space.each(env => {
-    if (!truthy(condition, env)) return false
-    found = new Map(env)
-    return true
-  })
-  return { found, exhaustive: space.exhaustive }
-}
-
-function showInputs(binders: readonly Binder[], env: Map<string, Scalar>): Record<string, string> {
-  const shown: Record<string, string> = {}
-  for (const binder of binders) {
-    const value = env.get(binder.name)
-    if (value !== undefined) shown[binder.label] = ir.showScalar(value)
-  }
-  return shown
-}
-
-function showValue(e: Expr, env: Map<string, Scalar>): string {
-  try {
-    return ir.showScalar(ir.evaluate(e, env))
-  } catch {
-    return "(throws)"
-  }
-}
-
 // ----------------------------------------------------------------- runtime
 
-function buildArgument(shape: ArgShape, env: Map<string, Scalar>): unknown {
-  switch (shape.k) {
-    case "binder": return env.get(shape.name)
-    case "const": return shape.value
-    case "array": return shape.items.map(item => buildArgument(item, env))
-    case "record": return Object.fromEntries(shape.fields.map(([key, field]) => [key, buildArgument(field, env)]))
+/**
+ * What Node needs to execute the law files the way TypeScript reads them:
+ * where each import resolves, and which imported or exported names are types
+ * only. Node erases type syntax but neither resolves `./cart` to `./cart.ts`
+ * nor drops an imported interface, and bundler-style code relies on both.
+ */
+function runtimeMap(program: Program, checker: Checker): RuntimeMap {
+  const map: RuntimeMap = { resolutions: new Map(), elided: new Map() }
+  // The compiler's nodes are handled untyped, as in the translator.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  type N = any
+  for (const name of program.getSourceFileNames()) {
+    if (!isAbsolute(name) || name.includes("/node_modules/")) continue
+    const source = program.getSourceFile(name)
+    if (!source || source.isDeclarationFile) continue
+    const text = source.text
+    const resolutions = new Map<string, string>()
+    const ranges: [number, number][] = []
+    /** The range of a binding, widened over one neighbouring comma. */
+    const withComma = (node: N): [number, number] => {
+      let start = node.getStart(source) as number
+      let end = node.end as number
+      const after = /^\s*,/.exec(text.slice(end))
+      if (after) end += after[0].length
+      else {
+        const before = /,\s*$/.exec(text.slice(0, start))
+        if (before) start -= before[0].length
+      }
+      return [start, end]
+    }
+    for (const statement of source.statements as readonly N[]) {
+      const isImport = statement.kind === K.ImportDeclaration
+      if (!isImport && statement.kind !== K.ExportDeclaration) continue
+      const specifier = statement.moduleSpecifier
+      if (specifier?.kind === K.StringLiteral) {
+        const symbol = checker.getSymbolAtLocation(specifier)
+        const target = (symbol?.valueDeclaration ?? symbol?.declarations[0])?.resolve()?.getSourceFile()
+        if (target && !target.isDeclarationFile && !program.isSourceFileFromExternalLibrary(target)) resolutions.set(specifier.text, target.fileName)
+      }
+      if (isImport ? statement.importClause?.phaseModifier === K.TypeKeyword : statement.isTypeOnly) continue
+      const bindings: N[] = isImport
+        ? statement.importClause?.namedBindings?.kind === K.NamedImports ? [...statement.importClause.namedBindings.elements] : []
+        : statement.exportClause?.kind === K.NamedExports ? [...statement.exportClause.elements] : []
+      const typeOnly = bindings.filter(binding => {
+        if (binding.isTypeOnly) return false
+        let symbol = checker.getSymbolAtLocation(binding.name)
+        if (symbol && symbol.flags & SymbolFlags.Alias) symbol = checker.getAliasedSymbol(symbol)
+        return !!symbol && !checker.isUnknownSymbol(symbol) && (symbol.flags & SymbolFlags.Value) === 0
+      })
+      // TypeScript drops an import whose names are all types; so must we, or Node would load a module for nothing.
+      const whole = isImport && typeOnly.length > 0 && typeOnly.length === bindings.length && !statement.importClause.name
+      if (whole) ranges.push([statement.getStart(source), statement.end])
+      else for (const binding of typeOnly) ranges.push(withComma(binding))
+    }
+    if (resolutions.size) map.resolutions.set(name, resolutions)
+    if (ranges.length) map.elided.set(name, ranges)
   }
+  return map
 }
 
-interface RuntimeLaw {
-  name: string
-  callback: ((input: unknown) => void) | undefined
-}
-
-async function loadRuntime(file: string): Promise<RuntimeLaw[] | string> {
-  const key = Symbol.for("pudding.registry")
-  const registry: RuntimeLaw[] = []
-  const globals = globalThis as Record<symbol, unknown>
-  globals[key] = registry
-  try {
-    await import(`${pathToFileURL(file).href}?pudding=${Date.now()}`)
-    return registry
-  } catch (error) {
-    return error instanceof Error ? error.message.split("\n")[0]! : String(error)
-  } finally {
-    delete globals[key]
-  }
-}
-
-function modelHolds(instance: LawInstance, env: Map<string, Scalar>): boolean {
-  try {
-    return instance.obligations.every(o => ir.evaluate(o.guard, env) !== true || ir.evaluate(o.claim, env) === true)
-  } catch (error) {
-    if (error instanceof ir.EvaluationError) return false
-    throw error
-  }
-}
-
-function runtimeHolds(callback: (input: unknown) => void, argument: unknown): boolean {
-  try {
-    callback(argument)
-    return true
-  } catch {
-    return false
-  }
+/**
+ * Execute the laws in a worker thread: fresh module state on every run, no
+ * way for the project's code to disturb this process, and a time limit.
+ */
+function executeLaws(job: Job): Promise<{ outcomes: Map<string, FileOutcome>; timedOut: boolean }> {
+  return new Promise(resolve => {
+    const outcomes = new Map<string, FileOutcome>()
+    const entry = new URL(import.meta.url.replace(/runner\.(ts|js)$/, "crosscheck.$1"))
+    const worker = new Worker(entry, { workerData: job, stdout: true, stderr: true })
+    let settled = false
+    const finish = (timedOut: boolean) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      void worker.terminate()
+      resolve({ outcomes, timedOut })
+    }
+    const timer = setTimeout(() => finish(true), RUNTIME_TIMEOUT_MS)
+    worker.on("message", (message: FileOutcome | "done") => {
+      if (message === "done") finish(false)
+      else outcomes.set(message.file, message)
+    })
+    worker.on("error", () => finish(false))
+    worker.on("exit", () => finish(false))
+  })
 }
 
 // --------------------------------------------------------------------- run
@@ -376,7 +307,7 @@ interface Pending {
 
 function emptyReport(lean: string): Report {
   return {
-    ok: false, laws: [], errors: [], counts: { proved: 0, checked: 0, sampled: 0, failed: 0, skipped: 0, todo: 0 },
+    ok: false, laws: [], errors: [], warnings: [], counts: { proved: 0, checked: 0, sampled: 0, failed: 0, skipped: 0, todo: 0 },
     obligations: 0, cachedObligations: 0, cases: 0, durationMs: 0, replayed: false, lean,
     retried: 0, timings: { typescript: 0, prove: 0, retry: 0, crossCheck: 0 },
   }
@@ -433,6 +364,7 @@ export async function run(options: RunOptions = {}): Promise<Report> {
   const api = new API({ cwd })
   let laws: Law[] = []
   let sources: string[] = []
+  let executable: RuntimeMap | undefined
   try {
     const snapshot = api.updateSnapshot({ openProjects: [tsconfig] })
     const project = snapshot.getProject(tsconfig) ?? snapshot.getProjects()[0]
@@ -461,6 +393,7 @@ export async function run(options: RunOptions = {}): Promise<Report> {
     for (const file of translator.reached) if (!readable.includes(file)) diagnose(file)
     if (report.errors.length) return finish()
     sources = program.getSourceFileNames().filter(name => isAbsolute(name) && !name.includes("/node_modules/") && existsSync(name))
+    if (config.crossCheck !== false) executable = runtimeMap(program, checker)
   } finally {
     api.close()
     report.timings.typescript = Math.round(performance.now() - reading)
@@ -601,47 +534,40 @@ export async function run(options: RunOptions = {}): Promise<Report> {
   // Run the real code and compare it with the model that was proved.
   const executedOnly = new Map<Law, boolean>()
   const executing = performance.now()
-  if (config.crossCheck !== false) {
-    for (const file of new Set(laws.map(law => law.file))) {
-      const inFile = laws.filter(law => law.file === file && law.index >= 0)
-      const runtime = await loadRuntime(file)
-      const reason = typeof runtime === "string" ? `the law file could not be executed (${runtime})`
-        : runtime.length !== inFile.length ? "the law file registered a different number of laws when executed" : undefined
-      for (const law of inFile) {
+  if (executable) {
+    const candidates = laws.filter(law => law.index >= 0)
+    const job: Job = {
+      map: executable,
+      budget: RUNTIME_BUDGET,
+      files: [...new Set(candidates.map(law => law.file))].map(file => ({
+        file,
+        registered: candidates.filter(law => law.file === file).length,
+        laws: candidates.filter(law => law.file === file && law.mode === "run" && law.problem?.kind !== "invalid").map(law => ({
+          index: law.index,
+          unproved: law.problem !== undefined,
+          instances: law.instances.map(instance => ({
+            binders: instance.binders, arg: instance.arg, obligations: instance.obligations.map(o => ({ guard: o.guard, claim: o.claim })),
+          })),
+        })),
+      })),
+    }
+    const { outcomes, timedOut } = await executeLaws(job)
+    for (const { file } of job.files) {
+      const outcome = outcomes.get(file)
+      const reason = outcome?.error ?? (outcome ? undefined : timedOut ? `executing the laws took longer than ${RUNTIME_TIMEOUT_MS / 1000} s` : "the worker that executes laws stopped unexpectedly")
+      if (reason) report.warnings.push(`${displayPath(cwd, file)} was not compared with the running code: ${reason}`)
+      for (const result of outcome?.laws ?? []) {
+        const law = candidates.find(candidate => candidate.file === file && candidate.index === result.index)!
         const entry = lawReports.get(law)!
-        if (law.problem?.kind === "invalid" || law.mode !== "run") continue
-        const real = typeof runtime === "string" ? undefined : runtime[law.index]
-        if (reason || !real?.callback) {
-          entry.notes.push(`not compared with the running code: ${reason ?? "the law was not registered when the file was executed"}`)
-          continue
-        }
-        const callback = real.callback
-        let exhaustive = true
-        let executed = 0
-        for (const instance of law.instances) {
-          const space = assignments(instance.binders, stringPool(instance.obligations.flatMap(o => [o.guard, o.claim])), RUNTIME_BUDGET)
-          exhaustive &&= space.exhaustive
-          space.each(env => {
-            executed++
-            const actual = runtimeHolds(callback, instance.arg ? buildArgument(instance.arg, env) : undefined)
-            if (law.problem) {
-              if (actual) return false
-              entry.findings.push({
-                kind: "counterexample", message: "the law fails when executed", file: law.file, line: law.line, column: law.column,
-                inputs: showInputs(instance.binders, env),
-              })
-              return true
-            }
-            const expected = modelHolds(instance, env)
-            if (actual === expected) return false
-            entry.findings.push({
-              kind: "mismatch", file: law.file, line: law.line, column: law.column, inputs: showInputs(instance.binders, env),
-              message: `the running code ${actual ? "satisfies" : "violates"} the law for this input, but the model Pudding proved things about ${expected ? "satisfies" : "violates"} it; the proof cannot be trusted`,
-            })
-            return true
+        if (result.failure) {
+          const { kind, inputs, actual, expected } = result.failure
+          entry.findings.push({
+            kind, inputs, file: law.file, line: law.line, column: law.column,
+            message: kind === "counterexample" ? "the law fails when executed"
+              : `the running code ${actual ? "satisfies" : "violates"} the law for this input, but the model Pudding proved things about ${expected ? "satisfies" : "violates"} it; the proof cannot be trusted`,
           })
         }
-        if (law.problem && executed) executedOnly.set(law, exhaustive)
+        if (law.problem && result.executed) executedOnly.set(law, result.exhaustive)
       }
     }
   }

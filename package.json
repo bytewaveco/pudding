@@ -21,18 +21,29 @@
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "README.md"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "proof": "npm run build --silent && node dist/cli.js",
-    "test": "npm run build --silent && node --test test/*.test.ts"
+    "test": "npm run build --silent && node --test test/*.test.ts",
+    "prepack": "npm run build --silent"
   },
   "dependencies": {
     "typescript": "7.0.2"
   },
   "devDependencies": {
     "@types/node": "^26.6.6"
-  }
+  },
+  "keywords": [
+    "typescript",
+    "proof",
+    "lean",
+    "verification",
+    "laws",
+    "property",
+    "testing"
+  ]
 }
