@@ -1,4 +1,4 @@
-import { describe, domain, expect, law } from "pudding"
+import { describe, domain, expect, law } from "@bytewaveco/pudding"
 import {
   assertPositive, bump, cents, countPositive, describeTier, discount, firstNegative, indexOfZero, journalTotals, largest, signed, total,
   type Line, type Tier,

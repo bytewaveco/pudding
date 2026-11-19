@@ -25,7 +25,7 @@ export function subtotal(items: readonly Item[]): bigint {
   return sum
 }
 `)
-  writeFileSync(join(project, "src", "cart.law.ts"), `import { domain, expect, law } from "pudding"
+  writeFileSync(join(project, "src", "cart.law.ts"), `import { domain, expect, law } from "@bytewaveco/pudding"
 import { Item, subtotal } from "./cart"
 
 law("the order of two items does not matter", domain<[Item, Item]>(), ([a, b]) => {
@@ -38,6 +38,7 @@ law("FALSE: quantity is ignored", domain<Item>(), item => {
 `)
   const lean = locateLean({}, root)
   const result = spawnSync("npx", ["pudding", "--reporter", "json"], { cwd: project, encoding: "utf8", env: { ...process.env, PUDDING_LEAN: lean } })
+  if (!result.stdout.trim().startsWith("{")) throw new Error(`pudding printed no report (exit ${result.status}):\n${result.stdout}\n${result.stderr}`)
   const report = JSON.parse(result.stdout)
   const statuses = Object.fromEntries(report.laws.map(entry => [entry.name, entry.status]))
   const expected = { "the order of two items does not matter": "proved", "FALSE: quantity is ignored": "failed" }

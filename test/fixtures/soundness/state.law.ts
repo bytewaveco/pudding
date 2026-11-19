@@ -1,4 +1,4 @@
-import { domain, expect, law } from "pudding"
+import { domain, expect, law } from "@bytewaveco/pudding"
 import {
   defaultOnUndefined, forInitializer, loopHeader, mixedIncludes, mixedSwitch, ownExpect, parameterScope, readAcrossBranches, shorthandRead,
   switchScope, unsetLet,

@@ -1,4 +1,4 @@
-import { describe, domain, expect, law, type Integer } from "pudding"
+import { describe, domain, expect, law, type Integer } from "@bytewaveco/pudding"
 import { average, clampPercent, countdown, label, minutes, pageCount, pageOf, parity, sumIndexed, sumTo, toCents } from "./numbers.ts"
 
 describe("whole numbers", () => {

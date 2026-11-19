@@ -646,7 +646,7 @@ async function runUnboundedBatch(batch, first) {
     writeFileSync(join(directory, `${program.name}.ts`), program.source + "\n" + mutant.source)
     const names = program.params.map((_, n) => `a${n}`)
     const domain = program.params.map(p => p.input ?? p.domain.map(show).join(" | ")).join(", ")
-    writeFileSync(join(directory, `${program.name}.law.ts`), `import { domain, expect, law, type Integer } from "pudding"
+    writeFileSync(join(directory, `${program.name}.law.ts`), `import { domain, expect, law, type Integer } from "@bytewaveco/pudding"
 import { ${program.name}, ${mutant.name} } from "./${program.name}.ts"
 
 law("M ${program.name}", domain<[${domain}]>(), ([${names.join(", ")}]) => {
@@ -732,7 +732,7 @@ async function runBatch(batch, first) {
     }
     const sound = truth.findIndex(entry => !entry.fails)
     const laws = [lawSource(program, truth, undefined), ...(sound >= 0 ? [lawSource(program, truth, sound)] : [])]
-    writeFileSync(join(directory, `${program.name}.law.ts`), `import { domain, expect, law } from "pudding"\nimport { ${program.name} } from "./${program.name}.ts"\n\n${laws.join("\n")}`)
+    writeFileSync(join(directory, `${program.name}.law.ts`), `import { domain, expect, law } from "@bytewaveco/pudding"\nimport { ${program.name} } from "./${program.name}.ts"\n\n${laws.join("\n")}`)
     cases.push({ program, truth, throws: truth.some(entry => entry.fails) })
   }
   const report = runPudding(directory, cases)

@@ -337,7 +337,7 @@ law("a rectangle of height two has twice its width as area", domain<bigint>(), w
     try {
       writeFileSync(join(project, "types.d.ts"), `export type Day = "Mon"\n`)
       writeFileSync(join(project, "subject.ts"), `import type { Day } from "./types.js"\nexport const monday = (day: Day) => day === "Mon"\n`)
-      writeFileSync(join(project, "days.law.ts"), `import { domain, expect, law } from "pudding"
+      writeFileSync(join(project, "days.law.ts"), `import { domain, expect, law } from "@bytewaveco/pudding"
 import type { Day } from "./types.js"
 import { monday } from "./subject.ts"
 

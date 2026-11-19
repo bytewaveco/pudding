@@ -1,4 +1,4 @@
-import { describe, domain, expect, law } from "pudding"
+import { describe, domain, expect, law } from "@bytewaveco/pudding"
 import { next, type Light } from "./lights.ts"
 
 law("three steps return to the start", domain<Light>(), light => {

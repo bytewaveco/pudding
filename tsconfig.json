@@ -22,6 +22,7 @@
   ],
   "exclude": [
     "test/fixtures/typeerror",
-    "test/fixtures/.tmp-*"
+    "test/fixtures/.tmp-*",
+    "test/fixtures/review-*"
   ]
 }

@@ -1,4 +1,4 @@
-import { domain, expect, law } from "pudding"
+import { domain, expect, law } from "@bytewaveco/pudding"
 import { next, type Light } from "./lights.ts"
 
 law.only("the one law that runs", domain<Light>(), light => {

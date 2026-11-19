@@ -1,4 +1,4 @@
-import { domain, expect, law } from "pudding"
+import { domain, expect, law } from "@bytewaveco/pudding"
 import { chained, makeCounter, mutatesObject, pushes, readsLater, whileLoop } from "./refused.ts"
 
 law("SAMPLED: a closure that writes an outer variable", domain<bigint>(), start => {

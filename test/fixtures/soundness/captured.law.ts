@@ -1,4 +1,4 @@
-import { expect, law } from "pudding"
+import { expect, law } from "@bytewaveco/pudding"
 import { readViaAlias, readViaHelper, readViaMethod } from "./captured.ts"
 
 law("FALSE: a table aliased through ?? keeps its value", () => expect<boolean>(readViaAlias).toBe(false))

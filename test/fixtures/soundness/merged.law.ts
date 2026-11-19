@@ -1,4 +1,4 @@
-import { domain, expect, law } from "pudding"
+import { domain, expect, law } from "@bytewaveco/pudding"
 import { couponDiscount, vatCents } from "./merged.ts"
 
 law("FALSE: a discount never exceeds a tenth of the subtotal", domain<[boolean, string, bigint]>(), ([member, coupon, subtotal]) => {

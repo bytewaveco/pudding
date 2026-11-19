@@ -1,4 +1,4 @@
-import { domain, expect, law } from "pudding"
+import { domain, expect, law } from "@bytewaveco/pudding"
 import { settle, type Order } from "./helper.ts"
 
 function expectPaidIsZero(order: Order) {

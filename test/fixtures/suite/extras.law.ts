@@ -1,4 +1,4 @@
-import { domain, expect, law } from "pudding"
+import { domain, expect, law } from "@bytewaveco/pudding"
 import * as extras from "./extras.ts"
 import { bump, deposit, describeLevel, greeting, levels, rank, weight, xor, type Account, type Bit, type Level } from "./extras.ts"
 

@@ -1,4 +1,4 @@
-import { domain, expect, law } from "pudding"
+import { domain, expect, law } from "@bytewaveco/pudding"
 import { sum } from "./sum.ts"
 
 law("FALSE: a sum of two values adds them", domain<[bigint, bigint]>(), ([a, b]) => {

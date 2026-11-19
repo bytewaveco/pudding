@@ -1,4 +1,4 @@
-import { domain, expect, law } from "pudding"
+import { domain, expect, law } from "@bytewaveco/pudding"
 import { defaultScope, emptyMap, ownName, varScope } from "./scopes.ts"
 
 law("FALSE: the default reads the body's label", domain<bigint>(), id => expect(defaultScope(id)).toBe("closed"))

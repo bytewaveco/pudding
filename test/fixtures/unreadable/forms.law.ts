@@ -1,4 +1,4 @@
-import { describe, domain, expect, law, law as register } from "pudding"
+import { describe, domain, expect, law, law as register } from "@bytewaveco/pudding"
 
 // A law that is not an ordinary synchronous function with one plain parameter.
 law("FALSE: an async law has finished", async () => {

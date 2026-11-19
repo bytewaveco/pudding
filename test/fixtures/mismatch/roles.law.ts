@@ -1,4 +1,4 @@
-import { domain, expect, law } from "pudding"
+import { domain, expect, law } from "@bytewaveco/pudding"
 import "./patch.ts"
 import { canWrite, type Role } from "./roles.ts"
 

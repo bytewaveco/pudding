@@ -7,7 +7,7 @@ checks the proofs.
 
 ```ts
 // cart.law.ts
-import { describe, domain, expect, law, type Integer } from "pudding"
+import { describe, domain, expect, law, type Integer } from "@bytewaveco/pudding"
 import { subtotal, pageCount, type Item } from "./cart"
 
 describe("cart", () => {
@@ -30,7 +30,7 @@ Pudding needs Node 24. It brings its own TypeScript 7 for reading your code,
 and it needs Lean 4.36 for the proofs.
 
 ```sh
-npm install --save-dev pudding
+npm install --save-dev @bytewaveco/pudding@beta
 npx pudding install-lean    # once per machine
 npx pudding                 # check every *.law.ts
 npx pudding watch           # check again on every change
@@ -66,14 +66,14 @@ pudding install-lean        download the Lean runtime
 
 The `github` reporter is chosen automatically inside GitHub Actions and
 annotates the lines that failed. The same run is available from code as
-`run()` in `pudding/runner`.
+`run()` in `@bytewaveco/pudding/runner`.
 
 ## Configuration
 
 A `pudding.config.ts` is optional.
 
 ```ts
-import { defineConfig } from "pudding"
+import { defineConfig } from "@bytewaveco/pudding"
 
 export default defineConfig({
   include: ["src/**/*.law.ts"],        // default: **/*.law.ts
@@ -274,7 +274,7 @@ official toolchain: the `lean` binary, its stripped shared libraries and the
 
 ```sh
 npm run build
-node scripts/pack-runtime.mjs .toolchain/lean-4.36.0-darwin_aarch64 out --package pudding-lean-darwin-arm64@4.36.0
+node scripts/pack-runtime.mjs .toolchain/lean-4.36.0-darwin_aarch64 out --package @bytewaveco/pudding-lean-darwin-arm64@4.36.0
 ```
 
 For macOS arm64 the result is 359 MB on disk and 109 MB as the `.tar.gz` npm

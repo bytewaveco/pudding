@@ -1,9 +1,8 @@
 {
-  "name": "pudding",
-  "version": "0.1.0",
+  "name": "@bytewaveco/pudding",
+  "version": "0.1.0-beta.0",
   "description": "Prove laws about existing TypeScript functions, with Lean doing the checking",
   "license": "MIT",
-  "private": true,
   "type": "module",
   "engines": {
     "node": ">=24"
@@ -19,13 +18,18 @@
     "./runner": {
       "types": "./dist/runner.d.ts",
       "default": "./dist/runner.js"
-    }
+    },
+    "./package.json": "./package.json"
   },
   "files": [
     "dist",
     "README.md",
     "LICENSE"
   ],
+  "publishConfig": {
+    "access": "public",
+    "tag": "beta"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",

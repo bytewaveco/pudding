@@ -249,7 +249,7 @@ export class Translator {
   private readonly facts = new Map<Node, { assigned: Set<string>; mentioned: Set<string>; returnsValue: boolean; usesVar: Node | undefined }>()
   private instance: LawInstance | undefined
 
-  constructor(program: Program, checker: Checker, moduleName = "pudding") {
+  constructor(program: Program, checker: Checker, moduleName: string) {
     this.program = program
     this.checker = checker
     this.moduleName = moduleName

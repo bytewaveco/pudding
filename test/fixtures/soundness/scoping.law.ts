@@ -1,4 +1,4 @@
-import { domain, expect, law } from "pudding"
+import { domain, expect, law } from "@bytewaveco/pudding"
 import { callbackIndex, castKey, deadZone, erasedThis, hoisted, protoLiteral, tableWrite } from "./scoping.ts"
 
 law("FALSE: the outer function supplies the result", () => expect(hoisted()).toBe(true))

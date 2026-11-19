@@ -1,4 +1,4 @@
-import { domain, expect, law } from "pudding"
+import { domain, expect, law } from "@bytewaveco/pudding"
 import { area, scale, type Shape } from "./shapes.ts"
 
 law("scaling by one changes nothing", domain<Shape>(), shape => {

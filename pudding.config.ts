@@ -1,4 +1,4 @@
-import { defineConfig } from "pudding"
+import { defineConfig } from "@bytewaveco/pudding"
 
 export default defineConfig({
   include: ["examples/**/*.law.ts"],

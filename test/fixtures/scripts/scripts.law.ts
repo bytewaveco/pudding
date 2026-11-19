@@ -1,4 +1,4 @@
-import { domain, expect, law } from "pudding"
+import { domain, expect, law } from "@bytewaveco/pudding"
 
 // A proof script is text handed to Lean. These laws check that it can only
 // ever be a proof of its own theorem.

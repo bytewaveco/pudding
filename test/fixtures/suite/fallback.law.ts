@@ -1,4 +1,4 @@
-import { domain, expect, law } from "pudding"
+import { domain, expect, law } from "@bytewaveco/pudding"
 import { initials, total } from "./fallback.ts"
 
 law("SAMPLED: the total of a pair is their sum", domain<[bigint, bigint]>(), ([a, b]) => {

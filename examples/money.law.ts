@@ -1,4 +1,4 @@
-import { domain, expect, law } from "pudding"
+import { domain, expect, law } from "@bytewaveco/pudding"
 import { abs, applyBasisPoints, clamp, perPart, roundToDollars } from "./money.ts"
 
 law("clamp stays within its bounds", domain<[bigint, bigint, bigint]>(), ([x, lo, hi]) => {

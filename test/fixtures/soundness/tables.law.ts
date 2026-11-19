@@ -1,4 +1,4 @@
-import { expect, law } from "pudding"
+import { expect, law } from "@bytewaveco/pudding"
 import { whileSet as throughAlias } from "./aliased.ts"
 import { whileSet as throughCopy } from "./copied.ts"
 

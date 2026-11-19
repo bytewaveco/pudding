@@ -1,4 +1,4 @@
-import { domain, expect, law } from "pudding"
+import { domain, expect, law } from "@bytewaveco/pudding"
 import { cancel, type JobState } from "./jobs.ts"
 
 law("retrying cancellation has no further effect", domain<JobState>(), state => {

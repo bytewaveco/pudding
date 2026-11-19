@@ -1,4 +1,4 @@
-import { expect, law } from "pudding"
+import { expect, law } from "@bytewaveco/pudding"
 import { cancel } from "./jobs.ts"
 
 law("a state that does not exist", () => {

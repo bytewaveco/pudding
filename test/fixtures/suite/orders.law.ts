@@ -1,4 +1,4 @@
-import { domain, expect, law } from "pudding"
+import { domain, expect, law } from "@bytewaveco/pudding"
 import { canMove, isTerminal, label, ship, type Order, type Status } from "./orders.ts"
 
 law("a paid, placed order ships", domain<Order>(), order => {

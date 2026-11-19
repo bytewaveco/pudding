@@ -1,4 +1,4 @@
-import { domain, expect, law } from "pudding"
+import { domain, expect, law } from "@bytewaveco/pudding"
 import type { Flags, Tagged } from "./inputs.ts"
 
 law("FALSE: a flag dictionary is empty", domain<Flags>(), flags => expect(flags).toEqual({}))

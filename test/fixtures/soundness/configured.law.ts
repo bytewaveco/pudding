@@ -1,4 +1,4 @@
-import { domain, expect, law } from "pudding"
+import { domain, expect, law } from "@bytewaveco/pudding"
 import "./configure-setup.ts"
 import { fee, toCents } from "./configured.ts"
 
