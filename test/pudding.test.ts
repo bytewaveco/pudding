@@ -1,4 +1,5 @@
 import assert from "node:assert/strict"
+import { spawnSync } from "node:child_process"
 import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { after, before, describe, test } from "node:test"
@@ -383,6 +384,15 @@ describe("the Lean encoding", () => {
     const [outcome] = await prove(lean, FAST_HEADER, wrong)
     assert.equal(outcome?.ok, false)
   })
+})
+
+test("random programs: a true law is proved or refused, a false one is never proved", () => {
+  // A small fixed sample of the differential fuzzer (scripts/fuzz.mjs), with and without executing the laws.
+  for (const extra of [[], ["--cross-check"]]) {
+    const result = spawnSync("node", [join(import.meta.dirname, "..", "scripts", "fuzz.mjs"), "--seed", "7", "--programs", "80", "--batch", "40", "--quiet", ...extra], { encoding: "utf8" })
+    assert.equal(result.status, 0, result.stdout + result.stderr)
+    assert.match(result.stdout, /WRONG PROOFS\s+0/)
+  }
 })
 
 describe("simplification", () => {

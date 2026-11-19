@@ -182,7 +182,7 @@ only a proof will do.
 
 Pudding reads only the code a law reaches. A module may contain anything else.
 
-- **Values:** `boolean`, `bigint`, `string`, whole `number`s, object literals, array literals and tuples, functions.
+- **Values:** `boolean`, `bigint`, `string`, whole `number`s, `undefined`, object literals, array literals and tuples, functions.
 - **Operators:** `===` `!==` `&&` `||` `!` `?:`; `+ - * % < <= > >=` on bigint and number; `/` on bigint; string `+` and template literals.
 - **Statements:** `const` and `let`, assignment and `+=`-style updates of local variables, `if`/`else`, `switch`, `for…of` over an array of known length, `for`, `while` and `do` loops whose condition is settled at each round, `break`, `continue`, `return`, `throw`.
 - **Functions:** declarations and arrows, in any module of the project, with defaults and destructured parameters.
@@ -235,7 +235,17 @@ npm install
 npx pudding install-lean
 npm test          # builds, then runs the tests
 npm run proof     # builds, then checks the examples
+npm run fuzz -- --seed 3 --programs 2000
 ```
+
+`npm run fuzz` is a differential fuzzer. It generates random functions inside
+the supported subset, runs each in Node on every input of a small finite
+domain, and checks that Pudding proves the law stating exactly those results
+and never proves the same law with one result changed. It leans on the
+scoping, hoisting and `undefined` rules that are easiest to model wrongly.
+Programs that expose a problem are kept under `.lab/fuzz/failures/`. It covers
+laws over finite inputs, which are decided by evaluation; laws over unbounded
+inputs are not fuzzed.
 
 - [src/translate.ts](src/translate.ts): TypeScript to obligations.
 - [src/ir.ts](src/ir.ts): the expression language, its simplifier and its evaluator.
@@ -243,6 +253,7 @@ npm run proof     # builds, then checks the examples
 - [src/runner.ts](src/runner.ts): the run, caching and explaining failures.
 - [src/crosscheck.ts](src/crosscheck.ts): executing laws against the real code.
 - [scripts/pack-runtime.mjs](scripts/pack-runtime.mjs): builds the trimmed Lean runtime for a platform.
+- [scripts/fuzz.mjs](scripts/fuzz.mjs): the differential fuzzer.
 - [examples/](examples): laws that pass.
 - [test/fixtures/](test/fixtures): laws that are meant to fail, be vacuous, or fall back, with the tests that pin each outcome.
 

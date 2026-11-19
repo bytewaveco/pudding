@@ -32,7 +32,8 @@
     "proof": "npm run build --silent && node dist/cli.js",
     "test": "npm run build --silent && node --test test/*.test.ts",
     "prepack": "npm run build --silent",
-    "test:package": "npm run build --silent && node scripts/smoke-package.mjs"
+    "test:package": "npm run build --silent && node scripts/smoke-package.mjs",
+    "fuzz": "npm run build --silent && node scripts/fuzz.mjs"
   },
   "dependencies": {
     "typescript": "7.0.2"
