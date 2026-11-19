@@ -1,0 +1,194 @@
+import assert from "node:assert/strict"
+import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { join } from "node:path"
+import { after, before, describe, test } from "node:test"
+import * as ir from "../src/ir.ts"
+import { checksFor, FAST_HEADER, prove } from "../dist/lean.js"
+import { locateLean, run, type Report } from "../dist/runner.js"
+
+const fixtures = join(import.meta.dirname, "fixtures")
+const lean = locateLean({}, join(import.meta.dirname, ".."))
+const law = (report: Report, name: string) => {
+  const found = report.laws.find(entry => entry.name === name)
+  assert.ok(found, `no law named ${name}`)
+  return found
+}
+
+describe("the suite project", () => {
+  let report: Report
+  before(async () => {
+    report = await run({ cwd: join(fixtures, "suite"), cache: false })
+  })
+
+  test("reports no project-level errors", () => assert.deepEqual(report.errors, []))
+
+  test("every law lands in the status its name announces", () => {
+    assert.ok(report.laws.length >= 25)
+    for (const entry of report.laws) {
+      const expected = /^(FALSE|VACUOUS|UNPROVED)/.test(entry.name) ? "failed"
+        : entry.name.startsWith("SAMPLED") ? "sampled" : entry.name.startsWith("CHECKED") ? "checked" : "proved"
+      assert.equal(entry.status, expected, `${entry.name}: ${JSON.stringify(entry.findings)}`)
+    }
+  })
+
+  test("a false law comes with a concrete counterexample and both sides", () => {
+    const [finding] = law(report, "FALSE: halving and doubling returns the input").findings
+    assert.equal(finding?.kind, "counterexample")
+    assert.deepEqual(finding?.inputs, { x: "1n" })
+    assert.match(finding?.detail ?? "", /actual: +0n\nexpected: 1n/)
+    assert.match(finding?.text ?? "", /^expect\(/)
+  })
+
+  test("inputs are named as the law names them, including object fields", () => {
+    const [finding] = law(report, "FALSE: any order ships").findings
+    assert.equal(finding?.kind, "throws")
+    assert.deepEqual(Object.keys(finding?.inputs ?? {}).sort(), ["order.paid", "order.status"])
+    assert.match(finding?.file ?? "", /orders\.ts$/)
+  })
+
+  test("division by an unguarded variable is reported as a possible throw", () => {
+    const kinds = law(report, "FALSE: dividing by any number of parts is safe").findings.map(f => f.kind)
+    assert.ok(kinds.includes("throws"))
+  })
+
+  test("expectations that can never be reached are rejected", () => {
+    for (const name of ["VACUOUS: contradictory guard", "VACUOUS: contradictory arithmetic guard"]) {
+      assert.deepEqual(law(report, name).findings.map(f => f.kind), ["vacuous"])
+    }
+  })
+
+  test("a true law beyond the automation is unproved, and proved once a proof is supplied", () => {
+    assert.deepEqual(law(report, "UNPROVED: a product of positives is positive").findings.map(f => f.kind), ["unproved"])
+    assert.equal(law(report, "a product of positives is positive, with a supplied proof").status, "proved")
+  })
+
+  test("every alternative of a union input is covered", () => {
+    const findings = law(report, "FALSE: scaling doubles the area").findings
+    assert.deepEqual(findings.map(f => Object.keys(f.inputs ?? {}).join()), ["shape.side", "shape.width,shape.height"])
+  })
+
+  test("code outside the supported subset is executed instead and says so", () => {
+    const sampled = law(report, "SAMPLED: the total of a pair is their sum")
+    assert.match(sampled.notes[0] ?? "", /not proved: only `const` declarations are supported \(fallback\.ts:2:3\)/)
+    assert.equal(law(report, "FALSE when executed: totals ignore the first amount").findings[0]?.kind, "counterexample")
+  })
+
+  test("strict mode refuses laws that were only executed", async () => {
+    const strict = await run({ cwd: join(fixtures, "suite"), cache: false, strict: true })
+    assert.equal(law(strict, "CHECKED: initials are one character").status, "failed")
+  })
+})
+
+test("a model that disagrees with the running code is never reported as proved", async () => {
+  const report = await run({ cwd: join(fixtures, "mismatch"), cache: false })
+  const entry = law(report, "only admins write")
+  assert.equal(report.ok, false)
+  assert.equal(entry.status, "failed")
+  assert.deepEqual(entry.findings.map(f => f.kind), ["mismatch"])
+  assert.deepEqual(entry.findings[0]?.inputs, { role: '"basic"' })
+})
+
+test("a table that load-time code may change is not trusted; the law is executed instead", async () => {
+  const report = await run({ cwd: join(fixtures, "loadtime"), cache: false })
+  const entry = law(report, "everyone writes once the table is patched")
+  assert.equal(entry.status, "checked")
+  assert.match(entry.notes[0] ?? "", /runs a statement at line 8 when it loads/)
+})
+
+test("TypeScript errors stop the run before anything is proved", async () => {
+  const report = await run({ cwd: join(fixtures, "typeerror"), cache: false })
+  assert.equal(report.ok, false)
+  assert.equal(report.laws.length, 0)
+  assert.match(report.errors.join("\n"), /jobs\.law\.ts:5:17 TS2345/)
+})
+
+describe("caching", () => {
+  let directory: string
+  before(() => {
+    directory = mkdtempSync(join(fixtures, ".tmp-"))
+    cpSync(join(fixtures, "suite", "tsconfig.json"), join(directory, "tsconfig.json"))
+    for (const name of ["shapes.ts", "shapes.law.ts"]) cpSync(join(fixtures, "suite", name), join(directory, name))
+  })
+  after(() => rmSync(directory, { recursive: true, force: true }))
+
+  test("an unchanged project reuses its result, and an edit reproves only what changed", async () => {
+    const first = await run({ cwd: directory })
+    assert.equal(first.replayed, false)
+    assert.equal(first.cachedObligations, 0)
+
+    const second = await run({ cwd: directory })
+    assert.equal(second.replayed, true)
+    assert.deepEqual(second.laws, first.laws)
+
+    const file = join(directory, "shapes.law.ts")
+    writeFileSync(file, readFileSync(file, "utf8") + `
+law("a rectangle of height two has twice its width as area", domain<bigint>(), width => {
+  expect(area({ kind: "rect", width, height: 2n })).toEqual(width + width)
+})
+`)
+    const third = await run({ cwd: directory })
+    assert.equal(third.replayed, false)
+    assert.equal(third.laws.length, first.laws.length + 1)
+    assert.equal(law(third, "a rectangle of height two has twice its width as area").status, "proved")
+    // Proved theorems are remembered; the two rejected ones of the false law are tried again.
+    assert.equal(third.obligations - third.cachedObligations, 3)
+  })
+})
+
+describe("the Lean encoding", () => {
+  const values = [-101n, -100n, -7n, -3n, -1n, 0n, 1n, 2n, 3n, 7n, 100n, 101n]
+  const x: ir.Binder = { name: "x0", label: "x", ty: "int", domain: values }
+  const y: ir.Binder = { name: "x1", label: "y", ty: "int", domain: values.filter(v => v !== 0n) }
+  const vx = ir.variable("x0", "int")
+  const vy = ir.variable("x1", "int")
+
+  /** A statement saying Lean computes `e` to what JavaScript computes, at every point of the grid. */
+  function agreement(e: ir.Expr, binders: ir.Binder[]) {
+    let claim = ir.TRUE
+    const visit = (index: number, env: Map<string, ir.Scalar>) => {
+      const binder = binders[index]
+      if (binder) return binder.domain!.forEach(value => visit(index + 1, new Map(env).set(binder.name, value)))
+      const at = ir.all([...env].map(([name, value]) => ir.eq(ir.variable(name, "int"), ir.lit(value))))
+      claim = ir.and(claim, ir.or(ir.not(at), ir.eq(e, ir.lit(ir.evaluate(e, env)))))
+    }
+    visit(0, new Map())
+    return checksFor(binders, ir.TRUE, claim, undefined).map(check => check.statement)
+  }
+
+  test("agrees with JavaScript on bigint division, remainder and comparison, including negatives", async () => {
+    const statements = [
+      ...[7n, -7n, 100n, 1n, -1n].flatMap(d => [agreement(ir.div(vx, ir.lit(d)), [x]), agreement(ir.mod(vx, ir.lit(d)), [x])]).flat(),
+      ...agreement(ir.div(vx, vy), [x, y]),
+      ...agreement(ir.mod(vx, vy), [x, y]),
+      ...agreement(ir.ite(ir.lt(vx, vy), ir.sub(vx, vy), ir.neg(ir.mul(vx, vy))), [x, y]),
+      ...agreement(ir.ite(ir.le(vx, vy), ir.add(vx, vy), vx), [x, y]),
+    ]
+    const outcomes = await prove(lean, FAST_HEADER, statements)
+    assert.deepEqual(outcomes.filter(o => !o.ok).map(o => o.message.slice(0, 300)), [])
+  })
+
+  test("rejects a wrong claim about division, so the agreement test can fail", async () => {
+    const wrong = checksFor([x], ir.TRUE, ir.eq(ir.div(vx, ir.lit(2n)), ir.lit(-4n)), undefined).map(c => c.statement)
+    const [outcome] = await prove(lean, FAST_HEADER, wrong)
+    assert.equal(outcome?.ok, false)
+  })
+})
+
+describe("simplification", () => {
+  const a = ir.variable("a", "int")
+  test("groups string concatenation the same way however it was written", () => {
+    const s = ir.variable("s", "str")
+    const left = ir.concat(ir.concat(s, ir.lit("level:")), ir.concat(ir.lit("high"), s))
+    const right = ir.concat(s, ir.concat(ir.lit("level:high"), s))
+    assert.equal(ir.eq(left, right), ir.TRUE)
+  })
+  test("folds constants with JavaScript's bigint semantics", () => {
+    assert.deepEqual(ir.div(ir.lit(-7n), ir.lit(2n)), ir.lit(-3n))
+    assert.deepEqual(ir.mod(ir.lit(-7n), ir.lit(2n)), ir.lit(-1n))
+    assert.equal(ir.eq(ir.add(a, ir.lit(0n)), a), ir.TRUE)
+  })
+  test("never folds a division by zero", () => {
+    assert.equal(ir.div(ir.lit(1n), ir.lit(0n)).t, "op")
+    assert.throws(() => ir.evaluate(ir.div(ir.lit(1n), ir.lit(0n)), new Map()), ir.EvaluationError)
+  })
+})

@@ -1,0 +1,38 @@
+{
+  "name": "pudding",
+  "version": "0.1.0",
+  "description": "Prove laws about existing TypeScript functions, with Lean doing the checking",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "bin": {
+    "pudding": "./dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./runner": {
+      "types": "./dist/runner.d.ts",
+      "default": "./dist/runner.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "proof": "npm run build --silent && node dist/cli.js",
+    "test": "npm run build --silent && node --test test/*.test.ts"
+  },
+  "dependencies": {
+    "typescript": "7.0.2"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6"
+  }
+}
