@@ -23,9 +23,13 @@ export interface Binder {
   ty: Ty
   /** Present when the input ranges over a finite set of values. */
   domain?: Scalar[]
+  /** True when the input is a JavaScript `number` holding a whole number, modeled as an integer. */
+  num?: boolean
+  /** Inclusive bounds of an integer input that is not enumerated. */
+  range?: [bigint, bigint]
 }
 
-export type ObligationKind = "expect" | "unreachable" | "falloff" | "nothrow"
+export type ObligationKind = "expect" | "unreachable" | "falloff" | "nothrow" | "overflow" | "nan"
 
 export interface Obligation {
   kind: ObligationKind
@@ -38,7 +42,7 @@ export interface Obligation {
   /** Source text of the statement that produced the obligation. */
   text: string
   /** Both sides of an equality assertion, kept for reporting. */
-  sides?: { actual: Expr; expected: Expr; negated: boolean }
+  sides?: { actual: Expr; expected: Expr; negated: boolean; num: boolean }
 }
 
 export const TRUE: Expr = { t: "lit", ty: "bool", value: true }
@@ -298,6 +302,15 @@ export function evaluate(e: Expr, env: ReadonlyMap<string, Scalar>): Scalar {
   }
 }
 
-export function showScalar(value: Scalar): string {
-  return typeof value === "bigint" ? `${value}n` : JSON.stringify(value)
+/** A value as it is written in TypeScript. `num` marks an integer that stands for a `number`. */
+export function showScalar(value: Scalar, num = false): string {
+  return typeof value === "bigint" ? (num ? String(value) : `${value}n`) : JSON.stringify(value)
+}
+
+/** The largest whole number a JavaScript `number` holds exactly. */
+export const MAX_SAFE = 2n ** 53n - 1n
+
+/** Whether an integer is one a `number` holds exactly. */
+export function isSafe(e: Expr): Expr {
+  return and(le(lit(-MAX_SAFE), e), le(e, lit(MAX_SAFE)))
 }

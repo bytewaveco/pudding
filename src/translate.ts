@@ -30,11 +30,13 @@ export class Unsupported extends Error {
 /** How to build the runtime argument of a law callback from its inputs. */
 export type ArgShape =
   | { k: "binder"; name: string }
-  | { k: "const"; value: Scalar }
+  | { k: "const"; value: Scalar; num?: boolean }
   | { k: "record"; fields: [string, ArgShape][] }
   | { k: "array"; items: ArgShape[] }
 
 export interface LawInstance {
+  /** What is known about the inputs beyond their types, such as the bounds of an integer. */
+  assumptions: Expr[]
   binders: Binder[]
   arg: ArgShape | undefined
   obligations: Obligation[]
@@ -60,7 +62,8 @@ export interface Law {
 }
 
 type Value =
-  | { k: "scalar"; e: Expr }
+  /** `num` marks an integer expression that stands for a `number` rather than a bigint. */
+  | { k: "scalar"; e: Expr; num?: boolean }
   | { k: "record"; fields: Map<string, Value> }
   | { k: "array"; items: Value[] }
   | { k: "closure"; node: N; env: Env }
@@ -71,7 +74,7 @@ type Value =
   | { k: "void" }
 
 type Shape =
-  | { k: "scalar"; ty: Ty; values?: Scalar[] }
+  | { k: "scalar"; ty: Ty; values?: Scalar[]; num?: boolean; range?: [bigint, bigint] }
   | { k: "record"; fields: [string, Shape][] }
   | { k: "tuple"; items: Shape[] }
   | { k: "union"; alts: Shape[] }
@@ -123,7 +126,12 @@ const COMPOUND = new Map<number, number>([
   [K.PlusEqualsToken, K.PlusToken], [K.MinusEqualsToken, K.MinusToken], [K.AsteriskEqualsToken, K.AsteriskToken],
   [K.SlashEqualsToken, K.SlashToken], [K.PercentEqualsToken, K.PercentToken],
 ])
-const scalar = (e: Expr): Value => ({ k: "scalar", e })
+const scalar = (e: Expr, num = false): Value => (num ? { k: "scalar", e, num } : { k: "scalar", e })
+const isNumber = (value: Value) => value.k === "scalar" && value.num === true
+/** Integer inputs with at most this many values are enumerated instead of quantified. */
+const MAX_ENUMERATED_RANGE = 256n
+const MAX_ITERATIONS = 2_000
+const NUMBER_HELP = "`number` covers fractions, NaN and infinities, which are not modeled; use `Integer` from pudding for whole numbers, or bigint"
 const MAX_ALTERNATIVES = 64
 const MODULE_DECLARATIONS = new Set<number>([
   K.ImportDeclaration, K.ExportDeclaration, K.ExportAssignment, K.VariableStatement, K.FunctionDeclaration, K.ClassDeclaration,
@@ -145,7 +153,7 @@ function sourceText(node: Node): string {
 
 function describe(value: Value): string {
   switch (value.k) {
-    case "scalar": return { bool: "a boolean", int: "a bigint", str: "a string" }[value.e.ty]
+    case "scalar": return value.num ? "a number" : { bool: "a boolean", int: "a bigint", str: "a string" }[value.e.ty]
     case "record": return "an object"
     case "array": return "an array"
     case "closure": return "a function"
@@ -327,14 +335,14 @@ export class Translator {
         alternatives = this.expand(this.shapeOf(type, typeNode), typeNode)
       }
       for (const alternative of alternatives) {
-        const instance: LawInstance = { binders: [], arg: undefined, obligations: [] }
+        const instance: LawInstance = { assumptions: [], binders: [], arg: undefined, obligations: [] }
         this.instance = instance
         if (hasDomain) instance.arg = this.instantiate(alternative, instance)
         law.instances.push(instance)
       }
       for (const instance of law.instances) {
         this.instance = instance
-        this.pc = []
+        this.pc = [...instance.assumptions]
         this.stack = []
         this.cells = []
         this.steps = 0
@@ -383,12 +391,38 @@ export class Translator {
     if (flags & TypeFlags.BigIntLiteral) return { k: "scalar", ty: "int", values: [BigInt(name().replace(/n$/, ""))] }
     if (flags & TypeFlags.String) return { k: "scalar", ty: "str" }
     if (flags & TypeFlags.StringLiteral) return { k: "scalar", ty: "str", values: [this.wellFormed(String((type as N).value), at)] }
-    if (flags & (TypeFlags.Number | TypeFlags.NumberLiteral)) throw new Unsupported("`number` is not modeled because it is floating point; use bigint for quantities", at)
+    if (flags & TypeFlags.NumberLiteral) {
+      const value = Number((type as N).value)
+      if (!Number.isSafeInteger(value)) throw new Unsupported(`the number ${name()} is not a whole number that can be held exactly`, at)
+      return { k: "scalar", ty: "int", num: true, values: [BigInt(value)] }
+    }
+    if (flags & TypeFlags.Number) throw new Unsupported(NUMBER_HELP, at)
+    if (type.isIntersectionType()) {
+      // `Integer<Min, Max>` is `number` intersected with a marker that carries the bounds.
+      const members = type.getTypes()
+      const marker = members.map(member => this.checker.getPropertyOfType(member, "__puddingInteger")).find(Boolean)
+      if (marker && members.some(member => member.flags & TypeFlags.Number)) {
+        const carried = this.checker.getTypeOfSymbol(marker)
+        const tuple = (carried?.isUnionType() ? carried.getTypes() : carried ? [carried] : []).find(member => this.checker.isTupleType(member))
+        const bound = (member: Type | undefined, fallback: bigint) =>
+          member && member.flags & TypeFlags.NumberLiteral && Number.isSafeInteger(Number((member as N).value)) ? BigInt(Number((member as N).value)) : fallback
+        const [low, high] = tuple ? this.checker.getTypeArguments(tuple as N) : []
+        const range: [bigint, bigint] = [bound(low, -ir.MAX_SAFE), bound(high, ir.MAX_SAFE)]
+        if (range[0] > range[1]) throw new Unsupported(`${name()} has a lower bound above its upper bound`, at)
+        if (range[1] - range[0] < MAX_ENUMERATED_RANGE) {
+          const values: Scalar[] = []
+          for (let value = range[0]; value <= range[1]; value++) values.push(value)
+          return { k: "scalar", ty: "int", num: true, values }
+        }
+        return { k: "scalar", ty: "int", num: true, range }
+      }
+    }
     if (type.isUnionType()) {
       const members = type.getTypes().map(member => this.shapeOf(member, at))
-      if (members.every(m => m.k === "scalar" && m.values && m.ty === (members[0] as typeof m).ty)) {
+      const first = members[0] as Extract<Shape, { k: "scalar" }>
+      if (members.every(m => m.k === "scalar" && m.values && m.ty === first.ty && !!m.num === !!first.num)) {
         const values = [...new Set(members.flatMap(m => (m as { values: Scalar[] }).values))]
-        return { k: "scalar", ty: (members[0] as { ty: Ty }).ty, values }
+        return { k: "scalar", ty: first.ty, values, ...(first.num ? { num: true } : {}) }
       }
       if (members.every(m => m.k !== "scalar")) return { k: "union", alts: members }
       throw new Unsupported(`the union type ${name()} mixes kinds of values that are not supported together`, at)
@@ -433,9 +467,16 @@ export class Translator {
   private instantiate(shape: Shape, instance: LawInstance): ArgShape {
     switch (shape.k) {
       case "scalar": {
-        if (shape.values?.length === 1) return { k: "const", value: shape.values[0]! }
+        if (shape.values?.length === 1) return { k: "const", value: shape.values[0]!, ...(shape.num ? { num: true } : {}) }
         const name = `x${instance.binders.length}`
-        instance.binders.push({ name, label: name, ty: shape.ty, ...(shape.values ? { domain: shape.values } : {}) })
+        instance.binders.push({
+          name, label: name, ty: shape.ty,
+          ...(shape.values ? { domain: shape.values } : {}), ...(shape.num ? { num: true } : {}), ...(shape.range ? { range: shape.range } : {}),
+        })
+        if (shape.range) {
+          const input = ir.variable(name, "int")
+          instance.assumptions.push(ir.and(ir.le(ir.lit(shape.range[0]), input), ir.le(input, ir.lit(shape.range[1]))))
+        }
         return { k: "binder", name }
       }
       case "tuple": return { k: "array", items: shape.items.map(item => this.instantiate(item, instance)) }
@@ -448,9 +489,9 @@ export class Translator {
     switch (arg.k) {
       case "binder": {
         const binder = this.instance!.binders.find(b => b.name === arg.name)!
-        return scalar(ir.variable(binder.name, binder.ty))
+        return scalar(ir.variable(binder.name, binder.ty), binder.num)
       }
-      case "const": return scalar(ir.lit(arg.value))
+      case "const": return scalar(ir.lit(arg.value), arg.num)
       case "array": return { k: "array", items: arg.items.map(item => this.valueOf(item)) }
       case "record": return { k: "record", fields: new Map(arg.fields.map(([key, field]) => [key, this.valueOf(field)])) }
     }
@@ -495,7 +536,7 @@ export class Translator {
       throw new Unsupported("toBe compares identity, which is only modeled for booleans, bigints and strings; use toEqual", node)
     }
     const equal = this.equal(actual, expected, node)
-    const sides = actual.k === "scalar" && expected.k === "scalar" ? { actual: actual.e, expected: expected.e, negated } : undefined
+    const sides = actual.k === "scalar" && expected.k === "scalar" ? { actual: actual.e, expected: expected.e, negated, num: !!actual.num } : undefined
     this.emit("expect", negated ? ir.not(equal) : equal, node, sides)
   }
 
@@ -504,7 +545,7 @@ export class Translator {
     if (a.k === "choice") return ir.ite(a.cond, this.equal(a.a, b, at), this.equal(a.b, b, at))
     if (b.k === "choice") return ir.ite(b.cond, this.equal(a, b.a, at), this.equal(a, b.b, at))
     if (a.k === "scalar" && b.k === "scalar") {
-      if (a.e.ty !== b.e.ty) throw new Unsupported(`cannot compare ${describe(a)} with ${describe(b)}`, at)
+      if (a.e.ty !== b.e.ty || !!a.num !== !!b.num) throw new Unsupported(`cannot compare ${describe(a)} with ${describe(b)}`, at)
       return ir.eq(a.e, b.e)
     }
     if (a.k === "array" && b.k === "array") {
@@ -586,7 +627,7 @@ export class Translator {
   private merge(cond: Expr, a: Value, b: Value): Value {
     if (a.k === "bottom") return b
     if (b.k === "bottom") return a
-    if (a.k === "scalar" && b.k === "scalar" && a.e.ty === b.e.ty) return scalar(ir.ite(cond, a.e, b.e))
+    if (a.k === "scalar" && b.k === "scalar" && a.e.ty === b.e.ty && !!a.num === !!b.num) return scalar(ir.ite(cond, a.e, b.e), a.num)
     if (a.k === "array" && b.k === "array" && a.items.length === b.items.length) {
       return { k: "array", items: a.items.map((item, i) => this.merge(cond, item, b.items[i]!)) }
     }
@@ -815,9 +856,34 @@ export class Translator {
       }
       case K.WhileStatement:
       case K.DoStatement:
-      case K.ForStatement:
+      case K.ForStatement: {
+        // These loops are unrolled by running them: the condition must come
+        // out as plainly true or false each time round, as it does when it
+        // only depends on a counter and on lengths known here.
+        const scope = env.child()
+        const initializer = statement.kind === K.ForStatement ? statement.initializer : undefined
+        if (initializer?.kind === K.VariableDeclarationList) this.declare(initializer, scope)
+        else if (initializer) this.effect(initializer, scope)
+        const condition = statement.kind === K.ForStatement ? statement.condition : statement.expression
+        const body = statement.statement
+        let rounds = 0
+        const test = (): Value => {
+          const cond = condition ? this.bool(condition, scope) : ir.TRUE
+          if (cond.t !== "lit") throw new Unsupported("how many times this loop runs depends on a value that is not known here", condition)
+          return cond.value ? round() : rest()
+        }
+        const step = (): Value => {
+          if (statement.kind === K.ForStatement && statement.incrementor) this.effect(statement.incrementor, scope)
+          return test()
+        }
+        const round = (): Value => {
+          if (++rounds > MAX_ITERATIONS) throw new Unsupported(`this loop runs more than ${MAX_ITERATIONS} times, which is too many to unroll`, statement)
+          return this.exec(body.kind === K.Block ? body.statements : [body], 0, scope.child(), { next: step, cont: step, brk: rest })
+        }
+        return statement.kind === K.DoStatement ? round() : test()
+      }
       case K.ForInStatement:
-        throw new Unsupported("this kind of loop is not supported; only `for (const item of items)` over an array of known length is", statement)
+        throw new Unsupported("for...in loops are not supported", statement)
       case K.TryStatement:
         throw new Unsupported("try, catch and finally are not supported", statement)
       default:
@@ -841,7 +907,7 @@ export class Translator {
     if ((node.kind === K.PrefixUnaryExpression || node.kind === K.PostfixUnaryExpression) &&
       (node.operator === K.PlusPlusToken || node.operator === K.MinusMinusToken)) {
       const cell = this.assignable(node.operand, env)
-      const one = scalar(ir.lit(1n))
+      const one = scalar(ir.lit(1n), isNumber(cell.value))
       cell.value = this.arithmetic(node.operator === K.PlusPlusToken ? K.PlusToken : K.MinusToken, cell.value, one, node)
       return
     }
@@ -898,15 +964,21 @@ export class Translator {
       case K.TrueKeyword: return scalar(ir.TRUE)
       case K.FalseKeyword: return scalar(ir.FALSE)
       case K.BigIntLiteral: return scalar(ir.lit(BigInt(node.text.replace(/n$/, "").replaceAll("_", ""))))
-      case K.NumericLiteral:
-        throw new Unsupported("`number` is not modeled because it is floating point; use bigint for quantities", node)
+      case K.NumericLiteral: {
+        const value = Number(node.text)
+        if (!Number.isSafeInteger(value)) throw new Unsupported("only whole numbers up to 2^53 - 1 are modeled; fractions and larger numbers are not", node)
+        return scalar(ir.lit(BigInt(value)), true)
+      }
       case K.Identifier: return env.get(node.text) ?? this.global(node)
       case K.ArrowFunction:
       case K.FunctionExpression:
         return { k: "closure", node, env }
       case K.PrefixUnaryExpression: {
         if (node.operator === K.ExclamationToken) return scalar(ir.not(this.bool(node.operand, env)))
-        if (node.operator === K.MinusToken) return scalar(ir.neg(this.scalarOf(this.evalExpr(node.operand, env), node.operand, "int")))
+        if (node.operator === K.MinusToken) {
+          const operand = this.evalExpr(node.operand, env)
+          return scalar(ir.neg(this.scalarOf(operand, node.operand, "int")), isNumber(operand))
+        }
         throw new Unsupported("this operator is not supported", node)
       }
       case K.ConditionalExpression:
@@ -955,6 +1027,12 @@ export class Translator {
         const name = node.name.text as string
         return this.over(this.evalExpr(node.expression, env), object => {
           if (object.k === "bottom") return BOTTOM
+          if (name === "length" && object.k === "array") return scalar(ir.lit(BigInt(object.items.length)), true)
+          if (name === "length" && object.k === "scalar" && object.e.ty === "str") {
+            // JavaScript counts UTF-16 units and Lean counts characters, so only a known string has a length here.
+            if (object.e.t !== "lit") throw new Unsupported("the length of a string that is not known here is not modeled", node)
+            return scalar(ir.lit(BigInt((object.e.value as string).length)), true)
+          }
           if (object.k !== "record") throw new Unsupported(`reading \`.${name}\` of ${describe(object)} is not supported`, node)
           const field = object.fields.get(name)
           if (!field) throw new Unsupported(`property \`${name}\` does not exist on this object`, node)
@@ -981,7 +1059,7 @@ export class Translator {
     const rightValue = this.evalExpr(node.right, env)
     if (operator === K.EqualsEqualsEqualsToken || operator === K.ExclamationEqualsEqualsToken) {
       if (leftValue.k !== "scalar" || rightValue.k !== "scalar") throw new Unsupported("=== is only modeled for booleans, bigints and strings", node)
-      if (leftValue.e.ty !== rightValue.e.ty) throw new Unsupported(`cannot compare ${describe(leftValue)} with ${describe(rightValue)}`, node)
+      if (leftValue.e.ty !== rightValue.e.ty || !!leftValue.num !== !!rightValue.num) throw new Unsupported(`cannot compare ${describe(leftValue)} with ${describe(rightValue)}`, node)
       const equal = ir.eq(leftValue.e, rightValue.e)
       return scalar(operator === K.EqualsEqualsEqualsToken ? equal : ir.not(equal))
     }
@@ -997,6 +1075,26 @@ export class Translator {
     }
     const left = this.scalarOf(leftValue, node.left ?? node, "int")
     const right = this.scalarOf(rightValue, node.right ?? node, "int")
+    if (isNumber(leftValue) !== isNumber(rightValue)) throw new Unsupported(`cannot combine ${describe(leftValue)} with ${describe(rightValue)}`, node)
+    if (isNumber(leftValue)) {
+      // A `number` is modeled as the whole number it holds. That is exact for
+      // these operators as long as the result stays within what a double
+      // holds exactly, which each use must prove.
+      const exact = (result: Expr) => {
+        this.emit("overflow", ir.isSafe(result), node)
+        return scalar(result, true)
+      }
+      switch (operator) {
+        case K.PlusToken: return exact(ir.add(left, right))
+        case K.MinusToken: return exact(ir.sub(left, right))
+        case K.AsteriskToken: return exact(ir.mul(left, right))
+        case K.PercentToken:
+          this.emit("nan", ir.not(ir.eq(right, ir.lit(0n))), node)
+          return scalar(ir.mod(left, right), true)
+        case K.SlashToken:
+          throw new Unsupported("dividing numbers can give a fraction, which is not modeled; write Math.floor(a / b) or Math.trunc(a / b), or use bigint", node)
+      }
+    }
     switch (operator) {
       case K.PlusToken: return scalar(ir.add(left, right))
       case K.MinusToken: return scalar(ir.sub(left, right))
@@ -1019,9 +1117,10 @@ export class Translator {
     return this.over(this.evalExpr(node.expression, env), object => {
       if (object.k === "bottom") return BOTTOM
       if (object.k === "array") {
-        if (index.kind !== K.NumericLiteral || !/^\d+$/.test(index.text)) throw new Unsupported("arrays can only be indexed by a literal position", node)
-        const item = object.items[Number(index.text)]
-        if (!item) throw new Unsupported("this index is past the end of the array", node)
+        const position = this.evalExpr(index, env)
+        if (!isNumber(position) || position.k !== "scalar" || position.e.t !== "lit") throw new Unsupported("an array can only be indexed by a position that is known here", node)
+        const item = object.items[Number(position.e.value)]
+        if (!item) throw new Unsupported("this index is outside the array", node)
         return item
       }
       if (object.k !== "record") throw new Unsupported(`indexing ${describe(object)} is not supported`, node)
@@ -1052,9 +1151,18 @@ export class Translator {
       if (argument.kind === K.SpreadElement) throw new Unsupported("spread arguments are not supported", argument)
       return this.evalExpr(argument, env)
     })
-    if (callee.kind === K.Identifier && callee.text === "String" && !env.get("String") && node.arguments.length === 1 && this.isBuiltin(callee)) {
-      return this.text(args()[0]!, node)
+    if (callee.kind === K.Identifier && !env.get(callee.text) && node.arguments.length === 1 && this.isBuiltin(callee)) {
+      if (callee.text === "String") return this.text(args()[0]!, node)
+      if (callee.text === "BigInt" || callee.text === "Number") {
+        const [value] = args()
+        const integer = this.scalarOf(value!, node, "int")
+        // Every whole number is a bigint, but only some bigints fit a number exactly.
+        if (callee.text === "Number" && !isNumber(value!)) this.emit("overflow", ir.isSafe(integer), node)
+        return scalar(integer, callee.text === "Number")
+      }
     }
+    if (callee.kind === K.PropertyAccessExpression && callee.expression.kind === K.Identifier && callee.expression.text === "Math" &&
+      !env.get("Math") && this.isBuiltin(callee.expression)) return this.math(callee.name.text, node, env)
     if (callee.kind === K.PropertyAccessExpression && !this.isNamespace(callee.expression, env)) {
       const method = callee.name.text as string
       return this.over(this.evalExpr(callee.expression, env), receiver => {
@@ -1066,6 +1174,48 @@ export class Translator {
       })
     }
     return this.call(this.evalExpr(callee, env), args(), node)
+  }
+
+  /** The `Math` functions that keep whole numbers whole. */
+  private math(name: string, node: N, env: Env): Value {
+    const parameters = node.arguments as N[]
+    const number = (argument: N) => {
+      const value = this.evalExpr(argument, env)
+      if (!isNumber(value)) throw new Unsupported(`Math.${name} is modeled for numbers, but this is ${describe(value)}`, argument)
+      return (value as { e: Expr }).e
+    }
+    const [first] = parameters
+    if (first && parameters.length === 1 && (name === "floor" || name === "trunc" || name === "ceil" || name === "round")) {
+      let inner = first
+      while (inner.kind === K.ParenthesizedExpression) inner = inner.expression
+      if (inner.kind !== K.BinaryExpression || inner.operatorToken.kind !== K.SlashToken) return scalar(number(first), true)
+      // Rounding a quotient of whole numbers. Dividing two exactly held whole
+      // numbers and rounding gives the same integer as exact division; that
+      // does not hold for Math.round, whose halfway cases depend on the fraction.
+      if (name === "round") throw new Unsupported("Math.round of a quotient is not modeled; use Math.floor or Math.trunc", node)
+      const a = number(inner.left)
+      const b = number(inner.right)
+      this.emit("nan", ir.not(ir.eq(b, ir.lit(0n))), inner)
+      const truncated = ir.div(a, b)
+      if (name === "trunc") return scalar(truncated, true)
+      const inexact = ir.not(ir.eq(ir.mod(a, b), ir.lit(0n)))
+      const negative = ir.not(ir.eq(ir.lt(a, ir.lit(0n)), ir.lt(b, ir.lit(0n))))
+      return scalar(name === "floor"
+        ? ir.ite(ir.and(inexact, negative), ir.sub(truncated, ir.lit(1n)), truncated)
+        : ir.ite(ir.and(inexact, ir.not(negative)), ir.add(truncated, ir.lit(1n)), truncated), true)
+    }
+    if (first && parameters.length === 1 && name === "abs") {
+      const value = number(first)
+      return scalar(ir.ite(ir.lt(value, ir.lit(0n)), ir.neg(value), value), true)
+    }
+    if (first && parameters.length === 1 && name === "sign") {
+      const value = number(first)
+      return scalar(ir.ite(ir.lt(value, ir.lit(0n)), ir.lit(-1n), ir.ite(ir.eq(value, ir.lit(0n)), ir.lit(0n), ir.lit(1n))), true)
+    }
+    if (parameters.length >= 1 && (name === "min" || name === "max") && parameters.every(p => p.kind !== K.SpreadElement)) {
+      return scalar(parameters.map(number).reduce((best, value) => ir.ite(name === "min" ? ir.lt(value, best) : ir.lt(best, value), value, best)), true)
+    }
+    throw new Unsupported(`Math.${name} is not supported`, node)
   }
 
   /** `String(x)` and `x.toString()` for the scalars whose text Lean and JavaScript agree on. */

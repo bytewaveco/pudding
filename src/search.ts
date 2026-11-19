@@ -33,7 +33,13 @@ export interface Assignments {
 
 /** Inputs to try: every combination when the space is small enough, otherwise a sample. */
 export function assignments(binders: readonly Binder[], strings: readonly string[], budget: number): Assignments {
-  const pools = binders.map(b => b.domain ?? (b.ty === "int" ? INTEGERS : b.ty === "bool" ? [true, false] : strings))
+  const integers = (b: Binder): readonly Scalar[] => {
+    if (!b.range) return INTEGERS
+    const [low, high] = b.range
+    const edges = [low, low + 1n, high - 1n, high, (low + high) / 2n]
+    return [...new Set([...INTEGERS, ...edges].filter(value => value >= low && value <= high))]
+  }
+  const pools = binders.map(b => b.domain ?? (b.ty === "int" ? integers(b) : b.ty === "bool" ? [true, false] : strings))
   const total = pools.reduce((n, pool) => n * pool.length, 1)
   const finite = binders.every(b => b.domain)
   const grid = total <= budget
@@ -56,7 +62,10 @@ export function assignments(binders: readonly Binder[], strings: readonly string
         binders.forEach((b, i) => {
           const pool = pools[i]!
           const fromPool = b.domain || b.ty !== "int" || random() < 0.2
-          env.set(b.name, fromPool ? pool[Math.floor(random() * pool.length)]! : randomInteger(random))
+          const drawn = fromPool ? pool[Math.floor(random() * pool.length)]! : randomInteger(random)
+          // A value outside an input's bounds is not an input at all.
+          const inside = !b.range || typeof drawn !== "bigint" || (drawn >= b.range[0] && drawn <= b.range[1])
+          env.set(b.name, inside ? drawn : pool[Math.floor(random() * pool.length)]!)
         })
         if (visit(env)) return
       }
@@ -107,14 +116,14 @@ export function showInputs(binders: readonly Binder[], env: Map<string, Scalar>)
   const shown: Record<string, string> = {}
   for (const binder of binders) {
     const value = env.get(binder.name)
-    if (value !== undefined) shown[binder.label] = ir.showScalar(value)
+    if (value !== undefined) shown[binder.label] = ir.showScalar(value, binder.num)
   }
   return shown
 }
 
-export function showValue(e: Expr, env: Map<string, Scalar>): string {
+export function showValue(e: Expr, env: Map<string, Scalar>, num = false): string {
   try {
-    return ir.showScalar(ir.evaluate(e, env))
+    return ir.showScalar(ir.evaluate(e, env), num)
   } catch {
     return "(throws)"
   }

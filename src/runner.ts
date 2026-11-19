@@ -40,7 +40,7 @@ export interface RunOptions extends Config {
 export type Status = "proved" | "checked" | "sampled" | "failed" | "skipped" | "todo"
 
 export interface Finding {
-  kind: "counterexample" | "unproved" | "vacuous" | "throws" | "mismatch" | "unsupported" | "invalid"
+  kind: "counterexample" | "unproved" | "vacuous" | "throws" | "inexact" | "mismatch" | "unsupported" | "invalid"
   message: string
   file: string
   line: number
@@ -500,10 +500,14 @@ export async function run(options: RunOptions = {}): Promise<Report> {
         const sides = obligation.sides
         entry.findings.push({
           kind: "counterexample", message: "the expectation does not hold", ...at, inputs,
-          ...(sides ? { detail: `actual:   ${showValue(sides.actual, found)}\nexpected: ${sides.negated ? "anything but " : ""}${showValue(sides.expected, found)}` } : {}),
+          ...(sides ? { detail: `actual:   ${showValue(sides.actual, found, sides.num)}\nexpected: ${sides.negated ? "anything but " : ""}${showValue(sides.expected, found, sides.num)}` } : {}),
         })
       } else {
-        entry.findings.push({
+        entry.findings.push(obligation.kind === "overflow" || obligation.kind === "nan" ? {
+          kind: "inexact", ...at, inputs,
+          message: obligation.kind === "nan" ? "this divides a number by zero, which does not give a whole number"
+            : "this result is too large for a number to hold exactly (beyond 2^53 - 1)",
+        } : {
           kind: "throws", ...at, inputs,
           message: obligation.kind === "nothrow" ? "this divides by zero"
             : obligation.kind === "falloff" ? "this function reaches its end without returning a value" : "this throw is reached",
@@ -511,7 +515,8 @@ export async function run(options: RunOptions = {}): Promise<Report> {
       }
     } else {
       const message = obligation.kind === "expect" ? "Lean could not prove this, and no counterexample was found"
-        : obligation.kind === "nothrow" ? "Lean could not prove that the divisor is never zero"
+        : obligation.kind === "nothrow" || obligation.kind === "nan" ? "Lean could not prove that the divisor is never zero"
+        : obligation.kind === "overflow" ? "Lean could not prove that this result stays small enough for a number to hold exactly"
         : obligation.kind === "falloff" ? "Lean could not prove that this function always returns a value"
         : "Lean could not prove that this throw is never reached"
       entry.findings.push({ kind: "unproved", message, ...at, detail: rejected.message.split("\n").slice(0, 8).join("\n") })
@@ -568,7 +573,7 @@ export async function run(options: RunOptions = {}): Promise<Report> {
           index: law.index,
           unproved: law.problem !== undefined,
           instances: law.instances.map(instance => ({
-            binders: instance.binders, arg: instance.arg, obligations: instance.obligations.map(o => ({ guard: o.guard, claim: o.claim })),
+            binders: instance.binders, arg: instance.arg, obligations: instance.obligations.map(o => ({ guard: o.guard, claim: o.claim, inexact: o.kind === "overflow" || o.kind === "nan" })),
           })),
         })),
       })),

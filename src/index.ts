@@ -31,6 +31,14 @@ export function defineConfig(config: Config): Config {
   return config
 }
 
+/**
+ * A whole number. As a law input it means every integer from `Min` to `Max`,
+ * or every integer a `number` holds exactly when no bounds are given. A plain
+ * `number` cannot be an input, because it also covers fractions, NaN and
+ * infinities, which are not modeled.
+ */
+export type Integer<Min extends number = number, Max extends number = number> = number & { readonly __puddingInteger?: [Min, Max] }
+
 export interface Domain<T> {
   readonly value: T
 }
@@ -99,8 +107,10 @@ export const describe: Describe = Object.assign(group, { skip: group, only: grou
 
 export class ExpectationFailed extends Error {}
 
+// Zero and negative zero are treated as equal, as `===` treats them: whole
+// numbers are modeled as integers, which have a single zero.
 function equal(a: unknown, b: unknown): boolean {
-  if (Object.is(a, b)) return true
+  if (a === b || Object.is(a, b)) return true
   if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) return false
   if (Array.isArray(a) !== Array.isArray(b)) return false
   const keys = Object.keys(a)
@@ -114,7 +124,7 @@ function matchers<T>(actual: T, negated: boolean): Matchers<T> {
   }
   return {
     toEqual: expected => check(equal(actual, expected)),
-    toBe: expected => check(Object.is(actual, expected)),
+    toBe: expected => check(actual === expected || Object.is(actual, expected)),
     get not() {
       return matchers(actual, !negated)
     },

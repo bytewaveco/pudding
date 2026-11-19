@@ -19,7 +19,7 @@ export interface RuntimeMap {
 interface Instance {
   binders: Binder[]
   arg: ArgShape | undefined
-  obligations: { guard: Expr; claim: Expr }[]
+  obligations: { guard: Expr; claim: Expr; inexact: boolean }[]
 }
 
 export interface Job {
@@ -55,18 +55,30 @@ interface Registered {
 
 const pathOf = (url: string) => fileURLToPath(url.split("?")[0]!)
 
-function buildArgument(shape: ArgShape, env: Map<string, Scalar>): unknown {
+function buildArgument(shape: ArgShape, env: Map<string, Scalar>, numbers: Set<string>): unknown {
   switch (shape.k) {
-    case "binder": return env.get(shape.name)
-    case "const": return shape.value
-    case "array": return shape.items.map(item => buildArgument(item, env))
-    case "record": return Object.fromEntries(shape.fields.map(([key, field]) => [key, buildArgument(field, env)]))
+    case "binder": return numbers.has(shape.name) ? Number(env.get(shape.name)) : env.get(shape.name)
+    case "const": return shape.num ? Number(shape.value) : shape.value
+    case "array": return shape.items.map(item => buildArgument(item, env, numbers))
+    case "record": return Object.fromEntries(shape.fields.map(([key, field]) => [key, buildArgument(field, env, numbers)]))
   }
 }
 
-function modelHolds(instance: Instance, env: Map<string, Scalar>): boolean {
+/**
+ * What the model says about an input: whether the law holds, or that the
+ * model does not describe this input. The latter is when a number leaves the
+ * range of exact whole numbers; the real code then computes something the
+ * model has no counterpart for, and that is already reported on its own.
+ */
+function modelHolds(instance: Instance, env: Map<string, Scalar>): boolean | "outside" {
   try {
-    return instance.obligations.every(o => ir.evaluate(o.guard, env) !== true || ir.evaluate(o.claim, env) === true)
+    let holds = true
+    for (const obligation of instance.obligations) {
+      if (ir.evaluate(obligation.guard, env) !== true || ir.evaluate(obligation.claim, env) === true) continue
+      if (obligation.inexact) return "outside"
+      holds = false
+    }
+    return holds
   } catch (error) {
     if (error instanceof ir.EvaluationError) return false
     throw error
@@ -124,12 +136,14 @@ async function execute(job: Job, report: (outcome: FileOutcome) => void) {
         if (!callback) continue
         const result: LawOutcome = { index: law.index, executed: 0, exhaustive: true }
         for (const instance of law.instances) {
+          const numbers = new Set(instance.binders.filter(b => b.num).map(b => b.name))
           const space = assignments(instance.binders, stringPool(instance.obligations.flatMap(o => [o.guard, o.claim])), job.budget)
           result.exhaustive &&= space.exhaustive
           space.each(env => {
-            result.executed++
-            const actual = runtimeHolds(callback, instance.arg ? buildArgument(instance.arg, env) : undefined)
             const expected = law.unproved ? true : modelHolds(instance, env)
+            if (expected === "outside") return false
+            result.executed++
+            const actual = runtimeHolds(callback, instance.arg ? buildArgument(instance.arg, env, numbers) : undefined)
             if (actual === expected) return false
             result.failure = { kind: law.unproved ? "counterexample" : "mismatch", inputs: showInputs(instance.binders, env), actual, expected }
             return true

@@ -65,7 +65,7 @@ describe("the suite project", () => {
 
   test("code outside the supported subset is executed instead and says so", () => {
     const sampled = law(report, "SAMPLED: the total of a pair is their sum")
-    assert.match(sampled.notes[0] ?? "", /not proved: this kind of loop is not supported.*\(fallback\.ts:3:3\)/)
+    assert.match(sampled.notes[0] ?? "", /not proved: the array method `\.filter` is not supported \(fallback\.ts:2:10\)/)
     assert.equal(law(report, "FALSE when executed: totals ignore the first amount").findings[0]?.kind, "counterexample")
   })
 
@@ -108,6 +108,16 @@ describe("imperative code", () => {
     assert.deepEqual(findings.map(f => f.line), [111, 112])
   })
 
+  test("numbers are whole numbers: results that could stop being exact are reported", () => {
+    const [grows] = law(report, "whole numbers > FALSE: adding one always grows a number").findings
+    assert.equal(grows?.kind, "inexact")
+    assert.deepEqual(grows?.inputs, { value: "9007199254740991" })
+    const [zero] = law(report, "whole numbers > FALSE: pages never divide by zero").findings
+    assert.equal(zero?.kind, "inexact")
+    assert.deepEqual(zero?.inputs, { size: "0" })
+    assert.match(law(report, "counted loops > SAMPLED: plain division is refused").notes[0] ?? "", /dividing numbers can give a fraction/)
+  })
+
   test("what cannot be modeled exactly is refused by name", () => {
     const note = (name: string) => law(report, name).notes[0] ?? ""
     assert.match(note("SAMPLED: a closure that writes an outer variable"), /uses `count`, a variable that is reassigned outside it/)
@@ -115,7 +125,7 @@ describe("imperative code", () => {
     assert.match(note("SAMPLED: mutating an object in place"), /changing an object or array in place is not modeled/)
     assert.match(note("SAMPLED: mutating an array in place"), /changing an object or array in place is not modeled/)
     assert.match(note("SAMPLED: assignment used as a value"), /assignment used as a value/)
-    assert.match(note("CHECKED: a while loop"), /this kind of loop is not supported/)
+    assert.match(note("CHECKED: a while loop bounded by an input"), /how many times this loop runs depends on a value that is not known here/)
   })
 })
 

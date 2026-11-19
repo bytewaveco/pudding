@@ -1,7 +1,5 @@
 export function total(amounts: readonly bigint[]): bigint {
-  let sum = 0n
-  for (let index = 0; index < amounts.length; index++) sum += amounts[index]!
-  return sum
+  return amounts.filter(amount => amount !== 0n).reduce((sum, amount) => sum + amount, 0n)
 }
 
 export function initials(name: "ada" | "grace"): string {

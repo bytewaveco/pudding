@@ -21,6 +21,6 @@ law("SAMPLED: assignment used as a value", domain<bigint>(), amount => {
   expect(chained(amount)).toEqual(amount + amount)
 })
 
-law("CHECKED: a while loop", domain<1n | 2n | 3n>(), limit => {
+law("CHECKED: a while loop bounded by an input", domain<1n | 2n | 3n>(), limit => {
   expect(whileLoop(limit)).toEqual(limit)
 })
