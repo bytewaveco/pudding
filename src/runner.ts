@@ -22,7 +22,7 @@ import { checksFor, FAST_HEADER, FULL_HEADER, prove, render, TooLarge, withFallb
 import { Translator, type Law, type LawInstance } from "./translate.ts"
 
 export const MINIMUM_LEAN = [4, 36, 0] as const
-const CACHE_VERSION = 1
+const CACHE_VERSION = 2
 const RUNTIME_BUDGET = 4_000
 const RUNTIME_TIMEOUT_MS = 30_000
 
@@ -81,18 +81,22 @@ export interface Report {
   retried: number
   /** Milliseconds spent in each phase. */
   timings: { typescript: number; prove: number; retry: number; crossCheck: number }
-  /** True when nothing changed since the previous run and its result was reused. */
-  replayed: boolean
   /** The reporter the project's configuration asks for, if any. */
   reporter?: Config["reporter"]
   lean: string
 }
 
+/**
+ * What is remembered between runs: which Lean binary is which version, and
+ * the theorems Lean has accepted. A theorem is identified by its full text
+ * and the Lean version, so reusing it cannot be wrong. Whole results are
+ * deliberately not reused: knowing that nothing relevant changed would mean
+ * second-guessing TypeScript's module resolution.
+ */
 interface Cache {
   version: number
   lean: Record<string, string>
   proved: string[]
-  replay?: { signature: string; sources: string[]; report: Report }
 }
 
 /** A path as shown to the user: relative inside the project, absolute outside it. */
@@ -110,7 +114,8 @@ async function loadConfig(cwd: string): Promise<{ config: Config; file: string |
   for (const name of ["pudding.config.ts", "pudding.config.mts", "pudding.config.js", "pudding.config.mjs"]) {
     const file = join(cwd, name)
     if (!existsSync(file)) continue
-    const module = (await import(pathToFileURL(file).href)) as { default?: Config }
+    // The query makes a changed file load again when one process runs several times, as watch mode does.
+    const module = (await import(`${pathToFileURL(file).href}?changed=${statSync(file).mtimeMs}`)) as { default?: Config }
     return { config: module.default ?? {}, file }
   }
   return { config: {}, file: undefined }
@@ -185,21 +190,6 @@ function loadCache(file: string): Cache {
     // Missing or unreadable: start fresh.
   }
   return { version: CACHE_VERSION, lean: {}, proved: [] }
-}
-
-function stamp(file: string): string {
-  try {
-    const stat = statSync(file)
-    return `${file}:${stat.mtimeMs}:${stat.size}`
-  } catch {
-    return `${file}:missing`
-  }
-}
-
-/** Identifies everything a result depends on, so an unchanged project can reuse it. */
-function signatureOf(parts: unknown, files: string[]): string {
-  const own = dirname(fileURLToPath(import.meta.url))
-  return hash(JSON.stringify([parts, files.map(stamp), readdirSync(own).map(name => stamp(join(own, name)))]))
 }
 
 /**
@@ -330,7 +320,7 @@ interface Pending {
 function emptyReport(lean: string): Report {
   return {
     ok: false, laws: [], errors: [], warnings: [], counts: { proved: 0, checked: 0, sampled: 0, failed: 0, skipped: 0, todo: 0 },
-    obligations: 0, cachedObligations: 0, cases: 0, durationMs: 0, replayed: false, lean,
+    obligations: 0, cachedObligations: 0, cases: 0, durationMs: 0, lean,
     retried: 0, timings: { typescript: 0, prove: 0, retry: 0, crossCheck: 0 },
   }
 }
@@ -375,17 +365,12 @@ export async function run(options: RunOptions = {}): Promise<Report> {
     }
   }
 
-  const identity = { cache: CACHE_VERSION, version, lawFiles, tsconfig: stamp(base), config: { ...config, emit: undefined, cwd: undefined, reporter: undefined } }
-  if (config.cache !== false && !config.emit && cache.replay && cache.replay.signature === signatureOf(identity, cache.replay.sources)) {
-    return { ...cache.replay.report, replayed: true, durationMs: Math.round(performance.now() - started) }
-  }
   const tsconfig = writeProject(dirname(cacheFile), existsSync(base) ? base : undefined, lawFiles)
 
   // Read and translate the laws.
   const reading = performance.now()
   const api = new API({ cwd })
   let laws: Law[] = []
-  let sources: string[] = []
   let executable: RuntimeMap | undefined
   try {
     const snapshot = api.updateSnapshot({ openProjects: [tsconfig] })
@@ -414,7 +399,6 @@ export async function run(options: RunOptions = {}): Promise<Report> {
     for (const file of readable) laws.push(...translator.translateFile(program.getSourceFile(file)!, selected))
     for (const file of translator.reached) if (!readable.includes(file)) diagnose(file)
     if (report.errors.length) return finish()
-    sources = program.getSourceFileNames().filter(name => isAbsolute(name) && !name.includes("/node_modules/") && existsSync(name))
     if (config.crossCheck !== false) executable = runtimeMap(program, checker)
   } finally {
     api.close()
@@ -545,7 +529,8 @@ export async function run(options: RunOptions = {}): Promise<Report> {
         } : {
           kind: "throws", ...at, inputs,
           message: obligation.kind === "nothrow" ? "this divides by zero"
-            : obligation.kind === "falloff" ? "this function reaches its end without returning a value" : "this throw is reached",
+            : obligation.kind === "falloff" ? "this function reaches its end without returning a value"
+            : obligation.kind === "missing" ? "this reads a property the object does not have" : "this throw is reached",
         })
       }
     } else {
@@ -553,6 +538,7 @@ export async function run(options: RunOptions = {}): Promise<Report> {
         : obligation.kind === "nothrow" || obligation.kind === "nan" ? "Lean could not prove that the divisor is never zero"
         : obligation.kind === "overflow" ? "Lean could not prove that this result stays small enough for a number to hold exactly"
         : obligation.kind === "falloff" ? "Lean could not prove that this function always returns a value"
+        : obligation.kind === "missing" ? "Lean could not prove that this key is always a property of the object"
         : "Lean could not prove that this throw is never reached"
       entry.findings.push({ kind: "unproved", message, ...at, detail: rejected.message.split("\n").slice(0, 8).join("\n") })
     }
@@ -600,7 +586,14 @@ export async function run(options: RunOptions = {}): Promise<Report> {
     for (const { file } of job.files) {
       const outcome = outcomes.get(file)
       const reason = outcome?.error ?? (outcome ? undefined : timedOut ? `executing the laws took longer than ${RUNTIME_TIMEOUT_MS / 1000} s` : "the worker that executes laws stopped unexpectedly")
-      if (reason) report.warnings.push(`${displayPath(cwd, file)} was not compared with the running code: ${reason}`)
+      if (outcome?.throws) {
+        // The file itself fails when it is loaded, so nothing in it holds at run time, whatever was proved about the model.
+        for (const law of candidates.filter(candidate => candidate.file === file && candidate.mode === "run")) {
+          lawReports.get(law)!.findings.push({
+            kind: "throws", message: `the law file throws when it is loaded (${reason})`, file: law.file, line: law.line, column: law.column,
+          })
+        }
+      } else if (reason) report.warnings.push(`${displayPath(cwd, file)} was not compared with the running code: ${reason}`)
       for (const result of outcome?.laws ?? []) {
         const law = candidates.find(candidate => candidate.file === file && candidate.index === result.index)!
         const entry = lawReports.get(law)!
@@ -645,12 +638,8 @@ export async function run(options: RunOptions = {}): Promise<Report> {
 
   if (config.cache !== false) {
     const saved: Cache = { version: CACHE_VERSION, lean: cache.lean, proved: [...used] }
-    if (!config.emit) {
-      const files = [...new Set([...sources, base, ...(loaded.file ? [loaded.file] : []), join(cwd, "package.json")])]
-      saved.replay = { signature: signatureOf(identity, files), sources: files, report }
-    }
     mkdirSync(dirname(cacheFile), { recursive: true })
-    writeFileSync(cacheFile, JSON.stringify(saved, (_, value: unknown) => (typeof value === "bigint" ? value.toString() : value)))
+    writeFileSync(cacheFile, JSON.stringify(saved))
   }
   return report
 }

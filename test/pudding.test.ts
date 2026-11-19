@@ -169,6 +169,37 @@ describe("grouping and selection", () => {
   })
 })
 
+describe("constructs that once produced a wrong proof", () => {
+  // Every law in this fixture is false or throws when it runs. None may be
+  // proved, with or without the execution that normally backs a proof up.
+  for (const crossCheck of [true, false]) {
+    test(`nothing is proved ${crossCheck ? "with" : "without"} executing the laws`, async () => {
+      const report = await run({ cwd: join(fixtures, "soundness"), cache: false, crossCheck })
+      assert.equal(report.laws.length, 9)
+      for (const entry of report.laws) assert.equal(entry.status, "failed", `${entry.name}: ${JSON.stringify(entry.findings)}`)
+    })
+  }
+
+  test("each is refused or refuted for the right reason", async () => {
+    const report = await run({ cwd: join(fixtures, "soundness"), cache: false, crossCheck: false })
+    const message = (name: string) => law(report, name).findings.map(f => f.message).join(" | ")
+    assert.match(message("FALSE: the outer function supplies the result"), /the expectation does not hold/)
+    assert.match(message("FALSE: reading the binding succeeds"), /`value` is read before its declaration has run/)
+    assert.match(message("FALSE: the erased parameter takes the argument"), /the expectation does not hold/)
+    assert.match(message("FALSE: the callback uses its default index"), /cannot compare a number with a boolean/)
+    assert.match(message("FALSE: every flag is set"), /reads a property the object does not have/)
+    assert.match(message("FALSE: the literal stores its tag"), /`__proto__`/)
+    assert.match(message("FALSE: the initial flag survives configuration"), /`flags` is handed to other code while its module loads at line 36/)
+    assert.match(message("FALSE: a flag dictionary is empty"), /allows any number of properties/)
+    assert.match(message("FALSE: ready initializes to true"), /`flag` is read while its module is loading/)
+  })
+
+  test("a law file that throws when loaded fails its laws", async () => {
+    const report = await run({ cwd: join(fixtures, "soundness"), cache: false, files: ["loading"] })
+    assert.match(law(report, "FALSE: ready initializes to true").findings.map(f => f.message).join(" | "), /throws when it is loaded \(ReferenceError/)
+  })
+})
+
 test("a model that disagrees with the running code is never reported as proved", async () => {
   const report = await run({ cwd: join(fixtures, "mismatch"), cache: false })
   const entry = law(report, "only admins write")
@@ -182,7 +213,7 @@ test("a table that load-time code may change is not trusted; the law is executed
   const report = await run({ cwd: join(fixtures, "loadtime"), cache: false })
   const entry = law(report, "everyone writes once the table is patched")
   assert.equal(entry.status, "checked")
-  assert.match(entry.notes[0] ?? "", /runs a statement at line 8 when it loads/)
+  assert.match(entry.notes[0] ?? "", /shares its module with a statement that runs on load at line 8/)
 })
 
 test("TypeScript errors stop the run before anything is proved", async () => {
@@ -201,14 +232,14 @@ describe("caching", () => {
   })
   after(() => rmSync(directory, { recursive: true, force: true }))
 
-  test("an unchanged project reuses its result, and an edit reproves only what changed", async () => {
+  test("proved theorems are remembered, and an edit reproves only what changed", async () => {
     const first = await run({ cwd: directory })
-    assert.equal(first.replayed, false)
     assert.equal(first.cachedObligations, 0)
 
+    // Lean is not asked again about what it already accepted; the false law's two rejected theorems are retried.
     const second = await run({ cwd: directory })
-    assert.equal(second.replayed, true)
     assert.deepEqual(second.laws, first.laws)
+    assert.equal(second.obligations - second.cachedObligations, 2)
 
     const file = join(directory, "shapes.law.ts")
     writeFileSync(file, readFileSync(file, "utf8") + `
@@ -217,11 +248,31 @@ law("a rectangle of height two has twice its width as area", domain<bigint>(), w
 })
 `)
     const third = await run({ cwd: directory })
-    assert.equal(third.replayed, false)
     assert.equal(third.laws.length, first.laws.length + 1)
     assert.equal(law(third, "a rectangle of height two has twice its width as area").status, "proved")
-    // Proved theorems are remembered; the two rejected ones of the false law are tried again.
     assert.equal(third.obligations - third.cachedObligations, 3)
+  })
+
+  test("a file that changes how an import resolves is seen at once", async () => {
+    // A cached result must never outlive a change in what the law quantifies over.
+    const project = mkdtempSync(join(fixtures, ".tmp-"))
+    try {
+      writeFileSync(join(project, "types.d.ts"), `export type Day = "Mon"\n`)
+      writeFileSync(join(project, "subject.ts"), `import type { Day } from "./types.js"\nexport const monday = (day: Day) => day === "Mon"\n`)
+      writeFileSync(join(project, "days.law.ts"), `import { domain, expect, law } from "pudding"
+import type { Day } from "./types.js"
+import { monday } from "./subject.ts"
+
+law("every day is Monday", domain<Day>(), day => expect(monday(day)).toBe(true))
+`)
+      assert.equal(law(await run({ cwd: project }), "every day is Monday").status, "proved")
+      writeFileSync(join(project, "types.ts"), `export type Day = "Mon" | "Tue"\n`)
+      const after = law(await run({ cwd: project }), "every day is Monday")
+      assert.equal(after.status, "failed")
+      assert.deepEqual(after.findings[0]?.inputs, { day: '"Tue"' })
+    } finally {
+      rmSync(project, { recursive: true, force: true })
+    }
   })
 })
 

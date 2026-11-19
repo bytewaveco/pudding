@@ -104,12 +104,14 @@ describe(name, () => { ... })               // also describe.skip, describe.only
 | `bigint`, `string` | every value |
 | `Integer` | every whole number a `number` holds exactly |
 | `Integer<Min, Max>` | every whole number from `Min` to `Max` |
-| an object type | every combination of its properties |
+| an object type | every plain object with exactly its properties, in every combination of their values |
 | a tuple | every combination of its elements |
 | a union of object types | every alternative |
 
 A plain `number` cannot be an input, because it also covers fractions, NaN and
-infinities. Functions that take a `number` accept an `Integer`.
+infinities. Functions that take a `number` accept an `Integer`. An object type
+with an index signature, such as `Record<string, boolean>`, cannot be an input
+either, because its values cannot be listed.
 
 Inside a law you can use anything from the supported subset below: declare
 values, loop, guard with `if`, leave early with `return`, call helpers that
@@ -159,9 +161,10 @@ rejects it if it is wrong.
 A failed law says why:
 
 - **A counterexample.** The inputs are named as the law names them, with both sides of the failed equality.
-- **A throw that can be reached**, including division by zero and a function that ends without returning. A law holds only if the code it calls cannot throw for the inputs it covers.
+- **A throw that can be reached**, including division by zero, a lookup with a key the table does not have, and a function that ends without returning. A law holds only if the code it calls cannot throw for the inputs it covers.
+- **A law file that throws when it is loaded.** Nothing in it holds at run time, whatever was proved.
 - **A number that stops being exact.** A result beyond 2^53 − 1, or a remainder by zero.
-- **An expectation that is never reached.** A guard that is never true would otherwise pass silently.
+- **An expectation that is never reached.** A guard that is never true would otherwise pass silently. When Pudding can neither find an input that reaches an expectation nor prove that none exists, the law keeps its verdict and carries a note saying so.
 - **No proof and no counterexample.** The law may be true but beyond the automation. Supply a proof.
 - **A disagreement between the model and the running code.** See "What a proof means".
 
@@ -184,6 +187,7 @@ Refused, with the reason, at the exact expression:
 - fractions, plain `number` division and `Math.round` of a quotient;
 - changing an object or array in place, because two names can refer to the same object;
 - a function that uses a variable which is reassigned outside it;
+- reading a `const` or `let` before its declaration has run, and `__proto__`;
 - loops whose length depends on an input, recursion, classes, async code, regular expressions and library calls.
 
 A refused law is executed instead and reported as *checked* or *sampled*, so a
@@ -195,10 +199,11 @@ A *proved* law is a theorem about a model of your code. These things stand
 between the theorem and the code that runs.
 
 1. **The translation.** Pudding's translator and its constant folding are trusted. To catch mistakes, every law is also executed against the real code and compared with the model, on all inputs of a small finite domain or a sample of a large one. A disagreement fails the law. If the law file cannot be executed, the run says so in a warning.
-2. **Module data.** A table such as `const transitions = {...}` is assumed to keep its initial value. Pudding refuses a table that is assigned to or mutated by name in its module, or whose module runs statements on load. It does not follow other names for the same object.
-3. **Numbers.** A `number` is modeled as the whole number it holds, and every result must be proved to stay within 2^53 − 1, where that model is exact. Zero and negative zero are one value, as `===` treats them.
-4. **Strings.** `string` inputs range over well-formed Unicode text. JavaScript strings with unpaired surrogates are not covered.
-5. **Lean.** Finite laws are checked by Lean's kernel. Other proofs are found by tactics and checked by the kernel.
+2. **Inputs are plain data.** An object input has exactly the properties its type declares, held as ordinary values. TypeScript would also accept an object with extra properties, or one whose properties are getters; those are not covered.
+3. **Module data.** A table such as `const transitions = {...}` is assumed to hold its initial value when a law runs. Pudding refuses a table that its own module changes by name, hands to other code while loading, or shares with statements or local function calls that run on load. It does not see another module changing an exported table.
+4. **Numbers.** A `number` is modeled as the whole number it holds, and every result must be proved to stay within 2^53 − 1, where that model is exact. Zero and negative zero are one value, as `===` treats them.
+5. **Strings.** `string` inputs range over well-formed Unicode text. JavaScript strings with unpaired surrogates are not covered.
+6. **Lean.** Finite laws are checked by Lean's kernel. Other proofs are found by tactics and checked by the kernel.
 
 ## How it works
 
@@ -208,8 +213,10 @@ between the theorem and the code that runs.
 4. **Explain.** For a rejected obligation Pudding searches for a counterexample by evaluating the model in JavaScript.
 5. **Cross-check.** In a worker thread, each law is executed against the real code and compared with the model.
 
-Proved theorems are cached by their text and the Lean version, and a run over
-an unchanged project reuses the previous report.
+Proved theorems are remembered by their full text and the Lean version, so
+Lean is only asked about what changed. The TypeScript side is read afresh on
+every run: reusing a whole result would mean guessing that nothing affecting
+module resolution had changed.
 
 ## Developing
 

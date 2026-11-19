@@ -89,6 +89,8 @@ type Value =
   | { k: "bottom" }
   /** `undefined`, as returned by a function that returns nothing. */
   | { k: "void" }
+  /** A `const` or `let` whose block has been entered but whose declaration has not run yet. */
+  | { k: "uninitialized" }
 
 type Shape =
   | { k: "scalar"; ty: Ty; values?: Scalar[]; num?: boolean; range?: [bigint, bigint] }
@@ -138,6 +140,7 @@ interface Flow {
 
 const BOTTOM: Value = { k: "bottom" }
 const VOID: Value = { k: "void" }
+const UNINITIALIZED: Value = { k: "uninitialized" }
 const MAX_STEPS = 200_000
 const COMPOUND = new Map<number, number>([
   [K.PlusEqualsToken, K.PlusToken], [K.MinusEqualsToken, K.MinusToken], [K.AsteriskEqualsToken, K.AsteriskToken],
@@ -178,6 +181,7 @@ function describe(value: Value): string {
     case "choice": return "a value that depends on a condition"
     case "bottom": return "a thrown error"
     case "void": return "nothing"
+    case "uninitialized": return "a variable that is not initialized yet"
   }
 }
 
@@ -196,6 +200,8 @@ export class Translator {
   /** For each function being evaluated, the names it assigns to anywhere in its body. */
   private assigned: Set<string>[] = []
   private steps = 0
+  /** Module constants whose initializers are being evaluated, innermost last. */
+  private loading: { file: string; position: number }[] = []
   private readonly facts = new Map<Node, { assigned: Set<string>; mentioned: Set<string>; returnsValue: boolean }>()
   private instance: LawInstance | undefined
   private names = { law: new Set<string>(), domain: new Set<string>(), expect: new Set<string>(), describe: new Set<string>() }
@@ -258,6 +264,7 @@ export class Translator {
     statements: readonly N[], env: Env | undefined, path: string[], mode: "run" | "skip" | "only",
     laws: (Law & { only?: boolean })[], selected: (name: string) => boolean,
   ) {
+    if (env) this.enter(statements, env)
     const invalid = (statement: N, message: string) => laws.push({
       name: sourceText(statement), ...locate(statement), index: -1, mode: "run", proof: undefined, instances: [], expectSites: new Map(),
       problem: { kind: "invalid", message, ...locate(statement) },
@@ -267,8 +274,7 @@ export class Translator {
         if (!env || DECLARATIONS_WITHOUT_VALUE.has(statement.kind)) continue
         try {
           if (statement.kind === K.VariableStatement) this.declare(statement, env)
-          else if (statement.kind === K.FunctionDeclaration) env.set(statement.name.text, { k: "closure", node: statement, env })
-          else invalid(statement, "only laws and declarations are allowed inside describe()")
+          else if (statement.kind !== K.FunctionDeclaration) invalid(statement, "only laws and declarations are allowed inside describe()")
         } catch (error) {
           if (!(error instanceof Unsupported)) throw error
           invalid(error.node ?? statement, error.message)
@@ -372,7 +378,7 @@ export class Translator {
         try {
           if (instance.arg) this.bind(callback.parameters[0].name, this.valueOf(instance.arg), env, true, true)
           const body = callback.body
-          if (body.kind === K.Block) this.exec(body.statements, 0, env, { next: () => VOID })
+          if (body.kind === K.Block) this.block(body.statements, env, { next: () => VOID })
           else this.effect(body, env)
           law.instances.push(instance)
         } catch (error) {
@@ -473,6 +479,9 @@ export class Translator {
     if (this.checker.isArrayType(type)) throw new Unsupported("arrays of unknown length are not supported as inputs; use a tuple", at)
     if (flags & TypeFlags.Object) {
       if (this.checker.getSignaturesOfType(type, SignatureKind.Call).length) throw new Unsupported("functions are not supported as inputs", at)
+      if (this.checker.getIndexInfosOfType(type).length) {
+        throw new Unsupported(`${name()} allows any number of properties, so its values cannot be listed; use an object type with named properties`, at)
+      }
       const fields: [string, Shape][] = []
       for (const property of this.checker.getPropertiesOfType(type)) {
         if (property.flags & SymbolFlags.Optional) throw new Unsupported(`optional property \`${property.name}\` is not supported in an input`, at)
@@ -712,7 +721,7 @@ export class Translator {
       if (node.kind === K.ReturnStatement && node.expression && !nested) facts!.returnsValue = true
       node.forEachChild((child: N) => visit(child, nested || isFunction(child)))
     }
-    for (const parameter of fn.parameters as N[]) visit(parameter, false)
+    for (const parameter of parametersOf(fn)) visit(parameter, false)
     if (fn.body) visit(fn.body, false)
     this.facts.set(fn, facts)
     return facts
@@ -786,7 +795,7 @@ export class Translator {
     this.stack.push(node)
     this.assigned.push(facts.assigned)
     try {
-      ;(node.parameters as N[]).forEach((parameter, i) => {
+      parametersOf(node).forEach((parameter, i) => {
         if (parameter.dotDotDotToken) throw new Unsupported("rest parameters are not supported", parameter)
         let value = args[i]
         if (!value) {
@@ -799,7 +808,7 @@ export class Translator {
       // Reaching the end of a function that returns values elsewhere yields
       // undefined where a value is expected. Like a throw, that is allowed
       // only where it is proved unreachable.
-      return this.exec(node.body.statements, 0, env, {
+      return this.block(node.body.statements, env, {
         next: () => {
           if (!facts.returnsValue) return VOID
           this.emit("falloff", ir.FALSE, node)
@@ -810,6 +819,28 @@ export class Translator {
       this.stack.pop()
       this.assigned.pop()
       this.cells.length = live
+    }
+  }
+
+  /**
+   * Evaluate a block in its own scope. Entering a block makes its function
+   * declarations callable at once, and puts its `const` and `let` names in
+   * scope before they hold a value, exactly as JavaScript does; reading one
+   * early is an error there and is refused here.
+   */
+  private block(statements: readonly N[], scope: Env, flow: Flow): Value {
+    this.enter(statements, scope)
+    return this.exec(statements, 0, scope, flow)
+  }
+
+  private enter(statements: readonly N[], scope: Env) {
+    for (const statement of statements) {
+      if (statement.kind === K.FunctionDeclaration && statement.name) scope.set(statement.name.text, { k: "closure", node: statement, env: scope })
+      else if (statement.kind === K.VariableStatement) {
+        for (const declaration of statement.declarationList.declarations as N[]) {
+          for (const name of boundNames(declaration.name)) scope.set(name, UNINITIALIZED)
+        }
+      } else if (statement.kind === K.ClassDeclaration && statement.name) scope.set(statement.name.text, UNINITIALIZED)
     }
   }
 
@@ -826,14 +857,14 @@ export class Translator {
     const rest = () => this.exec(statements, i + 1, env, flow)
     const after: Flow = { ...flow, next: rest }
     const run = (block: N | undefined, to: Flow): Value =>
-      block ? this.exec(block.kind === K.Block ? block.statements : [block], 0, env.child(), to) : to.next()
+      block ? this.block(block.kind === K.Block ? block.statements : [block], env.child(), to) : to.next()
     switch (statement.kind) {
       case K.EmptyStatement: return rest()
       case K.VariableStatement:
         this.declare(statement, env)
         return rest()
       case K.FunctionDeclaration:
-        env.set(statement.name.text, { k: "closure", node: statement, env })
+        // Declared when its block was entered.
         return rest()
       case K.ExpressionStatement:
         this.effect(statement.expression, env)
@@ -865,8 +896,11 @@ export class Translator {
         const subject = this.scalarOf(this.evalExpr(statement.expression, env), statement.expression)
         const clauses = statement.caseBlock.clauses as N[]
         // Entering at a clause runs it and every clause below it until a break.
-        const bodyFrom = (start: number) =>
-          this.exec(clauses.slice(start).flatMap(clause => clause.statements as N[]), 0, env.child(), { ...flow, next: rest, brk: rest })
+        const bodyFrom = (start: number) => {
+          const scope = env.child()
+          this.enter(clauses.flatMap(clause => clause.statements as N[]), scope)
+          return this.exec(clauses.slice(start).flatMap(clause => clause.statements as N[]), 0, scope, { ...flow, next: rest, brk: rest })
+        }
         const from = (index: number): Value => {
           const clause = clauses[index]
           if (!clause) return rest()
@@ -898,7 +932,7 @@ export class Translator {
             this.bind(declared[0].name, item, scope, false, reassignable)
             const onward = () => iterate(index + 1)
             const body = statement.statement
-            return this.exec(body.kind === K.Block ? body.statements : [body], 0, scope, { next: onward, cont: onward, brk: rest })
+            return this.block(body.kind === K.Block ? body.statements : [body], scope.child(), { next: onward, cont: onward, brk: rest })
           }
           return iterate(0)
         })
@@ -927,7 +961,7 @@ export class Translator {
         }
         const round = (): Value => {
           if (++rounds > MAX_ITERATIONS) throw new Unsupported(`this loop runs more than ${MAX_ITERATIONS} times, which is too many to unroll`, statement)
-          return this.exec(body.kind === K.Block ? body.statements : [body], 0, scope.child(), { next: step, cont: step, brk: rest })
+          return this.block(body.kind === K.Block ? body.statements : [body], scope.child(), { next: step, cont: step, brk: rest })
         }
         return statement.kind === K.DoStatement ? round() : test()
       }
@@ -1018,7 +1052,11 @@ export class Translator {
         if (!Number.isSafeInteger(value)) throw new Unsupported("only whole numbers up to 2^53 - 1 are modeled; fractions and larger numbers are not", node)
         return scalar(ir.lit(BigInt(value)), true)
       }
-      case K.Identifier: return env.get(node.text) ?? this.global(node)
+      case K.Identifier: {
+        const local = env.get(node.text)
+        if (local?.k === "uninitialized") throw new Unsupported(`\`${node.text}\` is read before its declaration has run, which throws`, node)
+        return local ?? this.global(node)
+      }
       case K.ArrowFunction:
       case K.FunctionExpression:
         return { k: "closure", node, env }
@@ -1053,6 +1091,8 @@ export class Translator {
           } else if (property.kind === K.ShorthandPropertyAssignment) {
             fields.set(property.name.text, env.get(property.name.text) ?? this.global(property.name, true))
           } else if (property.kind === K.PropertyAssignment && (property.name.kind === K.Identifier || property.name.kind === K.StringLiteral)) {
+            // In an object literal this name sets the prototype instead of storing a property.
+            if (property.name.text === "__proto__") throw new Unsupported("`__proto__` in an object literal sets the prototype, which is not modeled", property)
             fields.set(property.name.text, this.evalExpr(property.initializer, env))
           } else throw new Unsupported("methods, accessors and computed property names are not supported in object literals", property)
         }
@@ -1074,6 +1114,7 @@ export class Translator {
         if (node.questionDotToken) throw new Unsupported("optional chaining is not supported", node)
         if (this.isNamespace(node.expression, env)) return this.global(node.name)
         const name = node.name.text as string
+        if (name === "__proto__") throw new Unsupported("reading `__proto__` is not modeled", node)
         return this.over(this.evalExpr(node.expression, env), object => {
           if (object.k === "bottom") return BOTTOM
           if (name === "length" && object.k === "array") return scalar(ir.lit(BigInt(object.items.length)), true)
@@ -1177,19 +1218,21 @@ export class Translator {
       const key = this.scalarOf(this.evalExpr(index, env), index, "str")
       if (key.t === "lit") {
         const field = object.fields.get(key.value as string)
-        if (!field) throw new Unsupported(`property \`${key.value}\` does not exist on this object`, node)
+        if (!field || key.value === "__proto__") throw new Unsupported(`property \`${key.value}\` does not exist on this object`, node)
         return field
       }
-      // A key that is only known by its type: every value it can take must be a property.
-      const keyType = this.checker.getTypeAtLocation(index)
-      const members = keyType?.isUnionType() ? keyType.getTypes() : keyType ? [keyType] : []
-      const keys = members.map(member => (member.flags & TypeFlags.StringLiteral ? String((member as N).value) : undefined))
-      if (!keys.length || keys.some(k => k === undefined || !object.fields.has(k))) {
-        throw new Unsupported("this index is not known to be one of the object's property names", node)
+      // The key is compared with every property name. A key that matches none
+      // would read `undefined`, which is not modeled, so that case must be
+      // proved impossible. The key's declared type is not trusted for this: a
+      // cast can make it claim anything.
+      const names = [...object.fields.keys()]
+      const pick = (i: number): Value => {
+        if (i === names.length) {
+          this.emit("missing", ir.FALSE, node)
+          return BOTTOM
+        }
+        return this.branch(ir.eq(key, ir.lit(names[i]!)), () => object.fields.get(names[i]!)!, () => pick(i + 1))
       }
-      const pick = (i: number): Value => i === keys.length - 1
-        ? object.fields.get(keys[i]!)!
-        : this.branch(ir.eq(key, ir.lit(keys[i]!)), () => object.fields.get(keys[i]!)!, () => pick(i + 1))
       return pick(0)
     })
   }
@@ -1283,13 +1326,17 @@ export class Translator {
     if (!first || args.length !== expected) {
       throw new Unsupported(method === "reduce" ? "`.reduce` is supported with a callback and an initial value" : `\`.${method}\` is supported with exactly one argument`, node)
     }
-    // Callbacks also receive an index, which is a number and so not modeled.
-    if (method !== "includes" && first.k === "closure" && first.node.parameters.length > expected) {
-      throw new Unsupported("the index parameter of an array callback is not supported", node)
+    // A callback is passed each element and its position. One that declares
+    // more parameters would also receive the array itself, which is refused.
+    const invoke = (fn: Value, values: Value[]): Value => {
+      if (fn.k === "choice") return this.branch(fn.cond, () => invoke(fn.a, values), () => invoke(fn.b, values))
+      if (fn.k === "closure" && parametersOf(fn.node).length > values.length) throw new Unsupported("an array callback that takes the array itself is not supported", node)
+      return this.call(fn, values, node)
     }
+    const position = (index: number) => scalar(ir.lit(BigInt(index)), true)
     switch (method) {
       case "reduce":
-        return items.reduce((accumulator, item) => this.call(first, [accumulator, item], node), second!)
+        return items.reduce((accumulator, item, index) => invoke(first, [accumulator, item, position(index)]), second!)
       case "includes": {
         const needle = this.scalarOf(first, node)
         return scalar(items.map(item => {
@@ -1300,11 +1347,11 @@ export class Translator {
       }
       case "some":
       case "every": {
-        const results = items.map(item => this.scalarOf(this.call(first, [item], node), node, "bool"))
+        const results = items.map((item, index) => this.scalarOf(invoke(first, [item, position(index)]), node, "bool"))
         return scalar(method === "some" ? results.reduce(ir.or, ir.FALSE) : results.reduce(ir.and, ir.TRUE))
       }
       case "map":
-        return { k: "array", items: items.map(item => this.call(first, [item], node)) }
+        return { k: "array", items: items.map((item, index) => invoke(first, [item, position(index)])) }
       default:
         if (ARRAY_MUTATORS.has(method)) {
           throw new Unsupported("changing an object or array in place is not modeled, because two names can refer to the same object; build a new value instead", node)
@@ -1340,54 +1387,131 @@ export class Translator {
       if (!moduleLevel) throw new Unsupported(`\`${node.text}\` is a local variable that is not available here`, node)
       if (!(list.flags & NodeFlags.Const)) throw new Unsupported(`\`${node.text}\` is a mutable module variable`, node)
       if (declaration.name.kind !== K.Identifier || !declaration.initializer) throw new Unsupported(`the declaration of \`${node.text}\` is not supported`, node)
+      // While a module loads, its constants are initialized in order. Code
+      // that runs during one initializer cannot read a constant declared
+      // further down the same file: JavaScript throws there.
+      const early = this.loading.find(entry => entry.file === file.fileName && declaration.pos > entry.position)
+      if (early) throw new Unsupported(`\`${node.text}\` is read while its module is loading, before its own declaration has run, which throws`, node)
       const known = this.constants.get(declaration)
       if (known) return known
-      const saved = { pc: this.pc, stack: this.stack, instance: this.instance }
+      const saved = { pc: this.pc, stack: this.stack, instance: this.instance, cells: this.cells, assigned: this.assigned }
       this.pc = []
       this.stack = []
       this.instance = undefined
+      this.cells = []
+      this.assigned = []
+      this.loading.push({ file: file.fileName, position: declaration.pos })
       try {
         const value = this.evalExpr(declaration.initializer, new Env())
-        if (value.k !== "scalar" && value.k !== "closure") this.assertNotMutated(file, declaration.name.text, node)
+        if (value.k !== "scalar" && value.k !== "closure") this.assertStable(file, declaration, value, node)
         this.constants.set(declaration, value)
         return value
       } finally {
+        this.loading.pop()
         Object.assign(this, saved)
       }
     }
     throw new Unsupported(`\`${node.text}\` is declared in a way that is not supported (only functions and const values are)`, node)
   }
 
-  /** Refuse module constants whose contents are visibly changed in the file that declares them. */
-  private assertNotMutated(file: SourceFile, name: string, use: Node) {
+  /**
+   * Refuse a module constant whose contents may differ from its initializer
+   * by the time a law runs. Only two kinds of code run before then: the
+   * module's own loading, and whatever the law calls (which is translated,
+   * and refused if it changes anything in place). So the value is stable
+   * unless the file changes it by name, hands it to something while loading,
+   * or runs its own functions while loading.
+   */
+  private assertStable(file: SourceFile, declaration: N, value: Value, use: Node) {
+    const name = declaration.name.text as string
     const key = `${file.fileName}\0${name}`
     if (this.mutationChecked.has(key)) return
-    // Statements that run when the module loads could change the value in ways this scan cannot follow.
-    const loose = (file.statements as readonly N[]).find(statement => !MODULE_DECLARATIONS.has(statement.kind))
-    if (loose) {
-      throw new Unsupported(`the module that declares \`${name}\` runs a statement at line ${locate(loose).line} when it loads, so the initial value of \`${name}\` cannot be assumed`, use)
+    const refuse = (reason: string, at: N): never => {
+      throw new Unsupported(`\`${name}\` ${reason} at line ${locate(at).line} of its module, so its initial value cannot be assumed`, use)
     }
-    const visit = (node: N) => {
-      if (node.kind === K.Identifier && node.text === name) {
+    const loose = (file.statements as readonly N[]).find(statement => !MODULE_DECLARATIONS.has(statement.kind))
+    if (loose) refuse("shares its module with a statement that runs on load", loose)
+    const isFunction = (node: N) => node.kind === K.ArrowFunction || node.kind === K.FunctionExpression || node.kind === K.FunctionDeclaration ||
+      node.kind === K.MethodDeclaration || node.kind === K.GetAccessor || node.kind === K.SetAccessor || node.kind === K.Constructor
+    const unwrap = (node: N): N => {
+      while (node.kind === K.ParenthesizedExpression || node.kind === K.AsExpression || node.kind === K.SatisfiesExpression || node.kind === K.NonNullExpression) node = node.expression
+      return node
+    }
+    // Functions of this file that its own loading can run.
+    const local = new Set<string>()
+    for (const statement of file.statements as readonly N[]) {
+      if (statement.kind === K.FunctionDeclaration && statement.name) local.add(statement.name.text)
+      if (statement.kind === K.VariableStatement) {
+        for (const d of statement.declarationList.declarations as N[]) {
+          if (d.name.kind === K.Identifier && d.initializer && isFunction(unwrap(d.initializer))) local.add(d.name.text)
+        }
+      }
+    }
+    const isLocalCode = (node: N) => {
+      const inner = unwrap(node)
+      return isFunction(inner) || (inner.kind === K.Identifier && local.has(inner.text))
+    }
+    let runsOwnCode: N | undefined
+    const declaredConst = unwrap(declaration.initializer) !== declaration.initializer && /\bas\s+const\b/.test(declaration.initializer.getText(file))
+    const handedOver: { at: N; inFunction: boolean }[] = []
+    const visit = (node: N, inFunction: boolean) => {
+      if (!inFunction && (node.kind === K.CallExpression || node.kind === K.NewExpression) &&
+        (isLocalCode(node.expression) || (node.arguments as N[] | undefined)?.some(isLocalCode))) runsOwnCode ??= node
+      if (node.kind === K.Identifier && node.text === name && node !== declaration.name) {
+        // The longest access path that starts at this name, such as `table.rows[0]`.
         let top = node
-        while ((top.parent.kind === K.PropertyAccessExpression || top.parent.kind === K.ElementAccessExpression) && top.parent.expression === top) top = top.parent
-        const parent = top.parent
-        const assigned = parent.kind === K.BinaryExpression && parent.left === top &&
+        const path: (string | undefined)[] = []
+        while ((top.parent.kind === K.PropertyAccessExpression || top.parent.kind === K.ElementAccessExpression) && top.parent.expression === top) {
+          top = top.parent
+          path.push(top.kind === K.PropertyAccessExpression ? top.name.text : top.argumentExpression.kind === K.StringLiteral || top.argumentExpression.kind === K.NumericLiteral ? top.argumentExpression.text : undefined)
+        }
+        let outer = top
+        while (outer.parent.kind === K.ParenthesizedExpression || outer.parent.kind === K.AsExpression || outer.parent.kind === K.SatisfiesExpression || outer.parent.kind === K.NonNullExpression) outer = outer.parent
+        const parent = outer.parent
+        const assigned = parent.kind === K.BinaryExpression && parent.left === outer &&
           parent.operatorToken.kind >= K.FirstAssignment && parent.operatorToken.kind <= K.LastAssignment
         const updated = (parent.kind === K.PrefixUnaryExpression || parent.kind === K.PostfixUnaryExpression) &&
           (parent.operator === K.PlusPlusToken || parent.operator === K.MinusMinusToken)
-        const mutated = parent.kind === K.CallExpression && parent.expression === top &&
-          top.kind === K.PropertyAccessExpression && ARRAY_MUTATORS.has(top.name.text)
-        if (top !== node && (assigned || updated || mutated || parent.kind === K.DeleteExpression)) {
-          const at = locate(parent)
-          throw new Unsupported(`\`${name}\` is modified at line ${at.line} of its module, so its initial value cannot be assumed`, use)
+        const called = parent.kind === K.CallExpression && parent.expression === outer && top.kind === K.PropertyAccessExpression
+        if (assigned || updated || parent.kind === K.DeleteExpression || (called && ARRAY_MUTATORS.has(top.name.text))) refuse("is modified", parent)
+        // Reading through the value is harmless. What matters is where the
+        // value itself, or an object inside it, is handed to other code.
+        let reached: Value | undefined = value
+        for (const step of path.slice(0, called ? -1 : undefined)) {
+          reached = step === undefined || !reached ? undefined
+            : reached.k === "record" ? reached.fields.get(step) : reached.k === "array" ? reached.items[Number(step)] : undefined
         }
+        const reads = called || reached?.k === "scalar" || parent.kind === K.TypeQuery || parent.kind === K.TypeOfExpression ||
+          parent.kind === K.ExportSpecifier || parent.kind === K.ExportAssignment || parent.kind === K.SpreadElement || parent.kind === K.SpreadAssignment ||
+          (parent.kind === K.ForOfStatement && parent.expression === outer) ||
+          (parent.kind === K.BinaryExpression && parent.operatorToken.kind !== K.CommaToken && !assigned)
+        // A value declared `as const` may be given to a library while loading:
+        // its type forbids changing it, and schema builders are the common case.
+        const toLibrary = declaredConst && parent.kind === K.CallExpression && parent.expression !== outer && !isLocalCode(parent.expression) &&
+          !/^(Object\.(assign|definePropert(y|ies)|setPrototypeOf)|Reflect\.\w+)$/.test(parent.expression.getText(file))
+        if (!reads && !toLibrary) handedOver.push({ at: parent, inFunction })
       }
-      node.forEachChild(visit)
+      node.forEachChild((child: N) => visit(child, inFunction || isFunction(child)))
     }
-    visit(file)
+    visit(file, false)
+    const atLoad = handedOver.find(entry => !entry.inFunction)
+    if (atLoad) refuse("is handed to other code while its module loads", atLoad.at)
+    const inCode = handedOver.find(entry => entry.inFunction)
+    if (inCode && runsOwnCode) refuse(`is handed to other code by a function, and the module runs its own functions while loading (line ${locate(runsOwnCode).line});`, inCode.at)
     this.mutationChecked.add(key)
   }
+}
+
+/** A function's parameters as they exist at run time: TypeScript's `this` parameter is erased. */
+function parametersOf(fn: N): N[] {
+  return (fn.parameters as N[]).filter(parameter => !(parameter.name.kind === K.Identifier && parameter.name.text === "this"))
+}
+
+/** The names a binding pattern declares. */
+function boundNames(pattern: N, into: string[] = []): string[] {
+  if (pattern.kind === K.Identifier) into.push(pattern.text)
+  else for (const element of (pattern.elements ?? []) as N[]) if (element.name) boundNames(element.name, into)
+  return into
 }
 
 /** Whether a statement can leave its enclosing block early: by returning, throwing, breaking or continuing. */

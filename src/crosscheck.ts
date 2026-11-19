@@ -45,8 +45,17 @@ export interface FileOutcome {
   file: string
   /** Why the file's laws could not be executed. */
   error?: string
+  /** True when the file itself throws while it loads, as opposed to Node being unable to run TypeScript like it. */
+  throws?: boolean
   laws: LawOutcome[]
 }
+
+/** Failures that say Node could not run the source as written, not that the code is wrong. */
+const TOOLING = new Set([
+  "ERR_MODULE_NOT_FOUND", "ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX", "ERR_INVALID_TYPESCRIPT_SYNTAX", "ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING",
+  "ERR_UNKNOWN_FILE_EXTENSION", "ERR_PACKAGE_PATH_NOT_EXPORTED", "ERR_UNSUPPORTED_DIR_IMPORT", "ERR_IMPORT_ATTRIBUTE_MISSING", "ERR_REQUIRE_ESM",
+  "ERR_UNSUPPORTED_ESM_URL_SCHEME", "ERR_UNKNOWN_BUILTIN_MODULE",
+])
 
 interface Registered {
   name: string
@@ -94,7 +103,7 @@ function runtimeHolds(callback: (input: unknown) => void, argument: unknown): bo
   }
 }
 
-async function register(file: string): Promise<Registered[] | string> {
+async function register(file: string): Promise<Registered[] | { message: string; throws: boolean }> {
   const key = Symbol.for("pudding.registry")
   const registry: Registered[] = []
   const globals = globalThis as Record<symbol, unknown>
@@ -103,7 +112,10 @@ async function register(file: string): Promise<Registered[] | string> {
     await import(pathToFileURL(file).href)
     return registry
   } catch (error) {
-    return error instanceof Error ? error.message.split("\n")[0]! : String(error)
+    const code = (error as { code?: unknown } | null)?.code
+    const tooling = error instanceof SyntaxError || (typeof code === "string" && TOOLING.has(code))
+    const text = error instanceof Error ? `${error.name}: ${error.message.split("\n")[0]!}` : String(error)
+    return { message: text, throws: !tooling }
   } finally {
     delete globals[key]
   }
@@ -128,8 +140,10 @@ async function execute(job: Job, report: (outcome: FileOutcome) => void) {
   for (const { file, registered, laws } of job.files) {
     const outcome: FileOutcome = { file, laws: [] }
     const runtime = await register(file)
-    if (typeof runtime === "string") outcome.error = `it could not be executed (${runtime})`
-    else if (runtime.length !== registered) outcome.error = "it registered a different number of laws when executed than Pudding read from it"
+    if (!Array.isArray(runtime)) {
+      outcome.error = runtime.throws ? runtime.message : `it could not be executed (${runtime.message})`
+      outcome.throws = runtime.throws
+    } else if (runtime.length !== registered) outcome.error = "it registered a different number of laws when executed than Pudding read from it"
     else {
       for (const law of laws) {
         const callback = runtime[law.index]?.callback
