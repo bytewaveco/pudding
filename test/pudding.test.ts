@@ -449,6 +449,17 @@ test("a value that grows with every round of a loop is refused quickly, not hand
   assert.ok(report.durationMs < 20_000, `took ${report.durationMs} ms`)
 })
 
+test("strings too long for Lean to compare are refused, never called false", async () => {
+  // Lean's kernel ran out of depth on these after many seconds, and the true law was reported as failed.
+  const report = await run({ cwd: join(fixtures, "strings"), cache: false })
+  const long = law(report, "a long banner reads the same however the marker was chosen")
+  assert.equal(long.status, "checked")
+  assert.match(long.notes.join("\n"), /too large to check/)
+  assert.equal(law(report, "FALSE: a long banner ignores which marker was asked for").status, "failed")
+  assert.equal(law(report, "a short banner is proved").status, "proved")
+  assert.ok(report.durationMs < 10_000, `took ${report.durationMs} ms`)
+})
+
 describe("proof scripts", () => {
   test("a script can only be a proof of its own theorem", async () => {
     const report = await run({ cwd: join(fixtures, "scripts"), cache: false })

@@ -395,4 +395,5 @@ Tick `dry-run` to go through everything except the upload.
 - Division by an unknown and products of two unknowns are outside `grind`'s arithmetic. Bound the divisor with a small `Integer<Min, Max>`, which is checked value by value, or supply a proof.
 - Symbolic strings support equality and concatenation only.
 - Each obligation is printed as a tree, so deeply nested calls of functions that use an argument several times grow quickly. Pudding refuses terms past a size limit.
+- Where a law is checked value by value, a string may grow to 500 characters. Past that Lean's kernel gives up, so the law is executed instead and reported as not proved.
 - Prebuilt Lean downloads exist for macOS and Linux only.

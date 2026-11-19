@@ -40,6 +40,14 @@ const MAX_TERM_SIZE = 200_000
  * about five seconds at this size, and minutes a few rounds later.
  */
 const MAX_TERM_TEXT = 120_000
+/**
+ * The longest a string may become where a law is checked value by value. Lean's
+ * kernel compares strings a character at a time and gives up on long ones,
+ * somewhere past 800 characters, after working on them for many seconds.
+ */
+const MAX_STRING_LENGTH = 500
+/** The most characters an integer comes to as text, where every input has a short list of values. */
+const INTEGER_TEXT = 24
 /** How long one Lean process may run: this much, plus a share for each theorem in its file. */
 const FILE_TIMEOUT_MS = 30_000
 const THEOREM_TIMEOUT_MS = 10_000
@@ -152,6 +160,33 @@ function printExpr(e: Expr): string {
   return text
 }
 
+/** An upper bound on the length of any string the expression builds, given inputs with listed values. */
+function longestString(body: Expr, inputs: readonly Binder[]): number {
+  const given = new Map(inputs.map(input => [input.name, Math.max(0, ...(input.domain ?? []).map(value => typeof value === "string" ? value.length : 0))]))
+  const memo = new Map<Expr, number>()
+  let longest = 0
+  const length = (e: Expr): number => {
+    if (e.t === "var") return given.get(e.name) ?? 0
+    if (e.t === "lit") {
+      const own = typeof e.value === "string" ? e.value.length : 0
+      longest = Math.max(longest, own)
+      return own
+    }
+    const known = memo.get(e)
+    if (known !== undefined) return known
+    const parts = e.args.map(length)
+    const own = e.ty !== "str" ? 0
+      : e.op === "concat" ? parts[0]! + parts[1]!
+      : e.op === "ite" ? Math.max(parts[1]!, parts[2]!)
+      : INTEGER_TEXT
+    memo.set(e, own)
+    longest = Math.max(longest, own)
+    return own
+  }
+  length(body)
+  return longest
+}
+
 function leanType(ty: ir.Ty): string {
   return { bool: "Bool", int: "Int", str: "String" }[ty]
 }
@@ -200,6 +235,9 @@ export function checksFor(binders: readonly Binder[], guard: Expr, claim: Expr, 
   const used = binders.filter(b => free.has(b.name))
   if (used.every(b => b.domain)) {
     const cases = used.reduce((n, b) => n * b.domain!.length, 1)
+    if (longestString(body, used) > MAX_STRING_LENGTH) {
+      throw new TooLarge(`a string here can grow past ${MAX_STRING_LENGTH} characters, which is too large to check`)
+    }
     let text = printExpr(body)
     for (const binder of [...used].reverse()) {
       text = `([${binder.domain!.map(leanScalar).join(", ")}].all fun ${binder.name} => ${text})`

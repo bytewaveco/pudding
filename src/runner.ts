@@ -591,6 +591,10 @@ export async function run(options: RunOptions = {}): Promise<Report> {
             : obligation.kind === "missing" ? "this reads a property the object does not have" : "this throw is reached",
         })
       }
+    } else if (rejected.message.includes("(kernel) deep recursion detected")) {
+      // Lean gave up on the size of the values, which says nothing about the
+      // law. It is reported as not proved, with what executing it showed.
+      law.problem ??= { kind: "unsupported", message: "the values here are too large to check: Lean ran out of depth on them", ...at }
     } else {
       const message = obligation.kind === "expect" ? "Lean could not prove this, and no counterexample was found"
         : obligation.kind === "nothrow" || obligation.kind === "nan" ? "Lean could not prove that the divisor is never zero"
