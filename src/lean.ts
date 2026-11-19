@@ -9,33 +9,43 @@ import type { Binder, Expr, Scalar } from "./ir.ts"
 
 /**
  * The modules the generated theorems need. Importing only these starts Lean
- * several times faster than the default `import Init`. A proof that fails
- * under this header is retried under the full library before it is reported.
+ * several times faster than `import Init`, and they are what a trimmed Lean
+ * runtime ships.
  */
-export const FAST_HEADER = [
-  "prelude",
-  "import Init.Core",
-  "import Init.Omega",
-  "import Init.Grind",
-  "import Init.Data.List.Basic",
-  "import Init.Data.String.Basic",
-  "import Init.Data.Int.DivMod",
-].join("\n")
+export const FAST_IMPORTS = [
+  "Init.Core", "Init.Omega", "Init.Grind", "Init.Data.List.Basic", "Init.Data.String.Basic", "Init.Data.Int.DivMod", "Init.Data.Int.OfNat",
+]
 
+/**
+ * A slightly larger set for a second attempt. Measured against the whole of
+ * `Init` on thousands of generated theorems, the fallback tactic proves
+ * exactly as much under these imports.
+ */
+export const FALLBACK_IMPORTS = [...FAST_IMPORTS, "Init.Data.String.Lemmas.Basic", "Init.Data.String.Length"]
+
+const header = (imports: readonly string[]) => ["prelude", ...imports.map(name => `import ${name}`)].join("\n")
+export const FAST_HEADER = header(FAST_IMPORTS)
+export const FALLBACK_HEADER = header(FALLBACK_IMPORTS)
+/** The whole core library, for proofs an author wrote. A trimmed runtime does not have it. */
 export const FULL_HEADER = "import Init"
 
 export const DEFAULT_TACTIC = "grind"
-/** Tried, under the full library, on statements the default tactic could not close. */
-const FALLBACK_TACTIC = "first | grind | (intros; simp_all; done) | (intros; simp_all <;> omega)"
-
-/** The same statement with the stronger, slower automation, or undefined when the author supplied the proof. */
-export function withFallback(statement: string): string | undefined {
-  const ending = ` := by ${DEFAULT_TACTIC}`
-  return statement.endsWith(ending) ? statement.slice(0, -DEFAULT_TACTIC.length) + FALLBACK_TACTIC : undefined
-}
 const FINITE_TACTIC = "decide +kernel"
+/** Tried, under the fallback imports, on statements the default tactic could not close. */
+const FALLBACK_TACTIC = "first | grind | (intros; simp_all; done) | (intros; simp_all <;> omega)"
 const MAX_TERM_SIZE = 200_000
 const MAX_SPECIALIZATIONS = 512
+
+/** How a statement is proved: by evaluating every case, by the default automation, or by the author's script. */
+export function proofKind(statement: string): "finite" | "automatic" | "authored" {
+  if (statement.endsWith(` := by ${FINITE_TACTIC}`)) return "finite"
+  return statement.endsWith(` := by ${DEFAULT_TACTIC}`) ? "automatic" : "authored"
+}
+
+/** The same statement with the stronger, slower automation. Only meaningful for an automatic statement. */
+export function withFallback(statement: string): string {
+  return statement.slice(0, -DEFAULT_TACTIC.length) + FALLBACK_TACTIC
+}
 
 export class TooLarge extends Error {}
 
@@ -221,7 +231,8 @@ function runFile(lean: string, source: string, directory: string, name: string):
   return new Promise((resolve, reject) => {
     const file = join(directory, name)
     writeFile(file, source).then(() => {
-      execFile(lean, ["--json", file], { maxBuffer: 1 << 28 }, (error, stdout, stderr) => {
+      // Lean stops reporting after 100 errors unless told otherwise, and a theorem it never reported on must not pass for proved.
+      execFile(lean, ["-DmaxErrors=0", "--json", file], { maxBuffer: 1 << 28 }, (error, stdout, stderr) => {
         if (error && typeof (error as NodeJS.ErrnoException).code === "string") {
           return reject(new Error(`could not run Lean at ${lean}: ${error.message}`))
         }
@@ -250,14 +261,22 @@ async function runChunk(lean: string, header: string, statements: string[], dire
     firstLine.push(lines.length + 1)
     lines.push(...`theorem c${i}${statement}`.split("\n"))
   }
+  // A theorem counts as proved when Lean reports no error for it. That is only
+  // sound if Lean got to the end of the file, so the file ends with a command
+  // that always answers, and the answer is required.
+  const sentinel = lines.length + 1
+  lines.push("#check Nat")
   const messages = await runFile(lean, lines.join("\n") + "\n", directory, name)
+  if (!messages.some(message => message.severity === "information" && message.pos?.line === sentinel)) {
+    throw new Error("Lean stopped before it had checked every theorem, so no result can be trusted")
+  }
   const outcomes: LeanOutcome[] = statements.map(() => ({ ok: true, message: "" }))
   for (const message of messages) {
     if (message.severity !== "error") continue
     const line = message.pos?.line ?? 0
     let index = -1
     for (let i = 0; i < firstLine.length && firstLine[i]! <= line; i++) index = i
-    if (index < 0) throw new Error(`Lean rejected the generated preamble: ${message.data}`)
+    if (index < 0 || line >= sentinel) throw new Error(`Lean rejected the generated preamble: ${message.data}`)
     const outcome = outcomes[index]!
     outcome.message = outcome.ok ? message.data : outcome.message + "\n" + message.data
     outcome.ok = false
@@ -266,12 +285,12 @@ async function runChunk(lean: string, header: string, statements: string[], dire
 }
 
 /** Check each statement, in parallel across processes when there are many. */
-export async function prove(lean: string, header: string, statements: string[]): Promise<LeanOutcome[]> {
+export async function prove(lean: string, header: string, statements: string[], processes = availableParallelism()): Promise<LeanOutcome[]> {
   if (!statements.length) return []
   const directory = await mkdtemp(join(tmpdir(), "pudding-"))
   try {
     // Starting Lean costs little next to proving, so spread the work widely.
-    const workers = Math.max(1, Math.min(availableParallelism(), Math.ceil(statements.length / 8)))
+    const workers = Math.max(1, Math.min(processes, Math.ceil(statements.length / 8)))
     const size = Math.ceil(statements.length / workers)
     const chunks: string[][] = []
     for (let i = 0; i < statements.length; i += size) chunks.push(statements.slice(i, i + size))

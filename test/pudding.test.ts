@@ -316,6 +316,14 @@ describe("the Lean encoding", () => {
     assert.deepEqual(outcomes.filter(o => !o.ok).map(o => o.message.slice(0, 300)), [])
   })
 
+  test("every rejected theorem is seen, however many there are", async () => {
+    // Lean stops reporting after 100 errors by default. A theorem it stayed silent about must not count as proved.
+    const wrong = Array.from({ length: 150 }, (_, i) => ` : ((${i} : Int) == (${i + 1} : Int)) = true := by decide +kernel`)
+    const outcomes = await prove(lean, FAST_HEADER, [...wrong, " : ((7 : Int) == (7 : Int)) = true := by decide +kernel"], 1)
+    assert.equal(outcomes.filter(o => !o.ok).length, 150)
+    assert.equal(outcomes.at(-1)?.ok, true)
+  })
+
   test("rejects a wrong claim about division, so the agreement test can fail", async () => {
     const wrong = checksFor([x], ir.TRUE, ir.eq(ir.div(vx, ir.lit(2n)), ir.lit(-4n)), undefined).map(c => c.statement)
     const [outcome] = await prove(lean, FAST_HEADER, wrong)

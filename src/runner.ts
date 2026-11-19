@@ -18,7 +18,7 @@ import * as ir from "./ir.ts"
 import type { Obligation } from "./ir.ts"
 import type { FileOutcome, Job, RuntimeMap } from "./crosscheck.ts"
 import { findInput, showInputs, showValue } from "./search.ts"
-import { checksFor, FAST_HEADER, FULL_HEADER, prove, render, TooLarge, withFallback, type Check } from "./lean.ts"
+import { checksFor, FALLBACK_HEADER, FAST_HEADER, FULL_HEADER, proofKind, prove, render, TooLarge, withFallback, type Check } from "./lean.ts"
 import { Translator, type Law, type LawInstance } from "./translate.ts"
 
 export const MINIMUM_LEAN = [4, 36, 0] as const
@@ -468,19 +468,25 @@ export async function run(options: RunOptions = {}): Promise<Report> {
     mkdirSync(dirname(resolve(cwd, config.emit)), { recursive: true })
     writeFileSync(resolve(cwd, config.emit), render(FAST_HEADER, statements))
   }
-  // Statements with the default tactic start under the fast header. Proofs the
-  // author supplied may name any lemma, so they go straight to the full
-  // library, at the same time.
-  const quick = fresh.filter(statement => withFallback(statement) !== undefined)
-  const authored = fresh.filter(statement => withFallback(statement) === undefined)
+  // Everything starts under the fast imports. A proof the author supplied may
+  // name lemmas from anywhere in Lean's core library, so one that fails is
+  // tried again with all of it, where the installed Lean has all of it.
   const proving = performance.now()
-  const [first, own] = await Promise.all([prove(lean, FAST_HEADER, quick), prove(lean, FULL_HEADER, authored)])
-  quick.forEach((statement, i) => outcomes.set(statement, first[i]!))
-  authored.forEach((statement, i) => outcomes.set(statement, own[i]!))
+  const first = await prove(lean, FAST_HEADER, fresh)
+  fresh.forEach((statement, i) => outcomes.set(statement, first[i]!))
+  const authored = fresh.filter((statement, i) => !first[i]!.ok && proofKind(statement) === "authored")
+  if (authored.length) {
+    try {
+      const again = await prove(lean, FULL_HEADER, authored)
+      authored.forEach((statement, i) => outcomes.set(statement, again[i]!))
+    } catch {
+      for (const statement of authored) {
+        const outcome = outcomes.get(statement)!
+        outcome.message += "\n(This Lean installation holds only the part of the library Pudding itself uses. A proof that needs more of it needs a full Lean: see PUDDING_LEAN.)"
+      }
+    }
+  }
   report.timings.prove = Math.round(performance.now() - proving)
-  // A rejection under the fast header is only final once the full library and
-  // the slower fallback automation have also failed. Lean's first message is
-  // kept because it describes the goal best.
   // An obligation with a counterexample is false, so trying harder to prove
   // it would only waste time. The search is cheap and its result is reused
   // when the failure is explained.
@@ -494,8 +500,11 @@ export async function run(options: RunOptions = {}): Promise<Report> {
     counterexamples.set(obligation, found)
     if (!found) for (const check of rejected) unexplained.add(check.statement)
   }
-  const retry = quick.filter((statement, i) => !first[i]!.ok && unexplained.has(statement))
-  const second = await prove(lean, FULL_HEADER, retry.map(statement => withFallback(statement)!))
+  // What the default automation could not close gets a slower second attempt
+  // before the rejection is reported. Lean's first message is kept, because it
+  // describes the goal best.
+  const retry = fresh.filter((statement, i) => !first[i]!.ok && proofKind(statement) === "automatic" && unexplained.has(statement))
+  const second = await prove(lean, FALLBACK_HEADER, retry.map(withFallback))
   retry.forEach((statement, i) => {
     if (second[i]!.ok) outcomes.set(statement, second[i]!)
   })
