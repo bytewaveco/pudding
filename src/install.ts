@@ -2,28 +2,38 @@
 
 import { execFileSync, spawnSync } from "node:child_process"
 import { existsSync, mkdirSync, readdirSync, rmSync } from "node:fs"
+import { homedir } from "node:os"
 import { join } from "node:path"
 
 export const LEAN_VERSION = "4.36.0"
 
-function platform(): string {
-  const key = `${process.platform}-${process.arch}`
+/** Where downloads shared by every project on this machine are kept. */
+export function cacheDirectory(): string {
+  if (process.env["PUDDING_CACHE_DIR"]) return process.env["PUDDING_CACHE_DIR"]
+  if (process.platform === "darwin") return join(homedir(), "Library", "Caches", "pudding")
+  if (process.platform === "win32") return join(process.env["LOCALAPPDATA"] ?? join(homedir(), "AppData", "Local"), "pudding", "Cache")
+  return join(process.env["XDG_CACHE_HOME"] ?? join(homedir(), ".cache"), "pudding")
+}
+
+/** The directory name of the Lean release for this machine, or undefined when there is no prebuilt one. */
+export function toolchainName(): string | undefined {
   const names: Record<string, string> = {
     "darwin-arm64": "darwin_aarch64", "darwin-x64": "darwin", "linux-x64": "linux", "linux-arm64": "linux_aarch64",
   }
-  const name = names[key]
-  if (!name) throw new Error(`there is no prebuilt Lean for ${key}; install Lean ${LEAN_VERSION} yourself and set PUDDING_LEAN`)
-  return name
+  const name = names[`${process.platform}-${process.arch}`]
+  return name && `lean-${LEAN_VERSION}-${name}`
 }
 
 /**
- * Install Lean under `<cwd>/.toolchain`. By default everything Pudding does
- * not use (the C toolchain, static libraries, sources, the `Std` and `Lean`
- * libraries) is removed, which keeps about a sixth of the download.
+ * Install Lean into the machine-wide cache, or into `<cwd>/.toolchain` when
+ * `local` is set. By default everything Pudding does not use (the C
+ * toolchain, static libraries, sources, the `Std` and `Lean` libraries) is
+ * removed after unpacking.
  */
-export function installLean(cwd: string, options: { full: boolean; log: (line: string) => void }): string {
-  const name = `lean-${LEAN_VERSION}-${platform()}`
-  const root = join(cwd, ".toolchain")
+export function installLean(cwd: string, options: { full: boolean; local: boolean; log: (line: string) => void }): string {
+  const name = toolchainName()
+  if (!name) throw new Error(`there is no prebuilt Lean for ${process.platform}-${process.arch}; install Lean ${LEAN_VERSION} yourself and set PUDDING_LEAN`)
+  const root = options.local ? join(cwd, ".toolchain") : cacheDirectory()
   const target = join(root, name)
   const binary = join(target, "bin", "lean")
   if (existsSync(binary)) {

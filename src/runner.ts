@@ -4,6 +4,7 @@
 
 import { execFileSync } from "node:child_process"
 import { createHash } from "node:crypto"
+import { createRequire } from "node:module"
 import { existsSync, globSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { dirname, isAbsolute, join, relative, resolve } from "node:path"
@@ -12,6 +13,7 @@ import { Worker } from "node:worker_threads"
 import { SyntaxKind as K } from "typescript/unstable/ast"
 import { API, DiagnosticCategory, SymbolFlags, type Checker, type Program } from "typescript/unstable/sync"
 import type { Config } from "./index.ts"
+import { cacheDirectory, toolchainName } from "./install.ts"
 import * as ir from "./ir.ts"
 import type { Obligation } from "./ir.ts"
 import type { FileOutcome, Job, RuntimeMap } from "./crosscheck.ts"
@@ -114,15 +116,33 @@ async function loadConfig(cwd: string): Promise<{ config: Config; file: string |
   return { config: {}, file: undefined }
 }
 
+/** Raised when no Lean binary can be found, so the CLI can offer to install one. */
+export class LeanMissing extends Error {}
+
+/**
+ * Find the Lean binary. In order: the configuration, `PUDDING_LEAN`, the
+ * runtime package for this platform, a `.toolchain` directory in the project
+ * or in this package, the machine-wide cache `install-lean` fills, elan, and
+ * finally `lean` on the PATH.
+ */
 export function locateLean(config: Config, cwd: string): string {
   const explicit = config.lean ?? process.env["PUDDING_LEAN"]
   if (explicit) return isAbsolute(explicit) ? explicit : resolve(cwd, explicit)
+  const suffix = process.platform === "win32" ? ".exe" : ""
+  try {
+    const manifest = createRequire(import.meta.url).resolve(`${packageName}-lean-${process.platform}-${process.arch}/package.json`)
+    const bundled = join(dirname(manifest), "bin", "lean" + suffix)
+    if (existsSync(bundled)) return bundled
+  } catch {
+    // The runtime package is optional.
+  }
   for (const root of [cwd, packageRoot]) {
-    const found = globSync(".toolchain/lean-*/bin/lean", { cwd: root }).sort().at(-1)
+    const found = globSync(".toolchain/lean-*/bin/lean" + suffix, { cwd: root }).sort().at(-1)
     if (found) return join(root, found)
   }
-  const elan = join(homedir(), ".elan", "bin", "lean")
-  return existsSync(elan) ? elan : "lean"
+  const name = toolchainName()
+  const candidates = [...(name ? [join(cacheDirectory(), name, "bin", "lean" + suffix)] : []), join(homedir(), ".elan", "bin", "lean" + suffix)]
+  return candidates.find(candidate => existsSync(candidate)) ?? "lean"
 }
 
 function leanVersion(lean: string, cache: Cache): string {
@@ -138,7 +158,9 @@ function leanVersion(lean: string, cache: Cache): string {
     try {
       version = execFileSync(lean, ["--version"], { encoding: "utf8" }).trim()
     } catch {
-      throw new Error(`Lean was not found at \`${lean}\`. Run \`npx pudding install-lean\`, or set PUDDING_LEAN to a Lean ${MINIMUM_LEAN.join(".")} binary.`)
+      throw new LeanMissing(lean === "lean"
+        ? `Lean is not installed. Run \`npx pudding install-lean\`, or set PUDDING_LEAN to a Lean ${MINIMUM_LEAN.join(".")} binary.`
+        : `Lean could not be run at \`${lean}\`. Run \`npx pudding install-lean\`, or set PUDDING_LEAN to a Lean ${MINIMUM_LEAN.join(".")} binary.`)
     }
     cache.lean = { [key]: version }
   }

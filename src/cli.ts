@@ -3,9 +3,10 @@ import { readFileSync, watch as watchFiles } from "node:fs"
 import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { parseArgs } from "node:util"
-import { installLean } from "./install.ts"
+import { createInterface } from "node:readline/promises"
+import { installLean, LEAN_VERSION } from "./install.ts"
 import { format, type Reporter } from "./report.ts"
-import { run, type RunOptions } from "./runner.ts"
+import { LeanMissing, run, type RunOptions } from "./runner.ts"
 
 const HELP = `pudding: prove laws about TypeScript functions
 
@@ -24,6 +25,7 @@ Options
       --emit <file>      also write the generated Lean source to <file>
       --cwd <dir>        project directory (default: current directory)
       --full             with install-lean: keep the whole toolchain
+      --local            with install-lean: install into ./.toolchain, not the shared cache
   -v, --version
   -h, --help
 `
@@ -37,7 +39,7 @@ function main(): Promise<void> | void {
     options: {
       name: { type: "string", short: "t" }, watch: { type: "boolean", short: "w" }, strict: { type: "boolean" },
       reporter: { type: "string" }, "no-cache": { type: "boolean" }, "no-cross-check": { type: "boolean" }, emit: { type: "string" },
-      cwd: { type: "string" }, full: { type: "boolean" }, version: { type: "boolean", short: "v" }, help: { type: "boolean", short: "h" },
+      cwd: { type: "string" }, full: { type: "boolean" }, local: { type: "boolean" }, version: { type: "boolean", short: "v" }, help: { type: "boolean", short: "h" },
       // Kept so earlier invocations still work.
       json: { type: "boolean" }, verbose: { type: "boolean" },
     },
@@ -48,7 +50,9 @@ function main(): Promise<void> | void {
     const manifest = JSON.parse(readFileSync(join(dirname(dirname(fileURLToPath(import.meta.url))), "package.json"), "utf8")) as { version: string }
     return void console.log(manifest.version)
   }
-  if (positionals[0] === "install-lean") return void installLean(cwd, { full: !!values.full, log: line => console.log(line) })
+  if (positionals[0] === "install-lean") {
+    return void installLean(cwd, { full: !!values.full, local: !!values.local, log: line => console.log(line) })
+  }
 
   const watching = values.watch || positionals[0] === "watch"
   const filters = positionals[0] === "watch" ? positionals.slice(1) : positionals
@@ -111,9 +115,23 @@ async function watch(cwd: string, once: () => Promise<boolean>): Promise<void> {
   await cycle()
 }
 
+/** Offer to download Lean when it is missing and someone is there to answer. */
+async function offerInstall(): Promise<boolean> {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) return false
+  const prompt = createInterface({ input: process.stdin, output: process.stdout })
+  const answer = await prompt.question(`Lean ${LEAN_VERSION} is not installed. Download it now? [Y/n] `)
+  prompt.close()
+  if (answer.trim() !== "" && !/^y/i.test(answer.trim())) return false
+  installLean(process.cwd(), { full: false, local: false, log: line => console.log(line) })
+  return true
+}
+
 try {
   await main()
 } catch (error) {
-  process.stderr.write(`pudding: ${error instanceof Error ? error.message : String(error)}\n`)
-  process.exitCode = 2
+  if (error instanceof LeanMissing && await offerInstall()) await main()
+  else {
+    process.stderr.write(`pudding: ${error instanceof Error ? error.message : String(error)}\n`)
+    process.exitCode = 2
+  }
 }
