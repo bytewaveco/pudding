@@ -1718,6 +1718,10 @@ export class Translator {
           this.assertBuiltinsIntact(node)
           return this.text(receiver, node)
         }
+        if (receiver.k === "scalar" && receiver.e.ty === "str" && (method === "padStart" || method === "padEnd")) {
+          this.assertBuiltinsIntact(node)
+          return this.pad(receiver.e, method === "padStart", args(), node)
+        }
         if (receiver.k === "array") {
           this.assertBuiltinsIntact(node)
           return this.arrayMethod(receiver, method, args(), node)
@@ -1813,6 +1817,48 @@ export class Translator {
     if (value.k === "scalar" && value.e.ty === "str") return value
     if (value.k === "scalar" && value.e.ty === "int") return scalar(ir.toStr(value.e))
     throw new Unsupported(`converting ${describe(value)} to a string is not supported`, at)
+  }
+
+  /**
+   * `padStart` and `padEnd`, where the length of the text is known: a string
+   * known here, or the text of a whole number, whose length follows from its
+   * size. JavaScript counts UTF-16 units, so the padding is kept to characters
+   * that are one unit each and can be cut anywhere.
+   */
+  private pad(text: Expr, atStart: boolean, args: Value[], node: N): Value {
+    const [target, filler] = args
+    const refusal = () => new Unsupported("padding is modeled to a length that is known here, of at most 32", node)
+    if (!target || args.length > 2 || !isNumber(target) || target.k !== "scalar") throw refusal()
+    const length = Number(this.settle(target.e, refusal).value)
+    if (length > 32) throw refusal()
+    let fill = " "
+    if (filler && filler.k !== "void") {
+      const given = filler.k === "scalar" && filler.e.t === "lit" ? filler.e.value : undefined
+      if (typeof given !== "string" || [...given].some(char => char.length > 1)) throw new Unsupported("padding is modeled with a string known here, made of characters that are one UTF-16 unit each", node)
+      fill = given
+    }
+    // With nothing to pad with, or nothing to add, the text comes back as it is.
+    const padded = (missing: number, inner: Expr) => {
+      if (missing <= 0 || fill === "") return inner
+      const added = ir.lit(fill.repeat(Math.ceil(missing / fill.length)).slice(0, missing))
+      return atStart ? ir.concat(added, inner) : ir.concat(inner, added)
+    }
+    // Any other string has to be known here, which an input with few values becomes once the law is split on it.
+    if (text.t !== "lit" && !(text.t === "op" && text.op === "str")) {
+      text = this.settle(text, () => new Unsupported("padding is modeled for a string known here or the text of a whole number; the length of this string is not known", node))
+    }
+    if (text.t === "lit") return scalar(padded(length - (text.value as string).length, text))
+    if (text.t !== "op") throw new Error("the text of a whole number is an operation")
+    // The text of a whole number is its digits, with a minus sign in front of a negative one.
+    const [number] = text.args as [Expr]
+    let result: Expr = text
+    for (let size = length - 1; size >= 1; size--) {
+      const low = size === 1 ? 0n : 10n ** BigInt(size - 1)
+      const positive = ir.and(ir.le(ir.lit(low), number), ir.lt(number, ir.lit(10n ** BigInt(size))))
+      const negative = size === 1 ? ir.FALSE : ir.and(ir.lt(ir.lit(-(10n ** BigInt(size - 1))), number), ir.le(number, ir.lit(-(10n ** BigInt(size - 2)))))
+      result = ir.ite(ir.or(positive, negative), padded(length - size, text), result)
+    }
+    return scalar(result)
   }
 
   /** Whether an identifier refers to a global from TypeScript's own library files. */

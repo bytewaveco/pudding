@@ -468,6 +468,17 @@ test("objects changed in place: aliases, early exits and evaluation order follow
   assert.match(note("REFUSED: an object stored inside itself"), /inside itself/)
 })
 
+test("padStart and padEnd follow JavaScript for known strings and the text of whole numbers", async () => {
+  const report = await run({ cwd: join(fixtures, "padding"), cache: false })
+  assert.deepEqual(report.errors, [])
+  assert.deepEqual(report.warnings, [])
+  for (const entry of report.laws) {
+    const expected = entry.name.startsWith("FALSE") ? ["failed"] : entry.name.startsWith("REFUSED") ? ["checked", "sampled"] : ["proved"]
+    assert.ok(expected.includes(entry.status), `${entry.name}: ${entry.status} ${JSON.stringify(entry.findings)} ${entry.notes.join(" ")}`)
+  }
+  assert.match(law(report, "REFUSED: padding a string whose length is not known").notes[0] ?? "", /the length of this string is not known/)
+})
+
 test("strings too long for Lean to compare are refused, never called false", async () => {
   // Lean's kernel ran out of depth on these after many seconds, and the true law was reported as failed.
   const report = await run({ cwd: join(fixtures, "strings"), cache: false })

@@ -233,6 +233,8 @@ class Generator {
         return `\`${r.pick(["", "<", "n="])}\${${sub(t)}}${r.pick(["", ">", ":"])}\${${sub("str")}}\``
       })
       add(1, () => `String(${sub(r.pick(["big", "num"]))})`)
+      // Padding depends on the length of the text, which for a number depends on its size and sign.
+      add(1.2, () => `${r.chance(0.7) ? `String(${sub(r.pick(["big", "num"]))})` : leaf()}.${r.pick(["padStart", "padEnd"])}(${r.int(6)}${r.chance(0.8) ? `, ${JSON.stringify(r.pick(["0", " ", "ab", "x.y", ""]))}` : ""})`)
       add(1, () => `(${sub(r.pick(["big", "num"]))}).toString()`)
     }
     const total = choices.reduce((sum, [weight]) => sum + weight, 0)
