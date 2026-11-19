@@ -39,3 +39,10 @@ jobs:
       - run: npm run proof
       - run: npm run test:package
       - run: npm run fuzz -- --seed ${{ github.run_number }} --programs 300
+      # The same again with tsrs reading the code instead of TypeScript.
+      - run: npm test
+        env:
+          PUDDING_COMPILER: tsrs
+      - run: npm run fuzz -- --seed ${{ github.run_number }} --programs 300
+        env:
+          PUDDING_COMPILER: tsrs

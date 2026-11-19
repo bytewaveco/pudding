@@ -1,6 +1,6 @@
 {
   "name": "@bytewaveco/pudding",
-  "version": "0.1.0-beta.0",
+  "version": "0.1.0-beta.1",
   "description": "Prove laws about existing TypeScript functions, with Lean doing the checking",
   "license": "MIT",
   "repository": {
@@ -46,19 +46,26 @@
     "fuzz": "npm run build --silent && node scripts/fuzz.mjs",
     "pack:runtime": "npm run build --silent && node scripts/pack-runtime.mjs"
   },
-  "dependencies": {
-    "typescript": "7.0.2"
-  },
   "peerDependencies": {
+    "tsrs": "*",
+    "typescript": ">=7.0.2 || >=7.1.0-0",
     "vitest": ">=3"
   },
   "peerDependenciesMeta": {
+    "tsrs": {
+      "optional": true
+    },
+    "typescript": {
+      "optional": true
+    },
     "vitest": {
       "optional": true
     }
   },
   "devDependencies": {
     "@types/node": "^26.6.6",
+    "tsrs": "7.1.0-beta.tsrs3",
+    "typescript": "7.0.2",
     "vitest": "^5.1.1"
   },
   "keywords": [

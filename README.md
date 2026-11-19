@@ -26,17 +26,49 @@ TypeScript: they type-check, format and refactor with the rest of the project.
 
 ## Getting started
 
-Pudding needs Node 24. It brings its own TypeScript 7 for reading your code,
-and it needs Lean 4.36 for the proofs.
+Pudding needs Node 24, Lean 4.36 for the proofs, and your project's
+TypeScript 7 compiler for reading the code.
 
 ```sh
-npm install --save-dev @bytewaveco/pudding@beta
+npm install --save-dev @bytewaveco/pudding@beta typescript
 npx pudding                 # check every *.law.ts
 npx pudding watch           # check again on every change
 ```
 
 There is nothing to configure. Law files do not have to be listed in a
 tsconfig, and a project without a tsconfig works.
+
+### The compiler
+
+Pudding reads your code with the compiler your project already has, so the
+laws are checked against the same TypeScript as everything else. It is a peer
+dependency, and either of these serves:
+
+- `typescript` 7.0 or newer;
+- [`tsrs`](https://github.com/oxc-project/tsrs), the Rust port of TypeScript 7.
+
+When both are installed, `typescript` is used if it is version 7, and `tsrs`
+otherwise. Set `PUDDING_COMPILER` to `typescript` or `tsrs` to choose. Each run
+names the compiler it used in its last lines.
+
+A project can keep an older `typescript` for its other tools and give Pudding
+`tsrs`. Package managers then report that `typescript` is older than Pudding
+asks for, and need to be told that this is intended. With npm, in
+`package.json`:
+
+```json
+{ "overrides": { "@bytewaveco/pudding": { "typescript": "$typescript" } } }
+```
+
+With pnpm, in `pnpm-workspace.yaml`:
+
+```yaml
+peerDependencyRules:
+  allowedVersions:
+    '@bytewaveco/pudding>typescript': '6'
+```
+
+### Lean
 
 On macOS and Linux, arm64 and x64, Lean arrives with `npm install` as an
 optional dependency: a package of about 110 MB holding the part of Lean that
@@ -298,6 +330,7 @@ changed; when Node finds an input on which the two differ, the law that they
 are equal must not be proved. Programs that expose a problem are kept under
 `.lab/fuzz/failures/`.
 
+- [src/compiler.ts](src/compiler.ts): finds the project's TypeScript 7 compiler.
 - [src/translate.ts](src/translate.ts): TypeScript to obligations.
 - [src/ir.ts](src/ir.ts): the expression language, its simplifier and its evaluator.
 - [src/lean.ts](src/lean.ts): obligations to Lean theorems, and running Lean.
@@ -358,7 +391,7 @@ Tick `dry-run` to go through everything except the upload.
 
 ## Limits worth knowing
 
-- The TypeScript API Pudding uses is published under `typescript/unstable`, so the TypeScript version is pinned.
+- The compiler API Pudding uses is new in TypeScript 7 and changed between 7.0 and 7.1. Pudding is tested with `typescript` 7.0 and 7.1 and with `tsrs`; a later release may need a newer Pudding.
 - Division by an unknown and products of two unknowns are outside `grind`'s arithmetic. Bound the divisor with a small `Integer<Min, Max>`, which is checked value by value, or supply a proof.
 - Symbolic strings support equality and concatenation only.
 - Each obligation is printed as a tree, so deeply nested calls of functions that use an argument several times grow quickly. Pudding refuses terms past a size limit.

@@ -53,7 +53,7 @@ export function format(report: Report, options: { cwd: string; color: boolean; r
   const counts = ORDER.filter(status => report.counts[status]).map(status => paint(COLOR[status], `${report.counts[status]} ${LABEL[status]}`))
   const version = /version ([\d.]+[^\s,]*)/.exec(report.lean)?.[1] ?? "unknown"
   lines.push(`  Laws    ${counts.join(dim(", ")) || "none"}`)
-  lines.push(`  Proofs  ${report.obligations} ${report.obligations === 1 ? "theorem" : "theorems"}${report.cachedObligations ? ` (${report.cachedObligations} cached)` : ""}, ${report.cases.toLocaleString("en-US")} finite ${report.cases === 1 ? "case" : "cases"}, Lean ${version}`)
+  lines.push(`  Proofs  ${report.obligations} ${report.obligations === 1 ? "theorem" : "theorems"}${report.cachedObligations ? ` (${report.cachedObligations} cached)` : ""}, ${report.cases.toLocaleString("en-US")} finite ${report.cases === 1 ? "case" : "cases"}, Lean ${version}${report.compiler ? `, ${report.compiler}` : ""}`)
   lines.push(`  Time    ${report.durationMs} ms`)
 
   if (options.reporter === "github") {

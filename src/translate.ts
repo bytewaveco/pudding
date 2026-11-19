@@ -3,8 +3,7 @@
 // are resolved here, and anything outside the supported subset is refused at
 // the exact node instead of being approximated.
 
-import { ElementFlags, SignatureKind, SymbolFlags, TypeFlags, type Checker, type Program, type Type } from "typescript/unstable/sync"
-import { NodeFlags, SyntaxKind as K, type Node, type SourceFile } from "typescript/unstable/ast"
+import { ElementFlags, NodeFlags, SignatureKind, SymbolFlags, SyntaxKind as K, TypeFlags, type Checker, type Node, type Program, type SourceFile, type Type } from "./compiler.ts"
 import * as ir from "./ir.ts"
 import type { Binder, Expr, Obligation, ObligationKind, Scalar, Ty } from "./ir.ts"
 

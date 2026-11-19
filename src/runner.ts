@@ -10,8 +10,7 @@ import { homedir } from "node:os"
 import { dirname, isAbsolute, join, relative, resolve } from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
 import { threadId, Worker } from "node:worker_threads"
-import { SyntaxKind as K } from "typescript/unstable/ast"
-import { API, DiagnosticCategory, SymbolFlags, type Checker, type Program } from "typescript/unstable/sync"
+import { API, compiler, compilerProblem, DiagnosticCategory, SymbolFlags, SyntaxKind as K, type Checker, type Program } from "./compiler.ts"
 import type { Config } from "./index.ts"
 import { cacheDirectory, toolchainName } from "./install.ts"
 import * as ir from "./ir.ts"
@@ -86,6 +85,8 @@ export interface Report {
   /** The reporter the project's configuration asks for, if any. */
   reporter?: Config["reporter"]
   lean: string
+  /** The compiler that read the project, such as `TypeScript 7.0.2`. */
+  compiler: string
 }
 
 /**
@@ -349,7 +350,7 @@ interface Pending {
 function emptyReport(lean: string): Report {
   return {
     ok: false, laws: [], errors: [], warnings: [], counts: { proved: 0, checked: 0, sampled: 0, failed: 0, skipped: 0, todo: 0 },
-    obligations: 0, cachedObligations: 0, cases: 0, durationMs: 0, lean,
+    obligations: 0, cachedObligations: 0, cases: 0, durationMs: 0, lean, compiler,
     retried: 0, timings: { typescript: 0, prove: 0, retry: 0, crossCheck: 0 },
   }
 }
@@ -374,6 +375,10 @@ export async function run(options: RunOptions = {}): Promise<Report> {
   const finish = () => {
     report.durationMs = Math.round(performance.now() - started)
     return report
+  }
+  if (compilerProblem) {
+    report.errors.push(compilerProblem)
+    return finish()
   }
   if (!lawFiles.length) {
     report.errors.push(filters.length ? `no law file matches ${filters.map(f => `\`${f}\``).join(" or ")}` : "no law files were found")
@@ -403,7 +408,9 @@ export async function run(options: RunOptions = {}): Promise<Report> {
   let laws: Law[] = []
   let executable: RuntimeMap | undefined
   try {
-    const snapshot = api.updateSnapshot({ openProjects: [tsconfig] })
+    // TypeScript 7.1 opens a project with `createSnapshot`; 7.0 has only `updateSnapshot`.
+    const open = { openProjects: [tsconfig] }
+    const snapshot = "createSnapshot" in api && typeof api.createSnapshot === "function" ? api.createSnapshot(open) as ReturnType<typeof api.updateSnapshot> : api.updateSnapshot(open)
     const project = snapshot.getProject(tsconfig) ?? snapshot.getProjects()[0]
     if (!project) {
       report.errors.push("TypeScript could not open the project Pudding generated for the law files")
