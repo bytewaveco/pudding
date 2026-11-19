@@ -181,8 +181,10 @@ describe("constructs that once produced a wrong proof", () => {
   for (const crossCheck of [true, false]) {
     test(`nothing is proved ${crossCheck ? "with" : "without"} executing the laws`, async () => {
       const report = await run({ cwd: join(fixtures, "soundness"), cache: false, crossCheck })
-      assert.equal(report.laws.length, 32)
-      for (const entry of report.laws) assert.equal(entry.status, "failed", `${entry.name}: ${JSON.stringify(entry.findings)}`)
+      assert.equal(report.laws.length, 39)
+      // Two laws in merged.law.ts state the same functions correctly and must still be proved.
+      for (const entry of report.laws) assert.equal(entry.status, entry.name.startsWith("FALSE") ? "failed" : "proved", `${entry.name}: ${JSON.stringify(entry.findings)}`)
+      assert.equal(report.laws.filter(entry => entry.status === "proved").length, 2)
     })
   }
 
@@ -224,6 +226,27 @@ describe("constructs that once produced a wrong proof", () => {
       assert.match(messages, /only law\(\) and describe\(\) calls and declarations are allowed/)
       assert.match(messages, /a law callback must be an ordinary synchronous function/)
       assert.match(messages, /the callback's parameter must be plain/)
+    }
+  })
+
+  test("assignments inside a switch or a conditional loop survive an enclosing if", async () => {
+    const report = await run({ cwd: join(fixtures, "soundness"), cache: false, crossCheck: false, files: ["merged"] })
+    assert.deepEqual(law(report, "FALSE: a discount never exceeds a tenth of the subtotal").findings[0]?.inputs, { member: "true", coupon: '"VIP20"', subtotal: "10n" })
+    assert.deepEqual(law(report, "FALSE: VAT never exceeds a fifth of the price").findings[0]?.inputs, { country: '"DE"', express: "true", price: "0n" })
+  })
+
+  test("an expectation in a helper that is never reached fails the law", async () => {
+    const report = await run({ cwd: join(fixtures, "soundness"), cache: false, crossCheck: false, files: ["helper"] })
+    assert.deepEqual(law(report, "FALSE: a settled paid order owes nothing").findings.map(f => f.kind), ["vacuous"])
+  })
+
+  test("a module that replaces how arrays iterate is refused", async () => {
+    for (const crossCheck of [true, false]) {
+      const report = await run({ cwd: join(fixtures, "iterator"), cache: false, crossCheck })
+      const entry = law(report, "FALSE: a sum of two values adds them")
+      assert.equal(entry.status, "failed")
+      // Executed, the law simply fails; unexecuted, it is refused because of the replacement.
+      assert.match(JSON.stringify(entry.findings), crossCheck ? /the law fails when executed/ : /`Array` is modified/)
     }
   })
 

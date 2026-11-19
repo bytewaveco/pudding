@@ -34,7 +34,7 @@ const root = dirname(dirname(fileURLToPath(import.meta.url)))
 const { values: options } = parseArgs({
   options: {
     seed: { type: "string", default: "1" }, programs: { type: "string", default: "120" }, batch: { type: "string", default: "30" },
-    "cross-check": { type: "boolean", default: false }, quiet: { type: "boolean", default: false }, unbounded: { type: "boolean", default: false },
+    "cross-check": { type: "boolean", default: false }, quiet: { type: "boolean", default: false }, unbounded: { type: "boolean", default: false }, keep: { type: "boolean", default: false },
   },
 })
 
@@ -331,10 +331,14 @@ class Generator {
         const inner = new Scope(scope)
         // The list is generated first, through the loop's scope, so the loop variable never takes a name the list reads.
         const items = Array.from({ length: 1 + r.int(3) }, () => this.expr(type, inner, 2))
+        // Sometimes the list itself depends on a condition, and its two forms differ in length.
+        const list = r.chance(0.3)
+          ? `(${this.expr("bool", inner, 2)} ? [${items.join(", ")}] : [${items.slice(1).join(", ")}])`
+          : `[${items.join(", ")}]`
         const name = this.fresh(inner, type, "x")
         inner.names.set(name, { kind: "var", type })
         const body = this.block(inner, { ...context, loop: true }, depth - 1, 1 + r.int(3))
-        return [`for (const ${name} of [${items.join(", ")}]) {`, ...body.map(l => "  " + l), "}"]
+        return [`for (const ${name} of ${list}) {`, ...body.map(l => "  " + l), "}"]
       })
       add(1, () => {
         const inner = new Scope(scope)
@@ -347,9 +351,11 @@ class Generator {
         const type = r.pick(["big", "num", "str", "bool"])
         const labels = type === "bool" ? [true, false] : r.sample(type === "big" ? BIGS : type === "num" ? NUMS : STRS, 1 + r.int(3))
         const lines = [`switch (${this.expr(type, scope, 2)} as ${TS[type]}) {`]
+        // Some switches have no break at all, so every clause falls into the next.
+        const breaks = r.chance(0.3) ? 0 : 0.7
         for (const label of labels) {
           lines.push(`  case ${show(label)}: {`, ...nested({ loop: false }).map(l => "  " + l), "  }")
-          if (r.chance(0.7)) lines.push("  break")
+          if (r.chance(breaks)) lines.push("  break")
         }
         if (r.chance(0.6)) lines.push("  default: {", ...nested({ loop: false }).map(l => "  " + l), "  }")
         lines.push("}")
@@ -404,6 +410,34 @@ class Generator {
         return [`if (${this.expr("bool", scope, 2)}) {`, `  for (const ${target.name} of [call((): ${TS[target.type]} => ${target.name})]) { }`, "}"]
       })
     }
+    // A running value changed inside a switch that falls through, or by a loop over a list
+    // that depends on a condition, itself inside an `if` that nothing leaves early.
+    add(1.5, () => {
+      const type = r.pick(["big", "num"])
+      const m = `m${this.counter++}`
+      const update = () => `${m} ${r.pick(["+=", "-="])} ${this.expr(type, scope, 1)}`
+      const lines = [`let ${m}: ${TS[type]} = ${literal(this.value(type))}`, `if (${this.expr("bool", scope, 2)}) {`]
+      const inputs = scope.visible().filter(e => e.kind === "var" && e.domain && e.type !== "bool")
+      if (inputs.length && r.chance(0.6)) {
+        // Switch on an input, with labels it can actually take.
+        const subject = r.pick(inputs)
+        const labels = r.sample(subject.domain, 2)
+        scope.noteRead(subject.name)
+        lines.push(`  switch (${subject.name} as ${TS[subject.type]}) {`, `    case ${show(labels[0])}:`, `      ${update()}`)
+        if (labels[1] !== undefined) lines.push(`    case ${show(labels[1])}:`, `      ${update()}`)
+        if (r.chance(0.4)) lines.push("    default:", `      ${update()}`)
+        lines.push("  }")
+      } else {
+        const items = [this.expr(type, scope, 1), this.expr(type, scope, 1)]
+        const x = `x${this.counter++}`
+        lines.push(`  for (const ${x} of (${this.expr("bool", scope, 2)} ? [${items.join(", ")}] : [${items[0]}])) ${m} += ${x}`)
+      }
+      lines.push("}")
+      scope.names.set(m, { kind: "var", type, mutable: true })
+      // Make the outcome depend on the running value.
+      lines.push(`if ((${m} as ${TS[type]}) === (${literal(this.value(type))} as ${TS[type]})) return ${this.expr(context.returns, scope, 1)}`)
+      return lines
+    })
     // A variable that holds a value only on some paths.
     add(1.3, () => {
       const type = r.pick(TYPES)
@@ -444,7 +478,7 @@ class Generator {
     for (const p of params) {
       // The parameter keeps its literal type for table lookups; a widened copy is what the body computes with.
       scope.names.set(p.name, { kind: "param", type: p.type })
-      scope.names.set(p.local, { kind: "var", type: p.type, mutable: false })
+      scope.names.set(p.local, { kind: "var", type: p.type, mutable: false, domain: p.domain })
       header.push(`const ${p.local}: ${TS[p.type]} = ${p.name}`)
     }
     const module = []
@@ -559,6 +593,7 @@ const workRoot = join(root, ".lab", "fuzz")
 const failures = join(workRoot, "failures")
 const tally = { programs: 0, proved: 0, unsupported: 0, throwing: 0, equivalent: 0, typeErrors: 0, disagreements: 0, wrongProofs: 0 }
 const problems = []
+const reasons = new Map()
 
 async function runUnboundedBatch(batch, first) {
   const directory = join(workRoot, `seed-${seed}-unbounded-${batch}`)
@@ -638,7 +673,7 @@ law("M ${program.name}", domain<[${domain}]>(), ([${names.join(", ")}]) => {
     } else if (entry.findings.some(f => f.kind === "counterexample")) tally.proved++
     else tally.unsupported++
   }
-  if (!problems.some(p => cases.some(c => c.program.name === p.program))) rmSync(directory, { recursive: true, force: true })
+  if (!options.keep && !problems.some(p => cases.some(c => c.program.name === p.program))) rmSync(directory, { recursive: true, force: true })
 }
 
 /** Run Pudding on a batch, dropping programs TypeScript rejects, and return its report. */
@@ -729,10 +764,16 @@ async function runBatch(batch, first) {
       tally.throwing++
       if (a.status !== "failed") record("wrong proof", `some input fails in Node (${truth.find(e => e.fails).fails}) but law A was reported ${a.status}`)
     } else if (a.status === "proved") tally.proved++
-    else if (refused(a)) tally.unsupported++
+    else if (refused(a)) {
+      tally.unsupported++
+      // Why it was refused, with names and positions taken out so that like reasons count together.
+      const why = (a.findings.find(f => f.kind === "unsupported" || f.kind === "inexact")?.message ?? a.notes[0] ?? a.status)
+        .replace(/`[^`]*`/g, "`…`").replace(/\(?[\w./-]+\.ts:\d+(:\d+)?\)?/g, "").replace(/ at line \d+/g, "").replace(/;.*$/, "").trim()
+      reasons.set(why, (reasons.get(why) ?? 0) + 1)
+    }
     else record("disagreement", `law A is true but was reported ${a.status}: ${a.findings.map(f => `${f.kind}: ${f.message}`).join("; ").slice(0, 300)}`)
   }
-  if (!problems.some(p => cases.some(c => c.program.name === p.program))) rmSync(directory, { recursive: true, force: true })
+  if (!options.keep && !problems.some(p => cases.some(c => c.program.name === p.program))) rmSync(directory, { recursive: true, force: true })
 }
 
 const started = performance.now()
@@ -754,6 +795,7 @@ if (options.unbounded) {
 console.log(`  generator slips         ${tally.typeErrors}`)
 console.log(`  disagreements           ${tally.disagreements}`)
 console.log(`  WRONG PROOFS            ${tally.wrongProofs}`)
+for (const [why, count] of [...reasons].sort((x, y) => y[1] - x[1])) console.log(`    ${String(count).padStart(4)}  ${why.slice(0, 150)}`)
 for (const problem of problems) console.log(`  ${problem.kind}: ${problem.program}: ${problem.detail}`)
 if (problems.length) console.log(`\nkept under ${failures}`)
 process.exitCode = tally.wrongProofs || tally.disagreements ? 1 : 0

@@ -74,8 +74,8 @@ export interface Law {
   instances: LawInstance[]
   /** Constants met while translating, so inputs can be aimed at them even when translation stops early. */
   mentioned: Expr[]
-  /** Every `expect()` in the law, keyed by `line:column`. */
-  expectSites: Map<string, { line: number; column: number; text: string }>
+  /** Every `expect()` in the law and in the functions it calls, keyed by `file:line:column`. */
+  expectSites: Map<string, { file: string; line: number; column: number; text: string }>
   /** Set when the law could not be translated. */
   problem: ({ kind: "unsupported" | "invalid"; message: string } & Location) | undefined
 }
@@ -189,6 +189,11 @@ const READING_METHODS = new Set([
   "includes", "some", "every", "map", "reduce", "reduceRight", "filter", "find", "findIndex", "findLast", "findLastIndex", "indexOf", "lastIndexOf",
   "join", "slice", "concat", "at", "flat", "flatMap", "keys", "values", "entries", "toString",
 ])
+/** Functions that write to the object they are given first. */
+const WRITERS = /^(Object\.(assign|defineProperty|defineProperties|setPrototypeOf)|Reflect\.(set|defineProperty|setPrototypeOf|deleteProperty))$/
+/** Built-in functions that only read what they are given. The last group returns what is inside it. */
+const READERS = /^(Object\.(keys|isFrozen|hasOwn|getOwnPropertyNames)|Array\.isArray|JSON\.stringify|String|Boolean)$/
+const SHALLOW_READERS = /^(Object\.(values|entries|freeze|fromEntries)|Array\.from|structuredClone)$/
 const ARRAY_MUTATORS = new Set(["push", "pop", "shift", "unshift", "splice", "sort", "reverse", "fill", "copyWithin", "set", "delete", "clear", "add"])
 
 export function locate(node: Node): Location {
@@ -230,9 +235,14 @@ export class Translator {
   /** For each function being evaluated, the names it assigns to anywhere in its body. */
   private assigned: Set<string>[] = []
   private steps = 0
+  /** How many merges of variable state are in progress in the function being evaluated. */
+  private merging = 0
   /** Module constants whose initializers are being evaluated, innermost last. */
   private loading: { file: string; position: number }[] = []
   private mentioned: Expr[] = []
+  private sites: Law["expectSites"] | undefined
+  private scanned = new Set<Node>()
+  private readonly importing = new Map<string, boolean>()
   private readonly exportsUsed = new Map<Node, string>()
   /** Set when some file of the program replaces part of a built-in, which the models of built-ins cannot see. */
   private tampering: { message: string; node: Node } | undefined | null = null
@@ -396,6 +406,7 @@ export class Translator {
     }
     this.collectExpectSites(callback.body, law)
     this.mentioned = law.mentioned
+    this.sites = law.expectSites
     try {
       let alternatives: Shape[] = [{ k: "tuple", items: [] }]
       if (hasDomain) {
@@ -447,6 +458,9 @@ export class Translator {
           })))
         }
       }
+      // Whatever a law uses, its model assumes the language's own behaviour.
+      // Checked last, so that a law refused for this still has named inputs to be executed with.
+      this.assertBuiltinsIntact(call)
       const asserts = law.expectSites.size > 0 || law.instances.some(instance => instance.obligations.some(o => o.kind === "expect"))
       if (!asserts) return invalid("the law contains no expect() assertion", callback)
     } catch (error) {
@@ -457,8 +471,37 @@ export class Translator {
       this.instance = undefined
       this.assigned = []
       this.cells = []
+      this.sites = undefined
+      this.scanned = new Set()
     }
     return law
+  }
+
+  /**
+   * Record the expectations a called function contains, so one that is never
+   * reached is noticed like one written in the law itself. Only files that
+   * import this library can contain any.
+   */
+  private noteExpectations(fn: N) {
+    if (!this.sites || this.scanned.has(fn)) return
+    this.scanned.add(fn)
+    const file = fn.getSourceFile() as SourceFile
+    let uses = this.importing.get(file.fileName)
+    if (uses === undefined) {
+      uses = (file.statements as readonly N[]).some(s => s.kind === K.ImportDeclaration && s.moduleSpecifier.text === this.moduleName)
+      this.importing.set(file.fileName, uses)
+    }
+    if (!uses || !fn.body) return
+    const visit = (n: N) => {
+      if (this.isExpect(n)) {
+        let statement = n
+        while (statement.parent && statement.kind !== K.ExpressionStatement && statement !== fn.body) statement = statement.parent
+        const at = locate(statement)
+        this.sites!.set(`${at.file}:${at.line}:${at.column}`, { file: at.file, line: at.line, column: at.column, text: sourceText(statement) })
+      }
+      n.forEachChild(visit)
+    }
+    visit(fn.body)
   }
 
   private collectExpectSites(node: N, law: Law) {
@@ -467,7 +510,7 @@ export class Translator {
         let statement = n
         while (statement.parent && statement.kind !== K.ExpressionStatement && statement !== node) statement = statement.parent
         const at = locate(statement)
-        law.expectSites.set(`${at.line}:${at.column}`, { line: at.line, column: at.column, text: sourceText(statement) })
+        law.expectSites.set(`${at.file}:${at.line}:${at.column}`, { file: at.file, line: at.line, column: at.column, text: sourceText(statement) })
       }
       n.forEachChild(visit)
     }
@@ -713,8 +756,13 @@ export class Translator {
    * before: an expression cannot assign, and a statement branch evaluated
    * this way has already run to the end of its function on both sides.
    */
-  private branch(cond: Expr, whenTrue: () => Value, whenFalse: () => Value): Value {
+  private branch(cond: Expr, whenTrue: () => Value, whenFalse: () => Value, control = false): Value {
     if (cond.t === "lit") return cond.value ? whenTrue() : whenFalse()
+    // A branch over statements only keeps their effects if both sides run on to
+    // the end of the function. Inside a merge they do not, so reaching here
+    // would silently drop assignments. Every such construct is meant to merge
+    // instead; this is the net under that.
+    if (control && this.merging > 0) throw new Unsupported("this combination of branches and assignments is not supported", undefined)
     const before = this.save()
     const a = this.under(cond, whenTrue)
     this.restore(before)
@@ -731,12 +779,19 @@ export class Translator {
   private mergeStates(cond: Expr, whenTrue: () => void, whenFalse: () => void) {
     const before = this.save()
     const kept = before.values.length
-    this.under(cond, whenTrue)
-    const afterTrue = this.cells.slice(0, kept).map(cell => cell.value)
-    this.restore(before)
-    this.under(ir.not(cond), whenFalse)
-    const afterFalse = this.cells.slice(0, kept).map(cell => cell.value)
-    this.restore(before)
+    this.merging++
+    let afterTrue: Value[]
+    let afterFalse: Value[]
+    try {
+      this.under(cond, whenTrue)
+      afterTrue = this.cells.slice(0, kept).map(cell => cell.value)
+      this.restore(before)
+      this.under(ir.not(cond), whenFalse)
+      afterFalse = this.cells.slice(0, kept).map(cell => cell.value)
+      this.restore(before)
+    } finally {
+      this.merging--
+    }
     this.cells.forEach((cell, i) => {
       const a = afterTrue[i]!
       const b = afterFalse[i]!
@@ -850,6 +905,7 @@ export class Translator {
     if (!node.body) throw new Unsupported("this function has no body to translate", at)
     const facts = this.factsOf(node)
     if (facts.usesVar) throw new Unsupported("`var` is not supported; use `const` or `let`", facts.usesVar)
+    this.noteExpectations(node)
     // A function that reads or writes a variable someone reassigns would need
     // that variable's value at the moment of the call, on every path. That is
     // not tracked, so such closures are refused.
@@ -858,6 +914,9 @@ export class Translator {
     }
     const env = fn.env.child()
     const live = this.cells.length
+    // A call runs to its own end, whatever its caller is in the middle of.
+    const merging = this.merging
+    this.merging = 0
     this.stack.push(node)
     this.assigned.push(facts.assigned)
     try {
@@ -893,6 +952,7 @@ export class Translator {
       this.stack.pop()
       this.assigned.pop()
       this.cells.length = live
+      this.merging = merging
     }
   }
 
@@ -960,7 +1020,7 @@ export class Translator {
         const cond = this.bool(statement.expression, env)
         if (cond.t === "lit") return run(cond.value ? statement.thenStatement : statement.elseStatement, after)
         if (canExit(statement.thenStatement) || canExit(statement.elseStatement)) {
-          return this.branch(cond, () => run(statement.thenStatement, after), () => run(statement.elseStatement, after))
+          return this.branch(cond, () => run(statement.thenStatement, after), () => run(statement.elseStatement, after), true)
         }
         const stop: Flow = { next: () => VOID }
         this.mergeStates(cond, () => run(statement.thenStatement, stop), () => run(statement.elseStatement, stop))
@@ -973,18 +1033,32 @@ export class Translator {
         const scope = env.child()
         this.enter(clauses.flatMap(clause => clause.statements as N[]), scope)
         // Entering at a clause runs it and every clause below it until a break.
-        const bodyFrom = (start: number) =>
-          this.exec(clauses.slice(start).flatMap(clause => clause.statements as N[]), 0, scope, { ...flow, next: rest, brk: rest })
+        const statementsFrom = (start: number) => clauses.slice(start).flatMap(clause => clause.statements as N[])
+        const matchesAt = (clause: N) => {
+          const label = this.evalExpr(clause.expression, scope)
+          return this.scalarOf(this.over(subject, value => this.over(label, candidate => scalar(this.strictEqual(value, candidate, clause)))), clause, "bool")
+        }
+        for (const [index, clause] of clauses.entries()) {
+          if (clause.kind === K.DefaultClause && index !== clauses.length - 1) throw new Unsupported("`default` must be the last clause of a switch", clause)
+        }
+        if (!canExit(statement)) {
+          // Nothing leaves the switch early, so each clause is a branch whose assignments are merged.
+          const stop: Flow = { next: () => VOID }
+          const settle = (index: number): void => {
+            const clause = clauses[index]
+            if (!clause) return
+            if (clause.kind === K.DefaultClause) return void this.exec(statementsFrom(index), 0, scope, stop)
+            this.mergeStates(matchesAt(clause), () => void this.exec(statementsFrom(index), 0, scope, stop), () => settle(index + 1))
+          }
+          settle(0)
+          return rest()
+        }
+        const bodyFrom = (start: number) => this.exec(statementsFrom(start), 0, scope, { ...flow, next: rest, brk: rest })
         const from = (index: number): Value => {
           const clause = clauses[index]
           if (!clause) return rest()
-          if (clause.kind === K.DefaultClause) {
-            if (index !== clauses.length - 1) throw new Unsupported("`default` must be the last clause of a switch", clause)
-            return bodyFrom(index)
-          }
-          const label = this.evalExpr(clause.expression, scope)
-          const matches = this.scalarOf(this.over(subject, value => this.over(label, candidate => scalar(this.strictEqual(value, candidate, clause)))), clause, "bool")
-          return this.branch(matches, () => bodyFrom(index), () => from(index + 1))
+          if (clause.kind === K.DefaultClause) return bodyFrom(index)
+          return this.branch(matchesAt(clause), () => bodyFrom(index), () => from(index + 1), true)
         }
         return from(0)
       }
@@ -998,20 +1072,39 @@ export class Translator {
         // The loop is unrolled, so the array must have a length known here.
         const header = env.child()
         for (const name of boundNames(declared[0].name)) header.set(name, UNINITIALIZED)
-        return this.over(this.evalExpr(statement.expression, header), items => {
+        const body = statement.statement
+        const loop = (items: Value, after: () => Value): Value => {
           if (items.k === "bottom") return BOTTOM
           if (items.k !== "array") throw new Unsupported(`a loop needs an array whose length is known here, but this is ${describe(items)}`, statement.expression)
           const iterate = (index: number): Value => {
             const item = items.items[index]
-            if (!item) return rest()
+            if (!item) return after()
             const scope = env.child()
             this.bind(declared[0].name, item, scope, false, reassignable)
             const onward = () => iterate(index + 1)
-            const body = statement.statement
-            return this.block(body.kind === K.Block ? body.statements : [body], scope.child(), { next: onward, cont: onward, brk: rest })
+            return this.block(body.kind === K.Block ? body.statements : [body], scope.child(), { next: onward, cont: onward, brk: after })
           }
           return iterate(0)
-        })
+        }
+        // The list itself may depend on a condition. If the body cannot leave
+        // the loop, each possible list is run and the variables are merged;
+        // otherwise each runs on to the end of the function.
+        const run = (items: Value): Value => {
+          items = this.settled(items)
+          if (items.k !== "choice") return loop(items, rest)
+          const choice = items
+          if (canExit(body)) return this.branch(choice.cond, () => run(choice.a), () => run(choice.b), true)
+          const each = (list: Value): void => {
+            list = this.settled(list)
+            if (list.k === "choice") {
+              const inner = list
+              this.mergeStates(inner.cond, () => each(inner.a), () => each(inner.b))
+            } else loop(list, () => VOID)
+          }
+          each(choice)
+          return rest()
+        }
+        return run(this.evalExpr(statement.expression, header))
       }
       case K.WhileStatement:
       case K.DoStatement:
@@ -1424,8 +1517,10 @@ export class Translator {
         const target = assigns ? node.left : node.kind === K.DeleteExpression ? node.expression
           : (node.kind === K.PrefixUnaryExpression || node.kind === K.PostfixUnaryExpression) && (node.operator === K.PlusPlusToken || node.operator === K.MinusMinusToken) ? node.operand : undefined
         const root = target && target.kind !== K.Identifier ? rootOf(target) : undefined
-        // Also catch a built-in handed over whole, as in Object.assign(Math, ...) or Object.defineProperty(Array.prototype, ...).
-        const handed = node.kind === K.CallExpression ? (node.arguments as N[]).map(rootOf).find(a => a.kind === K.Identifier && builtins.has(a.text)) : undefined
+        // Also catch a built-in handed to something that writes to it, as in Object.assign(Math, ...) or
+        // Object.defineProperty(Array.prototype, ...). Passing one as a value, as in `.map(String)`, is not a write.
+        const writes = node.kind === K.CallExpression && WRITERS.test(node.expression.getText(node.getSourceFile()))
+        const handed = writes ? (node.arguments as N[]).slice(0, 1).map(rootOf).find(a => a.kind === K.Identifier && builtins.has(a.text)) : undefined
         const culprit = root?.kind === K.Identifier && builtins.has(root.text) ? root : handed
         if (culprit && this.isBuiltin(culprit)) {
           const at = locate(node)
@@ -1601,6 +1696,7 @@ export class Translator {
     const refuse = (reason: string, at: N): never => {
       throw new Unsupported(`\`${name}\` ${reason} at line ${locate(at).line} of its module, so its initial value cannot be assumed`, use)
     }
+    this.assertBuiltinsIntact(use)
     const loose = (file.statements as readonly N[]).find(statement => !MODULE_DECLARATIONS.has(statement.kind))
     if (loose) refuse("shares its module with a statement that runs on load", loose)
     const isFunction = (node: N) => node.kind === K.ArrowFunction || node.kind === K.FunctionExpression || node.kind === K.FunctionDeclaration ||
@@ -1643,12 +1739,9 @@ export class Translator {
     const shallow = (value: Value | undefined) =>
       value?.k === "record" ? [...value.fields.values()].every(field => field.k === "scalar")
         : value?.k === "array" ? value.items.every(item => item.k === "scalar") : false
-    let runsOwnCode: N | undefined
     const declaredConst = unwrap(declaration.initializer) !== declaration.initializer && /\bas\s+const\b/.test(declaration.initializer.getText(file))
     const handedOver: { at: N; inFunction: boolean }[] = []
     const visit = (node: N, inFunction: boolean) => {
-      if (!inFunction && (node.kind === K.CallExpression || node.kind === K.NewExpression) &&
-        (isLocalCode(node.expression) || (node.arguments as N[] | undefined)?.some(isLocalCode))) runsOwnCode ??= node
       if (node.kind === K.Identifier && node.text === name && node !== declaration.name) {
         // The longest access path that starts at this name, such as `table.rows[0]`.
         let top = node
@@ -1668,11 +1761,18 @@ export class Translator {
         if (assigned || updated || parent.kind === K.DeleteExpression || (called && ARRAY_MUTATORS.has(top.name.text))) refuse("is modified", parent)
         // Reading through the value is harmless. What matters is where the
         // value itself, or an object inside it, is handed to other code.
-        let reached: Value | undefined = value
+        // Everything the path can lead to. A key that is not a literal can pick any child.
+        let reached: Value[] = [value]
         for (const step of path.slice(0, called ? -1 : undefined)) {
-          reached = step === undefined || !reached ? undefined
-            : reached.k === "record" ? reached.fields.get(step) : reached.k === "array" ? reached.items[Number(step)] : undefined
+          reached = reached.flatMap(part => {
+            // The length of a list is a plain number.
+            if (step === "length" && part.k === "array") return [scalar(ir.lit(BigInt(part.items.length)), true)]
+            const children = part.k === "record" ? [...part.fields] : part.k === "array" ? part.items.map((item, i) => [String(i), item] as [string, Value]) : []
+            return children.filter(([key]) => step === undefined || key === step).map(([, child]) => child)
+          })
         }
+        const plain = reached.length > 0 && reached.every(part => part.k === "scalar")
+        const flat = reached.length > 0 && reached.every(shallow)
         // Only uses that are known to read count as reads. A method call does
         // when it is one of the array methods that change nothing, on a list
         // of plain values; a method the table defines itself may do anything.
@@ -1680,23 +1780,28 @@ export class Translator {
         // level holds no objects. `a ?? b` and the like return the table itself.
         const compares = parent.kind === K.BinaryExpression &&
           [K.EqualsEqualsEqualsToken, K.ExclamationEqualsEqualsToken, K.EqualsEqualsToken, K.ExclamationEqualsToken, K.InKeyword].includes(parent.operatorToken.kind)
-        const reads = (called && READING_METHODS.has(top.name.text) && shallow(reached)) || (!called && reached?.k === "scalar") ||
+        const reads = (called && READING_METHODS.has(top.name.text) && flat) || (!called && plain) ||
           parent.kind === K.TypeQuery || parent.kind === K.TypeOfExpression || parent.kind === K.ExportSpecifier || parent.kind === K.ExportAssignment ||
-          ((parent.kind === K.SpreadElement || parent.kind === K.SpreadAssignment || (parent.kind === K.ForOfStatement && parent.expression === outer)) && shallow(reached)) ||
+          ((parent.kind === K.SpreadElement || parent.kind === K.SpreadAssignment || (parent.kind === K.ForOfStatement && parent.expression === outer)) && flat) ||
           compares
         // A value declared `as const` may be given to an installed package
         // while loading: its type forbids changing it, and schema builders are
         // the common case. A function of the project itself gets no such trust.
         const toLibrary = declaredConst && parent.kind === K.CallExpression && parent.expression !== outer && fromPackage(parent.expression)
-        if (!reads && !toLibrary) handedOver.push({ at: parent, inFunction })
+        // A built-in that only reads may be given the table anywhere.
+        const callee = (parent.kind === K.CallExpression || parent.kind === K.NewExpression) && parent.expression !== outer ? parent.expression.getText(file) : ""
+        const toReader = READERS.test(callee) || (flat && (SHALLOW_READERS.test(callee) || (parent.kind === K.NewExpression && /^(Set|Map)$/.test(callee))))
+        if (!reads && !toLibrary && !toReader) handedOver.push({ at: parent, inFunction })
       }
       node.forEachChild((child: N) => visit(child, inFunction || isFunction(child)))
     }
     visit(file, false)
     const atLoad = handedOver.find(entry => !entry.inFunction)
     if (atLoad) refuse("is handed to other code while its module loads", atLoad.at)
+    // A function that hands the table on could be run while some module loads,
+    // by this module or by another that imports it, and nothing here can tell.
     const inCode = handedOver.find(entry => entry.inFunction)
-    if (inCode && runsOwnCode) refuse(`is handed to other code by a function, and the module runs its own functions while loading (line ${locate(runsOwnCode).line});`, inCode.at)
+    if (inCode) refuse("is handed to other code by a function, which may run before the law does,", inCode.at)
     this.mutationChecked.add(key)
   }
 }

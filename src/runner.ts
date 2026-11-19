@@ -456,7 +456,7 @@ export async function run(options: RunOptions = {}): Promise<Report> {
       laws: candidates.filter(law => law.file === file && law.mode === "run" && law.problem?.kind !== "invalid").map(law => ({
         index: law.index,
         unproved: law.problem !== undefined,
-        mentioned: law.problem ? law.mentioned : [],
+        mentioned: law.mentioned,
         instances: law.instances.map(instance => ({
           binders: instance.binders, arg: instance.arg, obligations: instance.obligations.map(o => ({ guard: o.guard, claim: o.claim, inexact: o.kind === "overflow" || o.kind === "nan" })),
         })),
@@ -574,15 +574,15 @@ export async function run(options: RunOptions = {}): Promise<Report> {
   }
 
   // An expectation whose condition can never be true proves nothing.
-  const vacuityChecks: { entry: LawReport; site: { line: number; column: number; text: string }; law: Law; checks: Check[] }[] = []
+  const vacuityChecks: { entry: LawReport; site: { file: string; line: number; column: number; text: string }; law: Law; checks: Check[] }[] = []
   for (const law of laws) {
     if (law.problem || law.mode !== "run") continue
     const entry = lawReports.get(law)!
     for (const [key, site] of law.expectSites) {
       const reaching = law.instances.flatMap(instance => instance.obligations
-        .filter(o => o.kind === "expect" && `${o.line}:${o.column}` === key).map(obligation => ({ instance, obligation })))
+        .filter(o => o.kind === "expect" && `${o.file}:${o.line}:${o.column}` === key).map(obligation => ({ instance, obligation })))
       const vacuous = () => entry.findings.push({
-        kind: "vacuous", message: "this expectation is never reached, so it proves nothing", file: law.file, ...site,
+        kind: "vacuous", message: "this expectation is never reached, so it proves nothing", ...site,
       })
       if (!reaching.length) {
         vacuous()
@@ -603,7 +603,7 @@ export async function run(options: RunOptions = {}): Promise<Report> {
     const neverTrue = new Set(all.filter((_, i) => results[i]!.ok))
     for (const { entry, site, law, checks } of vacuityChecks) {
       if (checks.every(c => neverTrue.has(c.statement))) {
-        entry.findings.push({ kind: "vacuous", message: "the condition guarding this expectation is never true, so it proves nothing", file: law.file, ...site })
+        entry.findings.push({ kind: "vacuous", message: "the condition guarding this expectation is never true, so it proves nothing", ...site })
       } else entry.notes.push(`line ${site.line}: no input satisfying the condition was found by sampling`)
     }
   }
