@@ -6,3 +6,8 @@ test/fixtures/.tmp-*/
 *.tgz
 .lab/
 test/fixtures/review-*/
+
+# A fixture needs a package that looks installed.
+!test/fixtures/trust/node_modules/
+test/fixtures/trust/node_modules/*
+!test/fixtures/trust/node_modules/registry/

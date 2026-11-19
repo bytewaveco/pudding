@@ -1739,7 +1739,17 @@ export class Translator {
     const shallow = (value: Value | undefined) =>
       value?.k === "record" ? [...value.fields.values()].every(field => field.k === "scalar")
         : value?.k === "array" ? value.items.every(item => item.k === "scalar") : false
-    const declaredConst = unwrap(declaration.initializer) !== declaration.initializer && /\bas\s+const\b/.test(declaration.initializer.getText(file))
+    // Whether the whole initializer is asserted `as const`, read from the
+    // syntax: the words may also appear on a single field or in a comment,
+    // which says nothing about the table.
+    const declaredConst = ((): boolean => {
+      for (let node: N = declaration.initializer; ; node = node.expression) {
+        if (node.kind === K.AsExpression) {
+          const type = node.type as N
+          if (type.kind === K.TypeReference && type.typeName.kind === K.Identifier && type.typeName.text === "const" && !type.typeArguments?.length) return true
+        } else if (node.kind !== K.ParenthesizedExpression && node.kind !== K.SatisfiesExpression && node.kind !== K.NonNullExpression) return false
+      }
+    })()
     const handedOver: { at: N; inFunction: boolean }[] = []
     const visit = (node: N, inFunction: boolean) => {
       if (node.kind === K.Identifier && node.text === name && node !== declaration.name) {

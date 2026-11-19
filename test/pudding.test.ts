@@ -189,6 +189,21 @@ describe("constructs that once produced a wrong proof", () => {
     })
   }
 
+  // A table may be given to an installed package while its module loads only
+  // when the table as a whole is `as const`. The words alone, on one field or
+  // in a comment, used to be enough.
+  for (const crossCheck of [true, false]) {
+    test(`only a table that is \`as const\` as a whole is trusted with a package, ${crossCheck ? "with" : "without"} executing the laws`, async () => {
+      const report = await run({ cwd: join(fixtures, "trust"), cache: false, crossCheck })
+      assert.equal(report.laws.length, 6)
+      for (const entry of report.laws) assert.equal(entry.status, entry.name.startsWith("FALSE") ? "failed" : "proved", `${entry.name}: ${JSON.stringify(entry.findings)}`)
+      if (!crossCheck) {
+        const refusals = report.laws.filter(entry => entry.status === "failed").map(entry => entry.findings[0]?.message ?? "")
+        for (const [i, name] of ["field", "comment", "wrapped", "inner", "inner"].entries()) assert.match(refusals[i]!, new RegExp(`^\`${name}\` is handed to other code while its module loads`))
+      }
+    })
+  }
+
   test("each is refused or refuted for the right reason", async () => {
     const report = await run({ cwd: join(fixtures, "soundness"), cache: false, crossCheck: false })
     const message = (name: string) => law(report, name).findings.map(f => f.message).join(" | ")
