@@ -67,8 +67,9 @@ jobs:
           cache: npm
           registry-url: https://registry.npmjs.org
       - run: npm ci
-      - run: npm run typecheck
+      # The law files import the package by name, which resolves to the build.
       - run: npm run build
+      - run: npm run typecheck
       - run: node dist/cli.js install-lean --local
       - run: npm test
       - run: npm run test:package
