@@ -388,7 +388,7 @@ describe("the Lean encoding", () => {
 
 test("random programs: a true law is proved or refused, a false one is never proved", () => {
   // A small fixed sample of the differential fuzzer (scripts/fuzz.mjs), with and without executing the laws.
-  for (const extra of [[], ["--cross-check"]]) {
+  for (const extra of [[], ["--cross-check"], ["--unbounded"]]) {
     const result = spawnSync("node", [join(import.meta.dirname, "..", "scripts", "fuzz.mjs"), "--seed", "7", "--programs", "80", "--batch", "40", "--quiet", ...extra], { encoding: "utf8" })
     assert.equal(result.status, 0, result.stdout + result.stderr)
     assert.match(result.stdout, /WRONG PROOFS\s+0/)

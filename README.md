@@ -243,9 +243,13 @@ the supported subset, runs each in Node on every input of a small finite
 domain, and checks that Pudding proves the law stating exactly those results
 and never proves the same law with one result changed. It leans on the
 scoping, hoisting and `undefined` rules that are easiest to model wrongly.
-Programs that expose a problem are kept under `.lab/fuzz/failures/`. It covers
-laws over finite inputs, which are decided by evaluation; laws over unbounded
-inputs are not fuzzed.
+
+With `--unbounded` the inputs are all bigints or a wide range of whole
+numbers, which Pudding proves with tactics. No table of results exists there,
+so each function is compared with a copy that has one constant or operator
+changed; when Node finds an input on which the two differ, the law that they
+are equal must not be proved. Programs that expose a problem are kept under
+`.lab/fuzz/failures/`.
 
 - [src/translate.ts](src/translate.ts): TypeScript to obligations.
 - [src/ir.ts](src/ir.ts): the expression language, its simplifier and its evaluator.

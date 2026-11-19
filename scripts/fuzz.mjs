@@ -11,7 +11,14 @@
 // expected too, and a failure to do so is reported as a disagreement unless
 // Pudding refused the code as unsupported.
 //
-//   node scripts/fuzz.mjs [--seed N] [--programs N] [--batch N] [--cross-check]
+// With --unbounded the inputs are all bigints, a wide range of whole numbers,
+// and so on, which Pudding proves with tactics instead of by evaluation. No
+// table of results can be written for those, so each function is compared
+// with a copy that has one constant or operator changed. When Node finds an
+// input on which the two differ, the law "they are equal" is false and must
+// not be proved.
+//
+//   node scripts/fuzz.mjs [--seed N] [--programs N] [--batch N] [--cross-check] [--unbounded]
 //
 // Run `npm run build` first. Programs that expose a problem are kept under
 // .lab/fuzz/failures/.
@@ -27,7 +34,7 @@ const root = dirname(dirname(fileURLToPath(import.meta.url)))
 const { values: options } = parseArgs({
   options: {
     seed: { type: "string", default: "1" }, programs: { type: "string", default: "120" }, batch: { type: "string", default: "30" },
-    "cross-check": { type: "boolean", default: false }, quiet: { type: "boolean", default: false },
+    "cross-check": { type: "boolean", default: false }, quiet: { type: "boolean", default: false }, unbounded: { type: "boolean", default: false },
   },
 })
 
@@ -417,16 +424,20 @@ class Generator {
   }
 
   /** A whole program: an exported function over a small finite domain, and what it needs at module level. */
-  program() {
+  program(unbounded = false) {
     const r = this.random
     const name = `f${this.index}`
     const count = 1 + r.int(3)
     const params = []
     for (let i = 0; i < count; i++) {
-      const type = r.pick(TYPES)
+      const type = unbounded && i === 0 ? r.pick(["big", "num"]) : r.pick(TYPES)
       const domain = type === "bool" ? [true, false]
         : r.sample(type === "big" ? BIGS : type === "num" ? NUMS : STRS, type === "str" ? 2 + r.int(2) : 2 + r.int(3))
-      params.push({ name: `p${i}`, local: `w${i}`, type, domain })
+      const param = { name: `p${i}`, local: `w${i}`, type, domain }
+      if (unbounded && type === "big") Object.assign(param, { written: "bigint", input: "bigint", range: [-60n, 60n] })
+      // A range too wide to list is stated as bounds; a narrow one is listed, and stated as bounds where that is enough.
+      if (unbounded && type === "num") Object.assign(param, r.chance(0.7) ? { written: "number", input: "Integer<-1000, 1000>", range: [-1000, 1000] } : { written: "number", input: "Integer<0, 9>", range: [0, 9] })
+      params.push(param)
     }
     const scope = new Scope(undefined, true)
     const header = []
@@ -447,7 +458,7 @@ class Generator {
     }
     const returns = r.pick(TYPES)
     const body = this.block(scope, { returns, loop: false }, 2, 2 + r.int(5))
-    const signature = params.map(p => `${p.name}: ${p.domain.map(show).join(" | ")}`).join(", ")
+    const signature = params.map(p => `${p.name}: ${p.written ?? p.domain.map(show).join(" | ")}`).join(", ")
     const source = [
       "const call = <T,>(f: () => T): T => f()",
       ...module,
@@ -458,6 +469,43 @@ class Generator {
     ].join("\n")
     return { name, params, returns, source }
   }
+}
+
+/** Copies of the function under another name, each with one constant or operator changed. */
+function mutate(program, random) {
+  const start = program.source.indexOf("export function")
+  const body = program.source.slice(start)
+  // Only swaps that keep the types right: `-` and `*` are never strings, and the equality swaps sit between two casts.
+  const swaps = [[" - ", " + "], [" * ", " + "], [" * ", " - "], [" < ", " <= "], [" <= ", " < "], [" > ", " >= "], [" >= ", " > "], [") === (", ") !== ("], [") !== (", ") === ("], [" && ", " || "], [" || ", " && "]]
+  const sites = []
+  for (const [from, to] of swaps) for (let at = body.indexOf(from); at >= 0; at = body.indexOf(from, at + 1)) sites.push({ at, length: from.length, text: to })
+  for (const match of body.matchAll(/\((\(?-?\d+n?\)?) as (bigint|number)\)/g)) {
+    const digits = /-?\d+/.exec(match[1])[0]
+    const changed = match[1].includes("n") ? `(${BigInt(digits) + 1n}n)` : `(${Number(digits) + 1})`
+    sites.push({ at: match.index, length: match[0].length, text: `(${changed} as ${match[2]})` })
+  }
+  for (const match of body.matchAll(/\((true|false) as boolean\)/g)) sites.push({ at: match.index, length: match[0].length, text: `(${match[1] === "true" ? "false" : "true"} as boolean)` })
+  // The header copies parameters into locals; leave it and the signature alone.
+  const from = body.indexOf("{")
+  const usable = sites.filter(site => site.at > from)
+  const mutant = `m${program.name.slice(1)}`
+  return random.sample(usable, 8).map(site => ({
+    name: mutant,
+    source: (body.slice(0, site.at) + site.text + body.slice(site.at + site.length)).replace(`export function ${program.name}(`, `export function ${mutant}(`),
+  }))
+}
+
+/** Inputs to compare a function with its mutant on, when its inputs cannot all be listed. */
+function sampleInputs(params, random, count) {
+  const one = p => {
+    if (!p.range) return random.pick(p.domain)
+    const [low, high] = p.range
+    const span = Number(high) - Number(low) + 1
+    const value = random.chance(0.3) ? Number(random.pick(p.type === "big" ? BIGS : NUMS)) : Number(low) + random.int(span)
+    const inside = Math.min(Number(high), Math.max(Number(low), value))
+    return p.type === "big" ? BigInt(inside) : inside
+  }
+  return Array.from({ length: count }, () => params.map(one))
 }
 
 // ------------------------------------------------------------------ oracle
@@ -509,8 +557,123 @@ const batchSize = Number(options.batch)
 const lean = process.env.PUDDING_LEAN ?? locateLean({}, root)
 const workRoot = join(root, ".lab", "fuzz")
 const failures = join(workRoot, "failures")
-const tally = { programs: 0, proved: 0, unsupported: 0, throwing: 0, typeErrors: 0, disagreements: 0, wrongProofs: 0 }
+const tally = { programs: 0, proved: 0, unsupported: 0, throwing: 0, equivalent: 0, typeErrors: 0, disagreements: 0, wrongProofs: 0 }
 const problems = []
+
+async function runUnboundedBatch(batch, first) {
+  const directory = join(workRoot, `seed-${seed}-unbounded-${batch}`)
+  rmSync(directory, { recursive: true, force: true })
+  mkdirSync(directory, { recursive: true })
+  const cases = []
+  for (let i = 0; i < batchSize && first + i < total; i++) {
+    const index = first + i
+    const random = new Random(seed * 1_000_003 + index)
+    const program = new Generator(random, index).program(true)
+    const run = (fn, input) => {
+      try {
+        const value = fn(...input)
+        return typeof value === "number" && !Number.isSafeInteger(value) ? { fails: true } : { value: Object.is(value, -0) ? 0 : value }
+      } catch {
+        return { fails: true }
+      }
+    }
+    // Try several mutants and keep the first one Node can tell from the original:
+    // the law that the two are equal is certainly false where both return different things.
+    const inputs = sampleInputs(program.params, random, 400)
+    let mutant
+    let differs
+    for (const [k, candidate] of mutate(program, random).entries()) {
+      const trial = join(directory, `trial-${index}-${k}.ts`)
+      writeFileSync(trial, program.source + "\n" + candidate.source)
+      try {
+        const module = await import(pathToFileURL(trial).href)
+        const original = inputs.map(input => run(module[program.name], input))
+        const at = inputs.findIndex((input, n) => {
+          const other = run(module[candidate.name], input)
+          return !original[n].fails && !other.fails && original[n].value !== other.value
+        })
+        mutant ??= candidate
+        if (at >= 0) {
+          mutant = candidate
+          differs = inputs[at]
+        }
+      } catch {
+        // A mutant Node cannot load is no use; try the next.
+      } finally {
+        rmSync(trial, { force: true })
+      }
+      if (differs) break
+    }
+    if (!mutant) {
+      tally.typeErrors++
+      continue
+    }
+    writeFileSync(join(directory, `${program.name}.ts`), program.source + "\n" + mutant.source)
+    const names = program.params.map((_, n) => `a${n}`)
+    const domain = program.params.map(p => p.input ?? p.domain.map(show).join(" | ")).join(", ")
+    writeFileSync(join(directory, `${program.name}.law.ts`), `import { domain, expect, law, type Integer } from "pudding"
+import { ${program.name}, ${mutant.name} } from "./${program.name}.ts"
+
+law("M ${program.name}", domain<[${domain}]>(), ([${names.join(", ")}]) => {
+  expect<${TS[program.returns]}>(${program.name}(${names.join(", ")})).toEqual(${mutant.name}(${names.join(", ")}))
+})
+`)
+    cases.push({ program, differs })
+  }
+  const report = runPudding(directory, cases)
+  for (const { program, differs } of cases) {
+    tally.programs++
+    const entry = report.laws.find(law => law.name === `M ${program.name}`)
+    if (!differs) {
+      tally.equivalent++
+      continue
+    }
+    tally.throwing++
+    if (!entry || entry.status === "proved") {
+      problems.push({ kind: "wrong proof", program: program.name, detail: `the function and its mutant differ at (${differs.map(show).join(", ")}) but the law that they are equal was reported ${entry?.status ?? "missing"}` })
+      tally.wrongProofs++
+      const kept = join(failures, `seed-${seed}-unbounded-${program.name}`)
+      mkdirSync(kept, { recursive: true })
+      for (const file of [`${program.name}.ts`, `${program.name}.law.ts`]) cpSync(join(directory, file), join(kept, file))
+    } else if (entry.findings.some(f => f.kind === "counterexample")) tally.proved++
+    else tally.unsupported++
+  }
+  if (!problems.some(p => cases.some(c => c.program.name === p.program))) rmSync(directory, { recursive: true, force: true })
+}
+
+/** Run Pudding on a batch, dropping programs TypeScript rejects, and return its report. */
+function runPudding(directory, cases) {
+  let report
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const args = [process.env.PUDDING_CLI ?? join(root, "dist", "cli.js"), "--cwd", directory, "--no-cache", "--reporter", "json", ...(options["cross-check"] ? [] : ["--no-cross-check"])]
+    const result = spawnSync("node", args, { encoding: "utf8", env: { ...process.env, PUDDING_LEAN: lean }, maxBuffer: 1 << 28 })
+    try {
+      report = JSON.parse(result.stdout)
+    } catch {
+      throw new Error(`Pudding did not produce a report for ${directory}:\n${result.stdout.slice(0, 2000)}\n${result.stderr.slice(0, 2000)}`)
+    }
+    // A program TypeScript rejects is a generator slip. Drop it and try the rest again.
+    const rejected = new Set(report.errors.flatMap(error => [...error.matchAll(/\b(f\d+)\.(?:law\.)?ts/g)].map(match => match[1])))
+    if (!report.errors.length) break
+    if (!rejected.size) throw new Error(`Pudding reported errors that name no program:\n${report.errors.join("\n")}`)
+    for (const name of rejected) {
+      if (!options.quiet) {
+        const where = /\b(f\d+\.(?:law\.)?ts):(\d+):/.exec(report.errors.find(e => e.includes(name + ".")) ?? "")
+        console.log(`  ${name}: rejected by TypeScript (${report.errors.find(e => e.includes(name + "."))?.slice(0, 160)})`)
+        if (where) console.log(`    ${readFileSync(join(directory, where[1]), "utf8").split("\n")[Number(where[2]) - 1]?.trim().slice(0, 200)}`)
+      }
+      rmSync(join(directory, `${name}.ts`), { force: true })
+      rmSync(join(directory, `${name}.law.ts`), { force: true })
+      const at = cases.findIndex(c => c.program.name === name)
+      if (at >= 0) {
+        cases.splice(at, 1)
+        tally.typeErrors++
+      }
+    }
+  }
+  if (report.errors.length) throw new Error(`Pudding still reports errors for ${directory}:\n${report.errors.join("\n")}`)
+  return report
+}
 
 async function runBatch(batch, first) {
   const directory = join(workRoot, `seed-${seed}-batch-${batch}`)
@@ -537,35 +700,7 @@ async function runBatch(batch, first) {
     writeFileSync(join(directory, `${program.name}.law.ts`), `import { domain, expect, law } from "pudding"\nimport { ${program.name} } from "./${program.name}.ts"\n\n${laws.join("\n")}`)
     cases.push({ program, truth, throws: truth.some(entry => entry.fails) })
   }
-  let report
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const args = [process.env.PUDDING_CLI ?? join(root, "dist", "cli.js"), "--cwd", directory, "--no-cache", "--reporter", "json", ...(options["cross-check"] ? [] : ["--no-cross-check"])]
-    const result = spawnSync("node", args, { encoding: "utf8", env: { ...process.env, PUDDING_LEAN: lean }, maxBuffer: 1 << 28 })
-    try {
-      report = JSON.parse(result.stdout)
-    } catch {
-      throw new Error(`Pudding did not produce a report for ${directory}:\n${result.stdout.slice(0, 2000)}\n${result.stderr.slice(0, 2000)}`)
-    }
-    // A program TypeScript rejects is a generator slip. Drop it and try the rest again.
-    const rejected = new Set(report.errors.flatMap(error => [...error.matchAll(/\b(f\d+)\.(?:law\.)?ts/g)].map(match => match[1])))
-    if (!report.errors.length) break
-    if (!rejected.size) throw new Error(`Pudding reported errors that name no program:\n${report.errors.join("\n")}`)
-    for (const name of rejected) {
-      if (!options.quiet) {
-        const where = /\b(f\d+\.(?:law\.)?ts):(\d+):/.exec(report.errors.find(e => e.includes(name + ".")) ?? "")
-        if (where) console.log(`    ${readFileSync(join(directory, where[1]), "utf8").split("\n")[Number(where[2]) - 1]?.trim().slice(0, 200)}`)
-      }
-      rmSync(join(directory, `${name}.ts`), { force: true })
-      rmSync(join(directory, `${name}.law.ts`), { force: true })
-      const at = cases.findIndex(c => c.program.name === name)
-      if (at >= 0) {
-        cases.splice(at, 1)
-        tally.typeErrors++
-        if (!options.quiet) console.log(`  ${name}: rejected by TypeScript (${report.errors.find(e => e.includes(name + "."))?.slice(0, 160)})`)
-      }
-    }
-  }
-  if (report.errors.length) throw new Error(`Pudding still reports errors for ${directory}:\n${report.errors.join("\n")}`)
+  const report = runPudding(directory, cases)
   for (const { program, truth, throws } of cases) {
     tally.programs++
     const entry = kind => report.laws.find(law => law.name === `${kind} ${program.name}`)
@@ -602,13 +737,20 @@ async function runBatch(batch, first) {
 
 const started = performance.now()
 for (let batch = 0, first = 0; first < total; batch++, first += batchSize) {
-  await runBatch(batch, first)
+  await (options.unbounded ? runUnboundedBatch(batch, first) : runBatch(batch, first))
   if (!options.quiet) console.log(`batch ${batch}: ${JSON.stringify(tally)}`)
 }
 console.log(`\nseed ${seed}: ${tally.programs} programs in ${((performance.now() - started) / 1000).toFixed(1)} s`)
-console.log(`  proved as expected      ${tally.proved}`)
-console.log(`  refused as unsupported  ${tally.unsupported}`)
-console.log(`  throw for some input    ${tally.throwing}`)
+if (options.unbounded) {
+  console.log(`  mutants Node tells apart      ${tally.throwing}`)
+  console.log(`    refuted with an input       ${tally.proved}`)
+  console.log(`    not proved, or refused      ${tally.unsupported}`)
+  console.log(`  mutants Node cannot tell apart ${tally.equivalent}`)
+} else {
+  console.log(`  proved as expected      ${tally.proved}`)
+  console.log(`  refused as unsupported  ${tally.unsupported}`)
+  console.log(`  throw for some input    ${tally.throwing}`)
+}
 console.log(`  generator slips         ${tally.typeErrors}`)
 console.log(`  disagreements           ${tally.disagreements}`)
 console.log(`  WRONG PROOFS            ${tally.wrongProofs}`)
