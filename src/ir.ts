@@ -8,7 +8,7 @@ export type Scalar = boolean | bigint | string
 export type Op =
   | "not" | "and" | "or" | "eq" | "lt" | "le"
   | "add" | "sub" | "mul" | "neg" | "div" | "mod"
-  | "concat" | "ite"
+  | "concat" | "str" | "ite"
 
 export type Expr =
   | { readonly t: "var"; readonly ty: Ty; readonly name: string }
@@ -180,6 +180,12 @@ export function concat(a: Expr, b: Expr): Expr {
   return parts.reduce((left, right) => op("concat", "str", left, right))
 }
 
+/** The decimal text of a bigint, as `String(n)` gives it. */
+export function toStr(a: Expr): Expr {
+  if (isLit(a)) return lit(String(a.value))
+  return op("str", "str", a)
+}
+
 export function ite(c: Expr, a: Expr, b: Expr): Expr {
   if (isLit(c)) return c.value ? a : b
   if (same(a, b)) return a
@@ -207,6 +213,7 @@ function rebuild(o: Op, args: Expr[]): Expr {
     case "div": return div(a, b)
     case "mod": return mod(a, b)
     case "concat": return concat(a, b)
+    case "str": return toStr(a)
     case "ite": return ite(a, b, c)
   }
 }
@@ -286,6 +293,7 @@ export function evaluate(e: Expr, env: ReadonlyMap<string, Scalar>): Scalar {
       return e.op === "div" ? (arg(0) as bigint) / divisor : (arg(0) as bigint) % divisor
     }
     case "concat": return (arg(0) as string) + (arg(1) as string)
+    case "str": return String(arg(0))
     case "ite": return arg(0) ? arg(1) : arg(2)
   }
 }

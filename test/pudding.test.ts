@@ -24,11 +24,7 @@ describe("the suite project", () => {
 
   test("every law lands in the status its name announces", () => {
     assert.ok(report.laws.length >= 25)
-    for (const entry of report.laws) {
-      const expected = /^(FALSE|VACUOUS|UNPROVED)/.test(entry.name) ? "failed"
-        : entry.name.startsWith("SAMPLED") ? "sampled" : entry.name.startsWith("CHECKED") ? "checked" : "proved"
-      assert.equal(entry.status, expected, `${entry.name}: ${JSON.stringify(entry.findings)}`)
-    }
+    for (const entry of report.laws) assert.equal(entry.status, announced(entry.name), `${entry.name}: ${JSON.stringify(entry.findings)}`)
   })
 
   test("a false law comes with a concrete counterexample and both sides", () => {
@@ -69,13 +65,57 @@ describe("the suite project", () => {
 
   test("code outside the supported subset is executed instead and says so", () => {
     const sampled = law(report, "SAMPLED: the total of a pair is their sum")
-    assert.match(sampled.notes[0] ?? "", /not proved: only `const` declarations are supported \(fallback\.ts:2:3\)/)
+    assert.match(sampled.notes[0] ?? "", /not proved: this kind of loop is not supported.*\(fallback\.ts:3:3\)/)
     assert.equal(law(report, "FALSE when executed: totals ignore the first amount").findings[0]?.kind, "counterexample")
   })
 
   test("strict mode refuses laws that were only executed", async () => {
     const strict = await run({ cwd: join(fixtures, "suite"), cache: false, strict: true })
     assert.equal(law(strict, "CHECKED: initials are one character").status, "failed")
+  })
+})
+
+/** The status a law's name announces: FALSE, VACUOUS and UNPROVED fail; SAMPLED and CHECKED fall back; the rest are proved. */
+function announced(name: string) {
+  const own = name.split(" > ").at(-1)!
+  return /^(FALSE|VACUOUS|UNPROVED)/.test(own) ? "failed" : own.startsWith("SAMPLED") ? "sampled" : own.startsWith("CHECKED") ? "checked" : "proved"
+}
+
+describe("imperative code", () => {
+  let report: Report
+  before(async () => {
+    report = await run({ cwd: join(fixtures, "language"), cache: false })
+  })
+
+  test("loops, reassignment, reduce and bigint text are proved or refuted as announced", () => {
+    assert.deepEqual(report.errors, [])
+    assert.ok(report.laws.length >= 30)
+    for (const entry of report.laws) assert.equal(entry.status, announced(entry.name), `${entry.name}: ${JSON.stringify(entry.findings)}`)
+  })
+
+  test("the translated model never disagrees with the running code", () => {
+    assert.deepEqual(report.laws.flatMap(entry => entry.findings).filter(f => f.kind === "mismatch"), [])
+    assert.deepEqual(report.laws.flatMap(entry => entry.notes).filter(note => note.includes("not compared")), [])
+  })
+
+  test("a refuted loop comes with the inputs that break it", () => {
+    const [finding] = law(report, "loops > FALSE: break keeps looking after the first match").findings
+    assert.deepEqual(finding?.inputs, { a: "-1n", b: "-2n" })
+  })
+
+  test("expectations inside a helper are reported where they are written", () => {
+    const findings = law(report, "helpers that assert > FALSE: the helper's bounds are too tight").findings
+    assert.deepEqual(findings.map(f => f.line), [111, 112])
+  })
+
+  test("what cannot be modeled exactly is refused by name", () => {
+    const note = (name: string) => law(report, name).notes[0] ?? ""
+    assert.match(note("SAMPLED: a closure that writes an outer variable"), /uses `count`, a variable that is reassigned outside it/)
+    assert.match(note("CHECKED: a closure that reads a reassigned variable"), /uses `value`, a variable that is reassigned outside it/)
+    assert.match(note("SAMPLED: mutating an object in place"), /changing an object or array in place is not modeled/)
+    assert.match(note("SAMPLED: mutating an array in place"), /changing an object or array in place is not modeled/)
+    assert.match(note("SAMPLED: assignment used as a value"), /assignment used as a value/)
+    assert.match(note("CHECKED: a while loop"), /this kind of loop is not supported/)
   })
 })
 
@@ -197,6 +237,12 @@ describe("the Lean encoding", () => {
       ...agreement(ir.ite(ir.le(vx, vy), ir.add(vx, vy), vx), [x, y]),
     ]
     const outcomes = await prove(lean, FAST_HEADER, statements)
+    assert.deepEqual(outcomes.filter(o => !o.ok).map(o => o.message.slice(0, 300)), [])
+  })
+
+  test("prints a bigint as JavaScript does", async () => {
+    const wide: ir.Binder = { ...x, domain: [...values, 10n ** 30n, -(10n ** 30n) - 1n] }
+    const outcomes = await prove(lean, FAST_HEADER, agreement(ir.concat(ir.toStr(vx), ir.lit("!")), [wide]))
     assert.deepEqual(outcomes.filter(o => !o.ok).map(o => o.message.slice(0, 300)), [])
   })
 

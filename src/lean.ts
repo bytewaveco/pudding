@@ -76,6 +76,7 @@ function print(e: Expr, memo: Map<Expr, string>): string {
     case "mul": text = `(${a} * ${b})`; break
     case "neg": text = `(-${a})`; break
     case "concat": text = `(${a} ++ ${b})`; break
+    case "str": text = `(toString ${a})`; break
     case "ite": text = `(if ${a} then ${b} else ${c})`; break
     case "div":
     case "mod": {

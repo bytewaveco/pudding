@@ -65,7 +65,10 @@ type Value =
   | { k: "array"; items: Value[] }
   | { k: "closure"; node: N; env: Env }
   | { k: "choice"; cond: Expr; a: Value; b: Value }
+  /** The result of a path that throws. It never reaches a caller, so it merges away. */
   | { k: "bottom" }
+  /** `undefined`, as returned by a function that returns nothing. */
+  | { k: "void" }
 
 type Shape =
   | { k: "scalar"; ty: Ty; values?: Scalar[] }
@@ -73,24 +76,53 @@ type Shape =
   | { k: "tuple"; items: Shape[] }
   | { k: "union"; alts: Shape[] }
 
+/** A variable. Only variables that are reassigned somewhere are `mutable`. */
+interface Cell {
+  value: Value
+  readonly mutable: boolean
+}
+
 class Env {
-  private readonly vars = new Map<string, Value>()
+  private readonly vars = new Map<string, Cell>()
   private readonly parent: Env | undefined
   constructor(parent?: Env) {
     this.parent = parent
   }
-  get(name: string): Value | undefined {
-    return this.vars.get(name) ?? this.parent?.get(name)
+  cell(name: string): Cell | undefined {
+    return this.vars.get(name) ?? this.parent?.cell(name)
   }
-  set(name: string, value: Value) {
-    this.vars.set(name, value)
+  get(name: string): Value | undefined {
+    return this.cell(name)?.value
+  }
+  set(name: string, value: Value, mutable = false): Cell {
+    const cell = { value, mutable }
+    this.vars.set(name, cell)
+    return cell
   }
   child() {
     return new Env(this)
   }
+  /** Names of the reassignable variables visible from here. */
+  mutableNames(into = new Set<string>()): Set<string> {
+    for (const [name, cell] of this.vars) if (cell.mutable) into.add(name)
+    return this.parent ? this.parent.mutableNames(into) : into
+  }
+}
+
+/** Where control goes when a statement list ends, breaks out of, or continues a loop. */
+interface Flow {
+  next: () => Value
+  brk?: () => Value
+  cont?: () => Value
 }
 
 const BOTTOM: Value = { k: "bottom" }
+const VOID: Value = { k: "void" }
+const MAX_STEPS = 200_000
+const COMPOUND = new Map<number, number>([
+  [K.PlusEqualsToken, K.PlusToken], [K.MinusEqualsToken, K.MinusToken], [K.AsteriskEqualsToken, K.AsteriskToken],
+  [K.SlashEqualsToken, K.SlashToken], [K.PercentEqualsToken, K.PercentToken],
+])
 const scalar = (e: Expr): Value => ({ k: "scalar", e })
 const MAX_ALTERNATIVES = 64
 const MODULE_DECLARATIONS = new Set<number>([
@@ -119,6 +151,7 @@ function describe(value: Value): string {
     case "closure": return "a function"
     case "choice": return "a value that depends on a condition"
     case "bottom": return "a thrown error"
+    case "void": return "nothing"
   }
 }
 
@@ -132,6 +165,12 @@ export class Translator {
   private readonly mutationChecked = new Set<string>()
   private stack: N[] = []
   private pc: Expr[] = []
+  /** Every reassignable variable that is live, so their values can be saved and merged around branches. */
+  private cells: Cell[] = []
+  /** For each function being evaluated, the names it assigns to anywhere in its body. */
+  private assigned: Set<string>[] = []
+  private steps = 0
+  private readonly facts = new Map<Node, { assigned: Set<string>; mentioned: Set<string>; returnsValue: boolean }>()
   private instance: LawInstance | undefined
   private names = { law: new Set<string>(), domain: new Set<string>(), expect: new Set<string>(), describe: new Set<string>() }
 
@@ -297,19 +336,25 @@ export class Translator {
         this.instance = instance
         this.pc = []
         this.stack = []
+        this.cells = []
+        this.steps = 0
+        this.assigned = [this.factsOf(callback).assigned]
         const env = scope ? scope.child() : new Env()
-        if (instance.arg) this.bind(callback.parameters[0].name, this.valueOf(instance.arg), env, true)
+        if (instance.arg) this.bind(callback.parameters[0].name, this.valueOf(instance.arg), env, true, true)
         const body = callback.body
-        if (body.kind === K.Block) this.execLaw(body.statements, 0, env, () => {})
-        else this.expectStatement(body, env)
+        if (body.kind === K.Block) this.exec(body.statements, 0, env, { next: () => VOID })
+        else this.effect(body, env)
       }
-      if (law.expectSites.size === 0) return invalid("the law contains no expect() assertion", callback)
+      const asserts = law.expectSites.size > 0 || law.instances.some(instance => instance.obligations.some(o => o.kind === "expect"))
+      if (!asserts) return invalid("the law contains no expect() assertion", callback)
     } catch (error) {
       if (!(error instanceof Unsupported)) throw error
       law.problem = { kind: "unsupported", message: error.message, ...locate(error.node ?? call) }
       for (const instance of law.instances) instance.obligations = []
     } finally {
       this.instance = undefined
+      this.assigned = []
+      this.cells = []
     }
     return law
   }
@@ -421,47 +466,19 @@ export class Translator {
 
   // ------------------------------------------------------------- law bodies
 
-  private execLaw(statements: readonly N[], i: number, env: Env, next: () => void): void {
-    if (i >= statements.length) return next()
-    const statement = statements[i]
-    const rest = () => this.execLaw(statements, i + 1, env, next)
-    switch (statement.kind) {
-      case K.EmptyStatement: return rest()
-      case K.VariableStatement:
-        this.declare(statement, env)
-        return rest()
-      case K.FunctionDeclaration:
-        env.set(statement.name.text, { k: "closure", node: statement, env })
-        return rest()
-      case K.ExpressionStatement:
-        this.expectStatement(statement.expression, env)
-        return rest()
-      case K.ReturnStatement:
-        if (statement.expression) throw new Unsupported("a law callback cannot return a value", statement)
-        return
-      case K.Block:
-        return this.execLaw(statement.statements, 0, env.child(), rest)
-      case K.IfStatement: {
-        const cond = this.bool(statement.expression, env)
-        const run = (branch: N | undefined, after: () => void) =>
-          branch ? this.execLaw(branch.kind === K.Block ? branch.statements : [branch], 0, env.child(), after) : after()
-        const exits = containsReturn(statement.thenStatement) || containsReturn(statement.elseStatement)
-        const after = exits ? rest : () => {}
-        if (cond.t === "lit") run(cond.value ? statement.thenStatement : statement.elseStatement, after)
-        else {
-          this.under(cond, () => run(statement.thenStatement, after))
-          this.under(ir.not(cond), () => run(statement.elseStatement, after))
-        }
-        if (!exits) rest()
-        return
-      }
-      default:
-        throw new Unsupported("this statement is not supported in a law", statement)
+  /** Whether a call is rooted in `expect(...)`, however the chain after it is written. */
+  private startsWithExpect(node: N): boolean {
+    let current = node
+    while (current) {
+      if (this.isCallTo(current, this.names.expect)) return true
+      if (current.kind === K.CallExpression || current.kind === K.PropertyAccessExpression) current = current.expression
+      else return false
     }
+    return false
   }
 
   private expectStatement(node: N, env: Env) {
-    const fail = () => new Unsupported("a statement in a law must be expect(actual).toEqual(expected), .toBe(expected), or the .not form of either", node)
+    const fail = () => new Unsupported("an assertion must be expect(actual).toEqual(expected), .toBe(expected), or the .not form of either", node)
     if (node.kind !== K.CallExpression || node.expression.kind !== K.PropertyAccessExpression || node.arguments.length !== 1) throw fail()
     const matcher = node.expression.name.text as string
     if (matcher !== "toEqual" && matcher !== "toBe") throw fail()
@@ -520,11 +537,50 @@ export class Translator {
     }
   }
 
+  private save(): Value[] {
+    return this.cells.map(cell => cell.value)
+  }
+
+  /** Put variables back to a saved state, forgetting any declared since. */
+  private restore(saved: Value[]) {
+    this.cells.length = saved.length
+    this.cells.forEach((cell, i) => (cell.value = saved[i]!))
+  }
+
+  /**
+   * Evaluate both sides of a condition and merge their results. Each side
+   * starts from the same variable state. The state afterwards is the state
+   * before: an expression cannot assign, and a statement branch evaluated
+   * this way has already run to the end of its function on both sides.
+   */
   private branch(cond: Expr, whenTrue: () => Value, whenFalse: () => Value): Value {
     if (cond.t === "lit") return cond.value ? whenTrue() : whenFalse()
+    const before = this.save()
     const a = this.under(cond, whenTrue)
+    this.restore(before)
     const b = this.under(ir.not(cond), whenFalse)
+    this.restore(before)
     return this.merge(cond, a, b)
+  }
+
+  /**
+   * Run two branches that both continue past the condition, then make every
+   * variable hold the value of whichever branch was taken. The code after
+   * the condition is then evaluated once, not once per branch.
+   */
+  private mergeStates(cond: Expr, whenTrue: () => void, whenFalse: () => void) {
+    const before = this.save()
+    this.under(cond, whenTrue)
+    const afterTrue = this.save()
+    this.restore(before)
+    this.under(ir.not(cond), whenFalse)
+    const afterFalse = this.save()
+    this.restore(before)
+    this.cells.forEach((cell, i) => {
+      const a = afterTrue[i]!
+      const b = afterFalse[i]!
+      cell.value = a === b ? a : this.merge(cond, a, b)
+    })
   }
 
   private merge(cond: Expr, a: Value, b: Value): Value {
@@ -538,6 +594,7 @@ export class Translator {
       return { k: "record", fields: new Map([...a.fields].map(([key, field]) => [key, this.merge(cond, field, b.fields.get(key)!)])) }
     }
     if (a.k === "closure" && b.k === "closure" && a.node === b.node && a.env === b.env) return a
+    if (a.k === "void" && b.k === "void") return a
     return { k: "choice", cond, a, b }
   }
 
@@ -549,18 +606,48 @@ export class Translator {
 
   // ------------------------------------------------------------- functions
 
+  /** What a function's body does that affects how it is evaluated, computed once per function. */
+  private factsOf(fn: N) {
+    let facts = this.facts.get(fn)
+    if (facts) return facts
+    facts = { assigned: new Set<string>(), mentioned: new Set<string>(), returnsValue: false }
+    const isFunction = (node: N) => node.kind === K.ArrowFunction || node.kind === K.FunctionExpression || node.kind === K.FunctionDeclaration
+    const visit = (node: N, nested: boolean) => {
+      if (node.kind === K.Identifier) facts!.mentioned.add(node.text)
+      if (node.kind === K.BinaryExpression && node.operatorToken.kind >= K.FirstAssignment && node.operatorToken.kind <= K.LastAssignment) {
+        collectNames(node.left, facts!.assigned)
+      }
+      if ((node.kind === K.PrefixUnaryExpression || node.kind === K.PostfixUnaryExpression) &&
+        (node.operator === K.PlusPlusToken || node.operator === K.MinusMinusToken)) collectNames(node.operand, facts!.assigned)
+      if (node.kind === K.ReturnStatement && node.expression && !nested) facts!.returnsValue = true
+      node.forEachChild((child: N) => visit(child, nested || isFunction(child)))
+    }
+    for (const parameter of fn.parameters as N[]) visit(parameter, false)
+    if (fn.body) visit(fn.body, false)
+    this.facts.set(fn, facts)
+    return facts
+  }
+
   private declare(statement: N, env: Env) {
-    const list = statement.declarationList
-    if (!(list.flags & NodeFlags.Const)) throw new Unsupported("only `const` declarations are supported", statement)
+    const list = statement.declarationList ?? statement
+    const reassignable = (list.flags & NodeFlags.Let) !== 0
+    if (!reassignable && !(list.flags & NodeFlags.Const)) throw new Unsupported("`var` is not supported; use `const` or `let`", statement)
     for (const declaration of list.declarations as N[]) {
-      if (!declaration.initializer) throw new Unsupported("a declaration needs an initializer", declaration)
-      this.bind(declaration.name, this.evalExpr(declaration.initializer, env), env)
+      if (!declaration.initializer && !reassignable) throw new Unsupported("a declaration needs an initializer", declaration)
+      // A `let` without an initializer holds nothing until it is assigned; TypeScript rejects reading it before then.
+      this.bind(declaration.name, declaration.initializer ? this.evalExpr(declaration.initializer, env) : BOTTOM, env, false, reassignable)
     }
   }
 
-  private bind(pattern: N, value: Value, env: Env, label = false) {
+  /**
+   * Bind the names of a pattern. A name becomes a reassignable variable only
+   * if the enclosing function assigns to it somewhere; everything else stays
+   * an immutable binding, which keeps closures over it exact.
+   */
+  private bind(pattern: N, value: Value, env: Env, label = false, reassignable = false) {
     if (pattern.kind === K.Identifier) {
-      env.set(pattern.text, value)
+      const cell = env.set(pattern.text, value, reassignable && this.assigned.at(-1)?.has(pattern.text) === true)
+      if (cell.mutable) this.cells.push(cell)
       if (label) this.relabel(value, pattern.text)
       return
     }
@@ -571,7 +658,7 @@ export class Translator {
         if (element.dotDotDotToken || element.initializer) throw new Unsupported("rest elements and defaults are not supported in destructuring", element)
         const item = value.items[i]
         if (!item) throw new Unsupported("destructuring reads past the end of the array", element)
-        this.bind(element.name, item, env, label)
+        this.bind(element.name, item, env, label, reassignable)
       })
       return
     }
@@ -583,7 +670,7 @@ export class Translator {
         if (key.kind !== K.Identifier && key.kind !== K.StringLiteral) throw new Unsupported("computed property names are not supported", element)
         const field = value.fields.get(key.text)
         if (!field) throw new Unsupported(`property \`${key.text}\` does not exist on this object`, element)
-        this.bind(element.name, field, env, label)
+        this.bind(element.name, field, env, label, reassignable)
       }
       return
     }
@@ -597,34 +684,59 @@ export class Translator {
     if (this.stack.includes(node)) throw new Unsupported("recursive functions are not supported", at)
     if (node.asteriskToken || node.modifiers?.some((m: N) => m.kind === K.AsyncKeyword)) throw new Unsupported("async functions and generators are not supported", at)
     if (!node.body) throw new Unsupported("this function has no body to translate", at)
+    const facts = this.factsOf(node)
+    // A function that reads or writes a variable someone reassigns would need
+    // that variable's value at the moment of the call, on every path. That is
+    // not tracked, so such closures are refused.
+    for (const name of fn.env.mutableNames()) {
+      if (facts.mentioned.has(name)) throw new Unsupported(`this function uses \`${name}\`, a variable that is reassigned outside it; that is not modeled`, at)
+    }
     const env = fn.env.child()
-    ;(node.parameters as N[]).forEach((parameter, i) => {
-      if (parameter.dotDotDotToken) throw new Unsupported("rest parameters are not supported", parameter)
-      let value = args[i]
-      if (!value) {
-        if (!parameter.initializer) throw new Unsupported("a call must pass every parameter that has no default", at)
-        value = this.evalExpr(parameter.initializer, env)
-      }
-      this.bind(parameter.name, value, env)
-    })
+    const live = this.cells.length
     this.stack.push(node)
+    this.assigned.push(facts.assigned)
     try {
+      ;(node.parameters as N[]).forEach((parameter, i) => {
+        if (parameter.dotDotDotToken) throw new Unsupported("rest parameters are not supported", parameter)
+        let value = args[i]
+        if (!value) {
+          if (!parameter.initializer) throw new Unsupported("a call must pass every parameter that has no default", at)
+          value = this.evalExpr(parameter.initializer, env)
+        }
+        this.bind(parameter.name, value, env, false, true)
+      })
       if (node.body.kind !== K.Block) return this.evalExpr(node.body, env)
-      // Reaching the end of the body returns undefined, which is not modeled.
-      // Like a throw, it is allowed only where it is proved unreachable.
-      return this.exec(node.body.statements, 0, env, () => {
-        this.emit("falloff", ir.FALSE, node)
-        return BOTTOM
+      // Reaching the end of a function that returns values elsewhere yields
+      // undefined where a value is expected. Like a throw, that is allowed
+      // only where it is proved unreachable.
+      return this.exec(node.body.statements, 0, env, {
+        next: () => {
+          if (!facts.returnsValue) return VOID
+          this.emit("falloff", ir.FALSE, node)
+          return BOTTOM
+        },
       })
     } finally {
       this.stack.pop()
+      this.assigned.pop()
+      this.cells.length = live
     }
   }
 
-  private exec(statements: readonly N[], i: number, env: Env, next: () => Value): Value {
-    if (i >= statements.length) return next()
+  /**
+   * Evaluate statements from index `i`. `flow.next` continues after the list.
+   * A branch that can leave early is evaluated together with everything that
+   * follows it; a branch that cannot is evaluated alone and its variables are
+   * merged, so straight-line code costs one pass.
+   */
+  private exec(statements: readonly N[], i: number, env: Env, flow: Flow): Value {
+    if (i >= statements.length) return flow.next()
     const statement = statements[i]
-    const rest = () => this.exec(statements, i + 1, env, next)
+    if (++this.steps > MAX_STEPS) throw new Unsupported("this code has too many paths to follow", statement)
+    const rest = () => this.exec(statements, i + 1, env, flow)
+    const after: Flow = { ...flow, next: rest }
+    const run = (block: N | undefined, to: Flow): Value =>
+      block ? this.exec(block.kind === K.Block ? block.statements : [block], 0, env.child(), to) : to.next()
     switch (statement.kind) {
       case K.EmptyStatement: return rest()
       case K.VariableStatement:
@@ -633,32 +745,38 @@ export class Translator {
       case K.FunctionDeclaration:
         env.set(statement.name.text, { k: "closure", node: statement, env })
         return rest()
+      case K.ExpressionStatement:
+        this.effect(statement.expression, env)
+        return rest()
       case K.ReturnStatement:
-        if (!statement.expression) throw new Unsupported("returning without a value is not supported", statement)
-        return this.evalExpr(statement.expression, env)
+        return statement.expression ? this.evalExpr(statement.expression, env) : VOID
       case K.ThrowStatement:
         this.emit("unreachable", ir.FALSE, statement)
         return BOTTOM
+      case K.BreakStatement:
+      case K.ContinueStatement: {
+        const target = statement.kind === K.BreakStatement ? flow.brk : flow.cont
+        if (statement.label || !target) throw new Unsupported("this break or continue is not supported", statement)
+        return target()
+      }
       case K.Block:
-        return this.exec(statement.statements, 0, env.child(), rest)
+        return run(statement, after)
       case K.IfStatement: {
-        const run = (branch: N | undefined) => () =>
-          branch ? this.exec(branch.kind === K.Block ? branch.statements : [branch], 0, env.child(), rest) : rest()
-        return this.branch(this.bool(statement.expression, env), run(statement.thenStatement), run(statement.elseStatement))
+        const cond = this.bool(statement.expression, env)
+        if (cond.t === "lit") return run(cond.value ? statement.thenStatement : statement.elseStatement, after)
+        if (canExit(statement.thenStatement) || canExit(statement.elseStatement)) {
+          return this.branch(cond, () => run(statement.thenStatement, after), () => run(statement.elseStatement, after))
+        }
+        const stop: Flow = { next: () => VOID }
+        this.mergeStates(cond, () => run(statement.thenStatement, stop), () => run(statement.elseStatement, stop))
+        return rest()
       }
       case K.SwitchStatement: {
         const subject = this.scalarOf(this.evalExpr(statement.expression, env), statement.expression)
         const clauses = statement.caseBlock.clauses as N[]
-        const bodyFrom = (start: number) => {
-          const body: N[] = []
-          for (const clause of clauses.slice(start)) {
-            for (const inner of clause.statements as N[]) {
-              if (inner.kind === K.BreakStatement) return this.exec(body, 0, env.child(), rest)
-              body.push(inner)
-            }
-          }
-          return this.exec(body, 0, env.child(), rest)
-        }
+        // Entering at a clause runs it and every clause below it until a break.
+        const bodyFrom = (start: number) =>
+          this.exec(clauses.slice(start).flatMap(clause => clause.statements as N[]), 0, env.child(), { ...flow, next: rest, brk: rest })
         const from = (index: number): Value => {
           const clause = clauses[index]
           if (!clause) return rest()
@@ -672,9 +790,79 @@ export class Translator {
         }
         return from(0)
       }
+      case K.ForOfStatement: {
+        const declarations = statement.initializer
+        const declared = declarations.kind === K.VariableDeclarationList ? (declarations.declarations as N[]) : []
+        const reassignable = (declarations.flags & NodeFlags.Let) !== 0
+        if (statement.awaitModifier || declared.length !== 1 || declared[0].initializer || (!reassignable && !(declarations.flags & NodeFlags.Const))) {
+          throw new Unsupported("a loop must be written `for (const item of items)`", statement)
+        }
+        // The loop is unrolled, so the array must have a length known here.
+        return this.over(this.evalExpr(statement.expression, env), items => {
+          if (items.k === "bottom") return BOTTOM
+          if (items.k !== "array") throw new Unsupported(`a loop needs an array whose length is known here, but this is ${describe(items)}`, statement.expression)
+          const iterate = (index: number): Value => {
+            const item = items.items[index]
+            if (!item) return rest()
+            const scope = env.child()
+            this.bind(declared[0].name, item, scope, false, reassignable)
+            const onward = () => iterate(index + 1)
+            const body = statement.statement
+            return this.exec(body.kind === K.Block ? body.statements : [body], 0, scope, { next: onward, cont: onward, brk: rest })
+          }
+          return iterate(0)
+        })
+      }
+      case K.WhileStatement:
+      case K.DoStatement:
+      case K.ForStatement:
+      case K.ForInStatement:
+        throw new Unsupported("this kind of loop is not supported; only `for (const item of items)` over an array of known length is", statement)
+      case K.TryStatement:
+        throw new Unsupported("try, catch and finally are not supported", statement)
       default:
-        throw new Unsupported("this statement is not supported in a function", statement)
+        throw new Unsupported("this statement is not supported", statement)
     }
+  }
+
+  /** A statement that is an expression: an assignment, an assertion, or a call made for the assertions inside it. */
+  private effect(node: N, env: Env): void {
+    if (node.kind === K.ParenthesizedExpression) return this.effect(node.expression, env)
+    if (node.kind === K.BinaryExpression && node.operatorToken.kind >= K.FirstAssignment && node.operatorToken.kind <= K.LastAssignment) {
+      const operator = node.operatorToken.kind
+      const base = COMPOUND.get(operator)
+      if (operator !== K.EqualsToken && base === undefined) throw new Unsupported("this assignment operator is not supported", node)
+      const cell = this.assignable(node.left, env)
+      // The right-hand side is evaluated first; it cannot change the variable, because closures over it are refused.
+      const right = this.evalExpr(node.right, env)
+      cell.value = base === undefined ? right : this.arithmetic(base, cell.value, right, node)
+      return
+    }
+    if ((node.kind === K.PrefixUnaryExpression || node.kind === K.PostfixUnaryExpression) &&
+      (node.operator === K.PlusPlusToken || node.operator === K.MinusMinusToken)) {
+      const cell = this.assignable(node.operand, env)
+      const one = scalar(ir.lit(1n))
+      cell.value = this.arithmetic(node.operator === K.PlusPlusToken ? K.PlusToken : K.MinusToken, cell.value, one, node)
+      return
+    }
+    if (node.kind === K.CallExpression) {
+      if (this.startsWithExpect(node)) return this.expectStatement(node, env)
+      this.evalExpr(node, env)
+      return
+    }
+    throw new Unsupported("this statement does nothing that is modeled", node)
+  }
+
+  private assignable(target: N, env: Env): Cell {
+    if (target.kind === K.ParenthesizedExpression) return this.assignable(target.expression, env)
+    if (target.kind === K.PropertyAccessExpression || target.kind === K.ElementAccessExpression) {
+      throw new Unsupported("changing an object or array in place is not modeled, because two names can refer to the same object; build a new value instead", target)
+    }
+    if (target.kind !== K.Identifier) throw new Unsupported("this assignment target is not supported", target)
+    const cell = env.cell(target.text)
+    if (!cell) throw new Unsupported(`\`${target.text}\` is not a local variable, so assigning to it is not supported`, target)
+    if (!cell.mutable) throw new Unsupported(`\`${target.text}\` cannot be reassigned here`, target)
+    return cell
   }
 
   // ----------------------------------------------------------- expressions
@@ -728,8 +916,9 @@ export class Translator {
         let result = ir.lit(this.wellFormed(node.head.text, node))
         for (const span of node.templateSpans as N[]) {
           const part = this.evalExpr(span.expression, env)
-          if (part.k !== "scalar" || part.e.ty !== "str") throw new Unsupported(`only strings can be interpolated, but this is ${describe(part)}`, span.expression)
-          result = ir.concat(ir.concat(result, part.e), ir.lit(this.wellFormed(span.literal.text, span)))
+          if (part.k !== "scalar" || part.e.ty === "bool") throw new Unsupported(`only strings and bigints can be interpolated, but this is ${describe(part)}`, span.expression)
+          const text = part.e.ty === "int" ? ir.toStr(part.e) : part.e
+          result = ir.concat(ir.concat(result, text), ir.lit(this.wellFormed(span.literal.text, span)))
         }
         return scalar(result)
       }
@@ -797,11 +986,17 @@ export class Translator {
       return scalar(operator === K.EqualsEqualsEqualsToken ? equal : ir.not(equal))
     }
     if (operator === K.EqualsEqualsToken || operator === K.ExclamationEqualsToken) throw new Unsupported("use === and !==; loose equality is not modeled", node)
+    if (operator >= K.FirstAssignment && operator <= K.LastAssignment) throw new Unsupported("an assignment used as a value is not supported; write it as its own statement", node)
+    return this.arithmetic(operator, leftValue, rightValue, node)
+  }
+
+  /** `+ - * / %` and the comparisons, on values already evaluated. */
+  private arithmetic(operator: number, leftValue: Value, rightValue: Value, node: N): Value {
     if (operator === K.PlusToken && leftValue.k === "scalar" && rightValue.k === "scalar" && leftValue.e.ty === "str" && rightValue.e.ty === "str") {
       return scalar(ir.concat(leftValue.e, rightValue.e))
     }
-    const left = this.scalarOf(leftValue, node.left, "int")
-    const right = this.scalarOf(rightValue, node.right, "int")
+    const left = this.scalarOf(leftValue, node.left ?? node, "int")
+    const right = this.scalarOf(rightValue, node.right ?? node, "int")
     switch (operator) {
       case K.PlusToken: return scalar(ir.add(left, right))
       case K.MinusToken: return scalar(ir.sub(left, right))
@@ -857,10 +1052,14 @@ export class Translator {
       if (argument.kind === K.SpreadElement) throw new Unsupported("spread arguments are not supported", argument)
       return this.evalExpr(argument, env)
     })
+    if (callee.kind === K.Identifier && callee.text === "String" && !env.get("String") && node.arguments.length === 1 && this.isBuiltin(callee)) {
+      return this.text(args()[0]!, node)
+    }
     if (callee.kind === K.PropertyAccessExpression && !this.isNamespace(callee.expression, env)) {
       const method = callee.name.text as string
       return this.over(this.evalExpr(callee.expression, env), receiver => {
         if (receiver.k === "bottom") return BOTTOM
+        if (receiver.k === "scalar" && method === "toString" && node.arguments.length === 0) return this.text(receiver, node)
         if (receiver.k === "array") return this.arrayMethod(receiver.items, method, args(), node)
         if (receiver.k === "record" && receiver.fields.has(method)) return this.call(receiver.fields.get(method)!, args(), node)
         throw new Unsupported(`calling \`.${method}\` on ${describe(receiver)} is not supported`, node)
@@ -869,10 +1068,32 @@ export class Translator {
     return this.call(this.evalExpr(callee, env), args(), node)
   }
 
+  /** `String(x)` and `x.toString()` for the scalars whose text Lean and JavaScript agree on. */
+  private text(value: Value, at: N): Value {
+    if (value.k === "scalar" && value.e.ty === "str") return value
+    if (value.k === "scalar" && value.e.ty === "int") return scalar(ir.toStr(value.e))
+    throw new Unsupported(`converting ${describe(value)} to a string is not supported`, at)
+  }
+
+  /** Whether an identifier refers to a global from TypeScript's own library files. */
+  private isBuiltin(node: N): boolean {
+    const declaration = this.checker.getSymbolAtLocation(node)?.declarations[0]?.resolve()
+    return !!declaration && this.program.isSourceFileDefaultLibrary(declaration.getSourceFile())
+  }
+
   private arrayMethod(items: Value[], method: string, args: Value[], node: N): Value {
-    const [first] = args
-    if (!first || args.length !== 1) throw new Unsupported(`\`.${method}\` is supported with exactly one argument`, node)
+    const [first, second] = args
+    const expected = method === "reduce" ? 2 : 1
+    if (!first || args.length !== expected) {
+      throw new Unsupported(method === "reduce" ? "`.reduce` is supported with a callback and an initial value" : `\`.${method}\` is supported with exactly one argument`, node)
+    }
+    // Callbacks also receive an index, which is a number and so not modeled.
+    if (method !== "includes" && first.k === "closure" && first.node.parameters.length > expected) {
+      throw new Unsupported("the index parameter of an array callback is not supported", node)
+    }
     switch (method) {
+      case "reduce":
+        return items.reduce((accumulator, item) => this.call(first, [accumulator, item], node), second!)
       case "includes": {
         const needle = this.scalarOf(first, node)
         return scalar(items.map(item => {
@@ -889,6 +1110,9 @@ export class Translator {
       case "map":
         return { k: "array", items: items.map(item => this.call(first, [item], node)) }
       default:
+        if (ARRAY_MUTATORS.has(method)) {
+          throw new Unsupported("changing an object or array in place is not modeled, because two names can refer to the same object; build a new value instead", node)
+        }
         throw new Unsupported(`the array method \`.${method}\` is not supported`, node)
     }
   }
@@ -970,9 +1194,16 @@ export class Translator {
   }
 }
 
-function containsReturn(node: N | undefined): boolean {
+/** Whether a statement can leave its enclosing block early: by returning, throwing, breaking or continuing. */
+function canExit(node: N | undefined): boolean {
   if (!node) return false
-  if (node.kind === K.ReturnStatement) return true
+  if (node.kind === K.ReturnStatement || node.kind === K.ThrowStatement || node.kind === K.BreakStatement || node.kind === K.ContinueStatement) return true
   if (node.kind === K.ArrowFunction || node.kind === K.FunctionExpression || node.kind === K.FunctionDeclaration) return false
-  return node.forEachChild((child: N) => containsReturn(child) || undefined) === true
+  return node.forEachChild((child: N) => canExit(child) || undefined) === true
+}
+
+/** The plain names an assignment target writes to. Property and element targets write to no name. */
+function collectNames(target: N, into: Set<string>) {
+  if (target.kind === K.Identifier) into.add(target.text)
+  else if (target.kind === K.ParenthesizedExpression) collectNames(target.expression, into)
 }

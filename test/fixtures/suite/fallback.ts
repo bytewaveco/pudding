@@ -1,6 +1,6 @@
 export function total(amounts: readonly bigint[]): bigint {
   let sum = 0n
-  for (const amount of amounts) sum += amount
+  for (let index = 0; index < amounts.length; index++) sum += amounts[index]!
   return sum
 }
 
