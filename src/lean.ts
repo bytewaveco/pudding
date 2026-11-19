@@ -34,6 +34,15 @@ const FINITE_TACTIC = "decide +kernel"
 /** Tried, under the fallback imports, on statements the default tactic could not close. */
 const FALLBACK_TACTIC = "first | grind | (intros; simp_all; done) | (intros; simp_all <;> omega)"
 const MAX_TERM_SIZE = 200_000
+/**
+ * The most text one expression may come to. A value fed back into itself in a
+ * loop multiplies in size with every round, and Lean's time grows with it:
+ * about five seconds at this size, and minutes a few rounds later.
+ */
+const MAX_TERM_TEXT = 120_000
+/** How long one Lean process may run: this much, plus a share for each theorem in its file. */
+const FILE_TIMEOUT_MS = 30_000
+const THEOREM_TIMEOUT_MS = 10_000
 const MAX_SPECIALIZATIONS = 512
 
 /**
@@ -138,7 +147,9 @@ function print(e: Expr, memo: Map<Expr, string>): string {
 
 function printExpr(e: Expr): string {
   if (ir.treeSize(e) > MAX_TERM_SIZE) throw new TooLarge("the translated expression is too large to check")
-  return print(e, new Map())
+  const text = print(e, new Map())
+  if (text.length > MAX_TERM_TEXT) throw new TooLarge("the translated expression is too large to check")
+  return text
 }
 
 function leanType(ty: ir.Ty): string {
@@ -247,12 +258,16 @@ interface LeanMessage {
   data: string
 }
 
-function runFile(lean: string, source: string, directory: string, name: string): Promise<LeanMessage[]> {
+/** Lean was stopped because it ran past its time limit. */
+class LeanTimeout extends Error {}
+
+function runFile(lean: string, source: string, directory: string, name: string, timeout: number): Promise<LeanMessage[]> {
   return new Promise((resolve, reject) => {
     const file = join(directory, name)
     writeFile(file, source).then(() => {
       // Lean stops reporting after 100 errors unless told otherwise, and a theorem it never reported on must not pass for proved.
-      execFile(lean, ["-DmaxErrors=0", "--json", file], { maxBuffer: 1 << 28 }, (error, stdout, stderr) => {
+      execFile(lean, ["-DmaxErrors=0", "--json", file], { maxBuffer: 1 << 28, timeout, killSignal: "SIGKILL" }, (error, stdout, stderr) => {
+        if (error?.killed) return reject(new LeanTimeout())
         if (error && typeof (error as NodeJS.ErrnoException).code === "string") {
           return reject(new Error(`could not run Lean at ${lean}: ${error.message}`))
         }
@@ -277,7 +292,7 @@ function runFile(lean: string, source: string, directory: string, name: string):
 /** The axioms of Lean's own logic. A proof that rests on anything else, `sorry` above all, is not a proof. */
 const ACCEPTED_AXIOMS = new Set(["propext", "Classical.choice", "Quot.sound"])
 
-async function runChunk(lean: string, header: string, statements: string[], directory: string, name: string, strict = false): Promise<LeanOutcome[]> {
+async function runChunk(lean: string, header: string, statements: string[], directory: string, name: string, strict: boolean, timeout: number): Promise<LeanOutcome[]> {
   // Each theorem is followed by a question about it: which axioms does it
   // rest on? A theorem counts as proved only when Lean reports no error for
   // it *and* answers that question acceptably. Silence is never taken for
@@ -294,7 +309,7 @@ async function runChunk(lean: string, header: string, statements: string[], dire
   // The file ends with a command that always answers, to show that Lean reached the end.
   const sentinel = lines.length + 1
   lines.push("#check Nat")
-  const messages = await runFile(lean, lines.join("\n") + "\n", directory, name)
+  const messages = await runFile(lean, lines.join("\n") + "\n", directory, name, timeout)
   if (!messages.some(message => message.severity === "information" && message.pos?.line === sentinel)) {
     throw new Error("Lean stopped before it had checked every theorem, so no result can be trusted")
   }
@@ -352,11 +367,26 @@ export async function prove(lean: string, header: string, statements: string[], 
       const size = Math.ceil(statements.length / workers)
       for (let i = 0; i < statements.length; i += size) chunks.push(statements.slice(i, i + size))
     }
+    // Lean bounds its tactics by work done, not by the clock, and reading a
+    // huge theorem is not bounded at all. A file that runs past its time is
+    // tried again one theorem at a time, so that only the slow one goes unproved.
+    const attempt = async (chunk: string[], file: string): Promise<LeanOutcome[]> => {
+      const timeout = FILE_TIMEOUT_MS + THEOREM_TIMEOUT_MS * chunk.length
+      try {
+        return await runChunk(lean, header, chunk, directory, file, alone, timeout)
+      } catch (error) {
+        if (!(error instanceof LeanTimeout)) throw error
+        if (chunk.length === 1) return [{ ok: false, message: `Lean did not finish within ${timeout / 1000} seconds` }]
+        const outcomes: LeanOutcome[] = []
+        for (const [n, statement] of chunk.entries()) outcomes.push(...await attempt([statement], `${file.replace(/\.lean$/, "")}_${n}.lean`))
+        return outcomes
+      }
+    }
     const results: LeanOutcome[][] = []
     // At most one process per core at a time.
     for (let i = 0; i < chunks.length; i += Math.max(1, processes)) {
       const wave = chunks.slice(i, i + Math.max(1, processes))
-      results.push(...await Promise.all(wave.map((chunk, n) => runChunk(lean, header, chunk, directory, `Proof${i + n}.lean`, alone))))
+      results.push(...await Promise.all(wave.map((chunk, n) => attempt(chunk, `Proof${i + n}.lean`))))
     }
     return results.flat()
   } finally {

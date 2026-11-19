@@ -440,6 +440,15 @@ test("Vitest runs a law file as tests that report the proofs", () => {
   assert.equal(result.status, 1)
 })
 
+test("a value that grows with every round of a loop is refused quickly, not handed to Lean", async () => {
+  // This once produced a 33 MB theorem that Lean spent minutes on.
+  const report = await run({ cwd: join(fixtures, "growth"), cache: false })
+  const entry = law(report, "settling never grows the value")
+  assert.equal(entry.status, "sampled")
+  assert.match(entry.notes.join("\n"), /too large to check/)
+  assert.ok(report.durationMs < 20_000, `took ${report.durationMs} ms`)
+})
+
 describe("proof scripts", () => {
   test("a script can only be a proof of its own theorem", async () => {
     const report = await run({ cwd: join(fixtures, "scripts"), cache: false })
