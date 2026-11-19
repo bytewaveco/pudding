@@ -76,11 +76,11 @@ describe("counted loops", () => {
     expect([a, b, c].length).toEqual(3)
   })
 
-  law("SAMPLED: a loop bounded by an input cannot be unrolled", domain<Integer<0, 100000>>(), limit => {
+  law("SAMPLED: a loop bounded by a large input cannot be unrolled", domain<Integer<0, 100000>>(), limit => {
     expect(sumTo(limit) >= limit).toBe(true)
   })
 
-  law("CHECKED: but a small enumerated bound still runs for real", domain<Integer<0, 20>>(), limit => {
+  law("a loop bounded by a small input is unrolled for each of its values", domain<Integer<0, 20>>(), limit => {
     expect(sumTo(limit) * 2).toEqual(limit * (limit + 1))
   })
 

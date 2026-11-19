@@ -27,6 +27,21 @@ export class Unsupported extends Error {
   }
 }
 
+/**
+ * Raised where the translation needs a plain value, such as the number of
+ * times a loop runs, and has an expression in the inputs instead. If one of
+ * those inputs has few values, the law is translated once per value.
+ */
+class NeedsValue extends Error {
+  readonly inputs: Set<string>
+  readonly refusal: Unsupported
+  constructor(inputs: Set<string>, refusal: Unsupported) {
+    super(refusal.message)
+    this.inputs = inputs
+    this.refusal = refusal
+  }
+}
+
 /** How to build the runtime argument of a law callback from its inputs. */
 export type ArgShape =
   | { k: "binder"; name: string }
@@ -37,6 +52,8 @@ export type ArgShape =
 export interface LawInstance {
   /** What is known about the inputs beyond their types, such as the bounds of an integer. */
   assumptions: Expr[]
+  /** Inputs this instance fixes to one value, because the translation had to know it. */
+  fixed: Map<string, Expr>
   binders: Binder[]
   arg: ArgShape | undefined
   obligations: Obligation[]
@@ -131,6 +148,7 @@ const isNumber = (value: Value) => value.k === "scalar" && value.num === true
 /** Integer inputs with at most this many values are enumerated instead of quantified. */
 const MAX_ENUMERATED_RANGE = 256n
 const MAX_ITERATIONS = 2_000
+const MAX_INSTANCES = 256
 const NUMBER_HELP = "`number` covers fractions, NaN and infinities, which are not modeled; use `Integer` from pudding for whole numbers, or bigint"
 const MAX_ALTERNATIVES = 64
 const MODULE_DECLARATIONS = new Set<number>([
@@ -335,12 +353,15 @@ export class Translator {
         alternatives = this.expand(this.shapeOf(type, typeNode), typeNode)
       }
       for (const alternative of alternatives) {
-        const instance: LawInstance = { assumptions: [], binders: [], arg: undefined, obligations: [] }
+        const instance: LawInstance = { assumptions: [], fixed: new Map(), binders: [], arg: undefined, obligations: [] }
         this.instance = instance
         if (hasDomain) instance.arg = this.instantiate(alternative, instance)
         law.instances.push(instance)
       }
-      for (const instance of law.instances) {
+      const waiting = law.instances
+      law.instances = []
+      while (waiting.length) {
+        const instance = waiting.shift()!
         this.instance = instance
         this.pc = [...instance.assumptions]
         this.stack = []
@@ -348,10 +369,27 @@ export class Translator {
         this.steps = 0
         this.assigned = [this.factsOf(callback).assigned]
         const env = scope ? scope.child() : new Env()
-        if (instance.arg) this.bind(callback.parameters[0].name, this.valueOf(instance.arg), env, true, true)
-        const body = callback.body
-        if (body.kind === K.Block) this.exec(body.statements, 0, env, { next: () => VOID })
-        else this.effect(body, env)
+        try {
+          if (instance.arg) this.bind(callback.parameters[0].name, this.valueOf(instance.arg), env, true, true)
+          const body = callback.body
+          if (body.kind === K.Block) this.exec(body.statements, 0, env, { next: () => VOID })
+          else this.effect(body, env)
+          law.instances.push(instance)
+        } catch (error) {
+          // Split on an input that has few values, and translate each case on its own.
+          const input = error instanceof NeedsValue ? instance.binders.find(b => error.inputs.has(b.name) && b.domain && b.domain.length > 1) : undefined
+          if (!input || law.instances.length + waiting.length + input.domain!.length > MAX_INSTANCES) {
+            // The law is refused as a whole. Keep every instance, so it can still be executed.
+            law.instances.push(instance, ...waiting)
+            throw error instanceof NeedsValue ? error.refusal : error
+          }
+          waiting.unshift(...input.domain!.map(value => ({
+            ...instance,
+            obligations: [],
+            binders: instance.binders.map(b => (b === input ? { ...b, domain: [value] } : { ...b })),
+            fixed: new Map(instance.fixed).set(input.name, ir.lit(value)),
+          })))
+        }
       }
       const asserts = law.expectSites.size > 0 || law.instances.some(instance => instance.obligations.some(o => o.kind === "expect"))
       if (!asserts) return invalid("the law contains no expect() assertion", callback)
@@ -567,6 +605,17 @@ export class Translator {
     if (kind !== "expect" && claim.t === "lit" && claim.value === true) return
     if (!this.instance) throw new Unsupported("this code can throw while a module is being initialized", node)
     this.instance.obligations.push({ kind, guard, claim, ...locate(node), text: sourceText(node), ...(sides ? { sides } : {}) })
+  }
+
+  /**
+   * The value of an expression where the translation cannot go on without
+   * one. Inputs this instance has fixed are filled in; if that is not enough,
+   * the caller's refusal is raised in a form that lets the law be split.
+   */
+  private settle(e: Expr, refusal: () => Unsupported): Extract<Expr, { t: "lit" }> {
+    const settled = this.instance?.fixed.size ? ir.substitute(e, this.instance.fixed) : e
+    if (settled.t === "lit") return settled
+    throw new NeedsValue(ir.freeVariables(settled), refusal())
   }
 
   private under<T>(cond: Expr, run: () => T): T {
@@ -869,8 +918,8 @@ export class Translator {
         let rounds = 0
         const test = (): Value => {
           const cond = condition ? this.bool(condition, scope) : ir.TRUE
-          if (cond.t !== "lit") throw new Unsupported("how many times this loop runs depends on a value that is not known here", condition)
-          return cond.value ? round() : rest()
+          const goes = this.settle(cond, () => new Unsupported("how many times this loop runs depends on a value that is not known here", condition))
+          return goes.value ? round() : rest()
         }
         const step = (): Value => {
           if (statement.kind === K.ForStatement && statement.incrementor) this.effect(statement.incrementor, scope)
@@ -1118,8 +1167,9 @@ export class Translator {
       if (object.k === "bottom") return BOTTOM
       if (object.k === "array") {
         const position = this.evalExpr(index, env)
-        if (!isNumber(position) || position.k !== "scalar" || position.e.t !== "lit") throw new Unsupported("an array can only be indexed by a position that is known here", node)
-        const item = object.items[Number(position.e.value)]
+        const refusal = () => new Unsupported("an array can only be indexed by a position that is known here", node)
+        if (!isNumber(position) || position.k !== "scalar") throw refusal()
+        const item = object.items[Number(this.settle(position.e, refusal).value)]
         if (!item) throw new Unsupported("this index is outside the array", node)
         return item
       }

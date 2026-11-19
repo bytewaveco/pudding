@@ -118,6 +118,13 @@ describe("imperative code", () => {
     assert.match(law(report, "counted loops > SAMPLED: plain division is refused").notes[0] ?? "", /dividing numbers can give a fraction/)
   })
 
+  test("a law is translated once per value of a small input that a loop bound depends on", () => {
+    const entry = law(report, "counted loops > a loop bounded by a small input is unrolled for each of its values")
+    assert.equal(entry.status, "proved")
+    assert.ok(entry.cases >= 21, `covered ${entry.cases} cases`)
+    assert.equal(law(report, "a while loop bounded by a small input").status, "proved")
+  })
+
   test("what cannot be modeled exactly is refused by name", () => {
     const note = (name: string) => law(report, name).notes[0] ?? ""
     assert.match(note("SAMPLED: a closure that writes an outer variable"), /uses `count`, a variable that is reassigned outside it/)
@@ -125,7 +132,7 @@ describe("imperative code", () => {
     assert.match(note("SAMPLED: mutating an object in place"), /changing an object or array in place is not modeled/)
     assert.match(note("SAMPLED: mutating an array in place"), /changing an object or array in place is not modeled/)
     assert.match(note("SAMPLED: assignment used as a value"), /assignment used as a value/)
-    assert.match(note("CHECKED: a while loop bounded by an input"), /how many times this loop runs depends on a value that is not known here/)
+    assert.match(note("counted loops > SAMPLED: a loop bounded by a large input cannot be unrolled"), /how many times this loop runs depends on a value that is not known here/)
   })
 })
 
