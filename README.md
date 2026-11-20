@@ -382,6 +382,11 @@ Lean is only asked about what changed. The TypeScript side is read afresh on
 every run: reusing a whole result would mean guessing that nothing affecting
 module resolution had changed.
 
+All runs on the machine share one limit of a Lean process per core, so
+Vitest proving several law files at once does not start a Lean per core for
+each of them. Where the temporary directory cannot hold the limit, Lean runs
+without it.
+
 ## What a proof means
 
 A *proved* law is a theorem about a model of your code. These are the main
