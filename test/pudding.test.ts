@@ -6,7 +6,8 @@ import { isAbsolute, join } from "node:path"
 import { after, before, describe, test } from "node:test"
 import * as ir from "../src/ir.ts"
 import { checksFor, FAST_HEADER, prove } from "../dist/lean.js"
-import { locateLean, run, type Report } from "../dist/runner.js"
+import { createWatchSession, locateLean, run, type Report } from "../dist/runner.js"
+import { findInput, showInputs } from "../dist/search.js"
 
 const fixtures = join(import.meta.dirname, "fixtures")
 const lean = locateLean({}, join(import.meta.dirname, ".."))
@@ -73,7 +74,7 @@ describe("the suite project", () => {
 
   test("code outside the supported subset is executed instead and says so", () => {
     const sampled = law(report, "SAMPLED: the total of a pair is their sum")
-    assert.match(sampled.notes[0] ?? "", /not proved: the array method `\.concat` is not supported \(fallback\.ts:2:10\)/)
+    assert.match(sampled.notes[0] ?? "", /not proved: `\.copyWithin` .* \(fallback\.ts:3:10\)/)
     assert.equal(law(report, "FALSE when executed: totals ignore the first amount").findings[0]?.kind, "counterexample")
   })
 
@@ -523,10 +524,10 @@ test("Vitest runs a law file as tests that report the proofs", () => {
   assert.equal(result.status, 1)
 })
 
-test("a value that grows with every round of a loop is refused quickly, not handed to Lean", async () => {
-  // This once produced a 33 MB theorem that Lean spent minutes on.
+test("DAG sharing proves repeated-division loops, while expressions past the size limit are still refused quickly", async () => {
   const report = await run({ cwd: join(fixtures, "growth"), cache: false })
-  const entry = law(report, "settling never grows the value")
+  assert.equal(law(report, "settling never grows the value").status, "proved")
+  const entry = law(report, "huge loop still stays above its input for positives")
   assert.equal(entry.status, "sampled")
   assert.match(entry.notes.join("\n"), /too large to check/)
   assert.ok(report.durationMs < 20_000, `took ${report.durationMs} ms`)
@@ -547,7 +548,7 @@ test("objects changed in place: aliases, early exits and evaluation order follow
   assert.match(note("REFUSED: changing an input in place"), /one of the law's inputs, a shared constant/)
   assert.match(note("REFUSED: changing a module constant"), /one of the law's inputs, a shared constant/)
   assert.match(note("REFUSED: an object that may be either of two is no longer changed"), /a condition choosing between two objects/)
-  assert.match(note("REFUSED: a push on one side of a condition that is not known"), /grows on only one side of a condition/)
+  assert.match(note("REFUSED: a push on one side of a condition that is not known"), /changes length on only one side of a condition/)
   assert.match(note("REFUSED: a change on the right of &&"), /the right side of `&&` changes an object in place/)
   assert.match(note("REFUSED: a change inside a callback of some"), /a callback of `\.some` changes an object in place/)
   assert.match(note("REFUSED: an object stored inside itself"), /inside itself/)
@@ -685,5 +686,188 @@ describe("simplification", () => {
   test("never folds a division by zero", () => {
     assert.equal(ir.div(ir.lit(1n), ir.lit(0n)).t, "op")
     assert.throws(() => ir.evaluate(ir.div(ir.lit(1n), ir.lit(0n)), new Map()), ir.EvaluationError)
+    assert.throws(() => ir.compile(ir.div(ir.lit(1n), ir.lit(0n)))(new Map()), ir.EvaluationError)
+  })
+  test("compiled evaluator preserves short-circuiting and matches evaluate on shared DAGs", () => {
+    const b = ir.variable("b", "int")
+    // Division by b appears twice on the right of `&&`; b = 0n must short-circuit to false without throwing.
+    const q = ir.div(a, b)
+    const guarded = ir.and(ir.not(ir.eq(b, ir.lit(0n))), ir.eq(ir.add(q, q), ir.mul(q, ir.lit(2n))))
+    const fn = ir.compile(guarded)
+    assert.equal(fn(new Map([["a", 10n], ["b", 0n]])), false)
+    assert.equal(fn(new Map([["a", -7n], ["b", 2n]])), true)
+    assert.equal(ir.compile(ir.neg(ir.lit(-1n)))(new Map()), 1n)
+    assert.equal(ir.compile(ir.sub(a, ir.lit(-1n)))(new Map([["a", 3n]])), 4n)
+  })
+})
+
+describe("extended subset, shrinking, emit annotations and watch session", () => {
+  for (const crossCheck of [true, false]) {
+    test(`extended constructs (null, typeof, in, Object.*, arrays, Map.delete, strings, matchers, toThrow, ranges) pass ${crossCheck ? "with" : "without"} cross-check`, async () => {
+      const report = await run({ cwd: join(fixtures, "extended"), cache: false, crossCheck })
+      assert.deepEqual(report.errors, [])
+      assert.deepEqual(report.warnings, [])
+      assert.ok(report.laws.length >= 30)
+      for (const entry of report.laws) {
+        const expected = announced(entry.name)
+        assert.equal(entry.status, crossCheck || expected === "proved" ? expected : "failed", `${entry.name}: ${JSON.stringify(entry.findings)} ${entry.notes.join(" ")}`)
+        const own = entry.name.split(" > ").at(-1)!
+        if (!crossCheck && own.startsWith("FALSE:")) {
+          assert.ok(entry.findings.length > 0 && entry.findings.every(f => f.kind === "counterexample" || f.kind === "throws" || f.kind === "inexact"), `${entry.name}: ${JSON.stringify(entry.findings)}`)
+        }
+      }
+      assert.deepEqual(report.laws.flatMap(entry => entry.findings).filter(f => f.kind === "mismatch"), [])
+      const ranged = law(report, "matchers and range quantification > large consecutive finite ranges quantify cleanly")
+      assert.equal(ranged.status, "proved")
+      assert.ok(ranged.cases >= 80_000)
+    })
+  }
+
+  test("counterexamples on unbounded inputs are shrunk to minimal values, including strings", () => {
+    const x0 = ir.variable("x0", "int")
+    const x1 = ir.variable("x1", "int")
+    const binders: ir.Binder[] = [{ name: "x0", label: "x", ty: "int" }, { name: "x1", label: "y", ty: "int" }]
+    const cond = ir.and(ir.lt(ir.lit(500n), x0), ir.and(ir.lt(ir.lit(500n), x1), ir.lt(ir.lit(1005n), ir.add(x0, x1))))
+    const { found } = findInput(binders, cond)
+    assert.ok(found)
+    assert.deepEqual(showInputs(binders, found), { x: "501n", y: "505n" })
+
+    const s0 = ir.variable("s0", "str")
+    const sBinders: ir.Binder[] = [{ name: "s0", label: "s", ty: "str" }]
+    // Only `"abcdef"` and `"abc"` satisfy this; `"abc"` is not a literal in the formula, so shrinking must discover and keep it.
+    const sCond = ir.or(ir.eq(s0, ir.lit("abcdef")), ir.eq(ir.concat(s0, ir.lit("def")), ir.lit("abcdef")))
+    const sRes = findInput(sBinders, sCond)
+    assert.ok(sRes.found)
+    assert.equal(sRes.found.get("s0"), "abc")
+  })
+
+  test("deep IR expressions evaluate, compile, substitute, search and build Lean checks without stack overflow", () => {
+    const x = ir.variable("x0", "int")
+    const y = ir.variable("x1", "int")
+    let expr: ir.Expr = x
+    for (let i = 0; i < 2000; i++) expr = ir.add(ir.add(expr, y), ir.lit(1n))
+    assert.equal(ir.evaluate(expr, new Map([["x0", 5n], ["x1", 0n]])), 2005n)
+    assert.equal(ir.compile(expr)(new Map([["x0", 5n], ["x1", 0n]])), 2005n)
+    const sub = ir.substitute(expr, new Map([["x0", ir.lit(10n)], ["x1", ir.lit(0n)]]))
+    assert.equal(ir.evaluate(sub, new Map()), 2010n)
+    const { found } = findInput([{ name: "x0", label: "x", ty: "int" }, { name: "x1", label: "y", ty: "int" }], ir.lt(ir.lit(2000n), expr))
+    assert.ok(found)
+    const finiteBinders: ir.Binder[] = [
+      { name: "x0", label: "x", ty: "int", domain: Array.from({ length: 20 }, (_, i) => BigInt(i)) },
+      { name: "x1", label: "y", ty: "int", domain: Array.from({ length: 20 }, (_, i) => BigInt(i)) },
+    ]
+    const checks = checksFor(finiteBinders, ir.TRUE, ir.le(ir.lit(0n), expr), undefined)
+    assert.equal(checks.length, 1)
+    assert.equal(checks[0]?.cases, 400)
+    // Also exercise `longestString` on a deep finite-only expression.
+    const smallBinders: ir.Binder[] = [
+      { name: "x0", label: "x", ty: "int", domain: [0n, 1n] },
+      { name: "x1", label: "y", ty: "int", domain: [0n, 1n] },
+    ]
+    const finiteChecks = checksFor(smallBinders, ir.TRUE, ir.le(ir.lit(0n), expr), undefined)
+    assert.equal(finiteChecks.length, 1)
+  })
+
+  test("finite case count is attributed even when an earlier specialization simplifies away", () => {
+    const x = ir.variable("x0", "int")
+    const y = ir.variable("x1", "int")
+    const binders: ir.Binder[] = [
+      { name: "x0", label: "x", ty: "int", domain: [0n, 1n] },
+      { name: "x1", label: "y", ty: "int", domain: Array.from({ length: 200 }, (_, i) => BigInt(i)) },
+    ]
+    // x = 0 simplifies to TRUE; x = 1 stays a quantified check and must carry all 400 finite cases.
+    const claim = ir.or(ir.eq(x, ir.lit(0n)), ir.le(ir.lit(0n), y))
+    const checks = checksFor(binders, ir.TRUE, claim, undefined)
+    assert.equal(checks.reduce((n, c) => n + c.cases, 0), 400)
+  })
+
+  test("--emit includes law annotations (escaping multiline names) and unproved diagnostics include binder names", async () => {
+    const emitFile = join(cacheDirectory, "annotated.lean")
+    const report = await run({ cwd: join(fixtures, "suite"), cache: false, emit: emitFile })
+    const leanText = readFileSync(emitFile, "utf8")
+    assert.match(leanText, /^-- .+ ".*" \(/m)
+    const unproved = law(report, "UNPROVED: a product of positives is positive")
+    assert.match(unproved.findings[0]?.detail ?? "", /^where x0 = a, x1 = b\n/)
+
+    const multiline = mkdtempSync(join(fixtures, ".tmp-"))
+    try {
+      const multiEmit = join(multiline, "out.lean")
+      writeFileSync(join(multiline, "m.law.ts"), `import { expect, law } from "@bytewaveco/pudding"\nlaw("line one\\nline two", () => expect(1).toBe(1))\n`)
+      const multiReport = await run({ cwd: multiline, cache: false, emit: multiEmit })
+      assert.equal(multiReport.ok, true)
+      const emitted = readFileSync(multiEmit, "utf8")
+      assert.match(emitted, /-- .* "line one\\nline two"/)
+      assert.doesNotMatch(emitted, /^line two/m)
+    } finally {
+      rmSync(multiline, { recursive: true, force: true })
+    }
+  })
+
+  test("WatchSession detects edits to both value and type-only files without stale results", async () => {
+    const project = mkdtempSync(join(fixtures, ".tmp-"))
+    const session = createWatchSession()
+    try {
+      writeFileSync(join(project, "types.ts"), `export type Role = "admin"\n`)
+      writeFileSync(join(project, "auth.ts"), `import type { Role } from "./types.ts"\nexport const canWrite = (role: Role) => role === "admin"\n`)
+      writeFileSync(join(project, "auth.law.ts"), `import { domain, expect, law } from "@bytewaveco/pudding"
+import type { Role } from "./types.ts"
+import { canWrite } from "./auth.ts"
+law("every role can write", domain<Role>(), role => expect(canWrite(role)).toBe(true))
+`)
+      const first = await run({ cwd: project, cache: false, session })
+      assert.equal(first.ok, true)
+
+      // Edit a type-only dependency: session.affected must include auth.law.ts and re-checking must see the new union member.
+      writeFileSync(join(project, "types.ts"), `export type Role = "admin" | "guest"\n`)
+      const affectedType = session.affected(join(project, "types.ts"))
+      assert.ok(affectedType && affectedType.some(file => file.endsWith("auth.law.ts")))
+      const afterTypeEdit = await run({ cwd: project, cache: false, session, lawFiles: affectedType })
+      assert.equal(afterTypeEdit.ok, false)
+      assert.deepEqual(law(afterTypeEdit, "every role can write").findings[0]?.inputs, { role: '"guest"' })
+
+      // Edit the value module so the law passes again: session must see the new implementation immediately.
+      writeFileSync(join(project, "auth.ts"), `import type { Role } from "./types.ts"\nexport const canWrite = (_role: Role) => true\n`)
+      const affectedValue = session.affected(join(project, "auth.ts"))
+      assert.ok(affectedValue && affectedValue.some(file => file.endsWith("auth.law.ts")))
+      const afterValueEdit = await run({ cwd: project, cache: false, session, lawFiles: affectedValue })
+      assert.equal(afterValueEdit.ok, true)
+
+      // Triple-slash `/// <reference path="..." />` directives (including indentation/spaces) must also be tracked, and deleted law files pruned on full runs.
+      writeFileSync(join(project, "ambient.d.ts"), `declare type Flag = "on"\n`)
+      writeFileSync(join(project, "flag.law.ts"), `  /// <reference path = "./ambient.d.ts" />\nimport { domain, expect, law } from "@bytewaveco/pudding"\nlaw("flag is on", domain<Flag>(), f => expect(f).toBe("on"))\n`)
+      assert.equal((await run({ cwd: project, cache: false, session })).ok, true)
+      writeFileSync(join(project, "ambient.d.ts"), `declare type Flag = "on" | "off"\n`)
+      const affectedRef = session.affected(join(project, "ambient.d.ts"))
+      assert.ok(affectedRef && affectedRef.some(file => file.endsWith("flag.law.ts")))
+      assert.equal((await run({ cwd: project, cache: false, session, lawFiles: affectedRef })).ok, false)
+
+      rmSync(join(project, "flag.law.ts"))
+      assert.equal((await run({ cwd: project, cache: false, session })).ok, true)
+      assert.deepEqual(session.affected(join(project, "ambient.d.ts")), [])
+
+      // Deleting the final law clears the dependency graph on a full run too.
+      rmSync(join(project, "auth.law.ts"))
+      assert.equal((await run({ cwd: project, cache: false, session })).ok, false)
+      assert.equal(session.affected(join(project, "auth.ts")), undefined)
+    } finally {
+      session.close()
+      rmSync(project, { recursive: true, force: true })
+    }
+  })
+
+  test("cross-check preserves __proto__ as an own property on input records", async () => {
+    const project = mkdtempSync(join(fixtures, ".tmp-"))
+    try {
+      writeFileSync(join(project, "proto.law.ts"), `import { domain, expect, law } from "@bytewaveco/pudding"
+law("own __proto__ property survives cross-check", domain<{ ["__proto__"]: 1; a: 2 }>(), x => {
+  expect(x.a).toBe(2)
+})
+`)
+      const report = await run({ cwd: project, cache: false })
+      assert.equal(report.ok, true, JSON.stringify(report.laws))
+      assert.equal(law(report, "own __proto__ property survives cross-check").status, "proved")
+    } finally {
+      rmSync(project, { recursive: true, force: true })
+    }
   })
 })

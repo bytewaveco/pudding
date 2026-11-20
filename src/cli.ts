@@ -6,7 +6,7 @@ import { parseArgs } from "node:util"
 import { createInterface } from "node:readline/promises"
 import { installLean, LEAN_VERSION } from "./install.ts"
 import { format, type Reporter } from "./report.ts"
-import { LeanMissing, run, type RunOptions } from "./runner.ts"
+import { createWatchSession, LeanMissing, run, type RunOptions } from "./runner.ts"
 
 const HELP = `pudding: prove laws about TypeScript functions
 
@@ -67,8 +67,8 @@ async function main(): Promise<void> {
     ...(values["no-cross-check"] ? { crossCheck: false } : {}),
     ...(values.emit ? { emit: values.emit } : {}),
   }
-  const once = async () => {
-    const report = await run(options)
+  const once = async (override?: Partial<RunOptions>) => {
+    const report = await run({ ...options, ...override })
     const reporter = (named ?? report.reporter ?? (process.env["GITHUB_ACTIONS"] ? "github" : "default")) as Reporter
     process.stdout.write(format(report, { cwd, color: process.stdout.isTTY === true && reporter !== "json", reporter }))
     return report.ok
@@ -78,9 +78,11 @@ async function main(): Promise<void> {
 }
 
 /** Check, then check again after each change to a source file, until interrupted. */
-async function watch(cwd: string, once: () => Promise<boolean>): Promise<void> {
+async function watch(cwd: string, once: (override?: Partial<RunOptions>) => Promise<boolean>): Promise<void> {
+  const session = createWatchSession()
   let running = false
   let again = false
+  let pendingFiles: Set<string> | "all" = "all"
   let timer: NodeJS.Timeout | undefined
   const interactive = process.stdout.isTTY === true
   const cycle = async () => {
@@ -88,9 +90,25 @@ async function watch(cwd: string, once: () => Promise<boolean>): Promise<void> {
     running = true
     do {
       again = false
+      const target = pendingFiles
+      pendingFiles = new Set()
+      let lawFiles: string[] | undefined
+      if (target !== "all") {
+        const hit = new Set<string>()
+        let needAll = false
+        for (const file of target) {
+          const affected = session.affected(file)
+          if (!affected) { needAll = true; break }
+          for (const lawFile of affected) hit.add(lawFile)
+        }
+        if (!needAll) {
+          if (!hit.size) continue
+          lawFiles = [...hit].sort()
+        }
+      }
       if (interactive) process.stdout.write("\x1b[2J\x1b[3J\x1b[H")
       try {
-        await once()
+        await once({ session, ...(lawFiles ? { lawFiles } : {}) })
       } catch (error) {
         process.stderr.write(`pudding: ${error instanceof Error ? error.message : String(error)}\n`)
       }
@@ -98,8 +116,11 @@ async function watch(cwd: string, once: () => Promise<boolean>): Promise<void> {
     } while (again)
     running = false
   }
-  watchFiles(cwd, { recursive: true }, (_event, file) => {
+  watchFiles(cwd, { recursive: true }, (event, file) => {
     if (!file || IGNORED.test(file) || !/\.(m?ts|cts|json)$/.test(file)) return
+    const full = resolve(cwd, file)
+    if (event === "rename" || file.endsWith(".json") || /pudding\.config\./.test(file) || (file.endsWith(".law.ts") && !session.affected(full)?.length)) pendingFiles = "all"
+    else if (pendingFiles !== "all") pendingFiles.add(full)
     clearTimeout(timer)
     timer = setTimeout(() => void cycle(), 60)
   })
@@ -108,8 +129,14 @@ async function watch(cwd: string, once: () => Promise<boolean>): Promise<void> {
     process.stdin.resume()
     process.stdin.on("data", data => {
       const key = data.toString()
-      if (key === "q" || key === "\x03") process.exit(0)
-      if (key === "\r" || key === "\n") void cycle()
+      if (key === "q" || key === "\x03") {
+        session.close()
+        process.exit(0)
+      }
+      if (key === "\r" || key === "\n") {
+        pendingFiles = "all"
+        void cycle()
+      }
     })
   }
   await cycle()

@@ -10,7 +10,7 @@ import { homedir } from "node:os"
 import { dirname, isAbsolute, join, relative, resolve } from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
 import { threadId, Worker } from "node:worker_threads"
-import { API, compiler, compilerProblem, DiagnosticCategory, SymbolFlags, SyntaxKind as K, type Checker, type Program } from "./compiler.ts"
+import { API, compiler, compilerProblem, DiagnosticCategory, ensureCompiler, SymbolFlags, SyntaxKind as K, type Checker, type Program } from "./compiler.ts"
 import type { Config } from "./index.ts"
 import { cacheDirectory, toolchainName } from "./install.ts"
 import * as ir from "./ir.ts"
@@ -22,8 +22,88 @@ import { Translator, type Law, type LawInstance } from "./translate.ts"
 
 export const MINIMUM_LEAN = [4, 36, 0] as const
 const CACHE_VERSION = 3
-const RUNTIME_BUDGET = 4_000
+const PROVED_RUNTIME_BUDGET = 1_000
+const FALLBACK_RUNTIME_BUDGET = 4_000
 const RUNTIME_TIMEOUT_MS = 30_000
+
+/** Dependency-tracking session for watch mode so edits re-check only affected law files. */
+export interface WatchSession {
+  /** Clear tracked dependency state. */
+  close(): void
+  /** Law files affected by a change to `changedFile`, or `undefined` when a full run is needed. */
+  affected(changedFile: string): string[] | undefined
+  /** Internal dependency graph mapping each law file to every file it transitively imports or reaches. */
+  readonly _internal: { dependencies: Map<string, Set<string>> }
+}
+
+export function createWatchSession(): WatchSession {
+  const state: WatchSession["_internal"] = { dependencies: new Map() }
+  return {
+    _internal: state,
+    close() {
+      state.dependencies.clear()
+    },
+    affected(changedFile: string) {
+      if (!state.dependencies.size) return undefined
+      const target = resolve(changedFile)
+      const hit: string[] = []
+      for (const [lawFile, reached] of state.dependencies) {
+        if (lawFile === target || reached.has(target)) hit.push(lawFile)
+      }
+      return hit
+    },
+  }
+}
+
+/** Collect every project file transitively imported or re-exported by `entry`, including type-only imports and `.d.ts` files. */
+function collectDependencies(program: Program, checker: Checker, entry: string): Set<string> {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  type N = any
+  const visited = new Set<string>([resolve(entry)])
+  const queue = [entry]
+  while (queue.length) {
+    const current = queue.pop()!
+    const source = program.getSourceFile(current)
+    if (!source) continue
+    const addFile = (fileName: string) => {
+      const full = resolve(fileName)
+      if (visited.has(full)) return
+      const target = program.getSourceFile(fileName) ?? program.getSourceFile(full)
+      if (target && (program.isSourceFileFromExternalLibrary(target) || program.isSourceFileDefaultLibrary(target))) return
+      visited.add(full)
+      queue.push(target ? target.fileName : full)
+    }
+    const addSpecifier = (specifier: N) => {
+      if (!specifier || specifier.kind !== K.StringLiteral) return
+      const symbol = checker.getSymbolAtLocation(specifier)
+      const target = (symbol?.valueDeclaration ?? symbol?.declarations[0])?.resolve()?.getSourceFile()
+      if (!target || program.isSourceFileFromExternalLibrary(target) || program.isSourceFileDefaultLibrary(target)) return
+      addFile(target.fileName)
+    }
+    const visit = (node: N) => {
+      if ((node.kind === K.ImportDeclaration || node.kind === K.ExportDeclaration) && node.moduleSpecifier) {
+        addSpecifier(node.moduleSpecifier)
+      } else if (K.ImportType !== undefined && node.kind === K.ImportType && node.argument?.kind === K.LiteralType && node.argument.literal?.kind === K.StringLiteral) {
+        addSpecifier(node.argument.literal)
+      }
+      node.forEachChild(visit)
+    }
+    visit(source)
+    // Also track triple-slash `/// <reference path="..." />` directives (e.g. local `.d.ts` files).
+    const referenced = (source as { referencedFiles?: readonly { fileName: string }[] }).referencedFiles
+    if (referenced) {
+      for (const ref of referenced) {
+        const target = resolve(dirname(current), ref.fileName)
+        if (existsSync(target) || program.getSourceFile(target)) addFile(target)
+      }
+    }
+    for (const match of source.text.matchAll(/^[ \t]*\/\/\/[ \t]*<reference[ \t]+path[ \t]*=[ \t]*["']([^"']+)["']/gm)) {
+      const target = resolve(dirname(current), match[1]!)
+      if (existsSync(target) || program.getSourceFile(target)) addFile(target)
+    }
+  }
+  return visited
+}
 
 export interface RunOptions extends Config {
   /** Project directory. Default: the current directory. */
@@ -36,6 +116,8 @@ export interface RunOptions extends Config {
   name?: string
   /** Write the generated Lean source to this file. */
   emit?: string
+  /** Optional persistent watch session that reuses the TypeScript 7 compiler API across edits. */
+  session?: WatchSession
 }
 
 export type Status = "proved" | "checked" | "sampled" | "failed" | "skipped" | "todo"
@@ -298,7 +380,7 @@ function runtimeMap(program: Program, checker: Checker, ambiguous: (message: str
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   type N = any
   for (const name of program.getSourceFileNames()) {
-    if (!isAbsolute(name) || name.includes("/node_modules/")) continue
+    if (!isAbsolute(name) || name.replaceAll("\\", "/").includes("/node_modules/")) continue
     const source = program.getSourceFile(name)
     if (!source || source.isDeclarationFile) continue
     const text = source.text
@@ -401,6 +483,7 @@ function emptyReport(lean: string): Report {
 export async function run(options: RunOptions = {}): Promise<Report> {
   const started = performance.now()
   const cwd = resolve(options.cwd ?? process.cwd())
+  await ensureCompiler(cwd)
   const loaded = await loadConfig(cwd)
   const given = Object.fromEntries(Object.entries(options).filter(([, value]) => value !== undefined)) as RunOptions
   const config: RunOptions = { ...loaded.config, ...given }
@@ -424,6 +507,7 @@ export async function run(options: RunOptions = {}): Promise<Report> {
     return finish()
   }
   if (!lawFiles.length) {
+    if (options.session && config.lawFiles === undefined && !filters.length && !config.name) options.session._internal.dependencies.clear()
     report.errors.push(filters.length ? `no law file matches ${filters.map(f => `\`${f}\``).join(" or ")}` : "no law files were found")
     return finish()
   }
@@ -447,13 +531,16 @@ export async function run(options: RunOptions = {}): Promise<Report> {
 
   // Read and translate the laws.
   const reading = performance.now()
+  const session = options.session?._internal
   const api = new API({ cwd })
   let laws: Law[] = []
   let executable: RuntimeMap | undefined
   try {
-    // TypeScript 7.1 opens a project with `createSnapshot`; 7.0 has only `updateSnapshot`.
+    // TypeScript 7.1 and tsrs open projects with `createSnapshot`; 7.0 uses `updateSnapshot`.
     const open = { openProjects: [tsconfig] }
-    const snapshot = "createSnapshot" in api && typeof api.createSnapshot === "function" ? api.createSnapshot(open) as ReturnType<typeof api.updateSnapshot> : api.updateSnapshot(open)
+    const snapshot = "createSnapshot" in api && typeof api.createSnapshot === "function"
+      ? api.createSnapshot(open)
+      : api.updateSnapshot(open)
     const project = snapshot.getProject(tsconfig) ?? snapshot.getProjects()[0]
     if (!project) {
       report.errors.push("TypeScript could not open the project Pudding generated for the law files")
@@ -474,13 +561,30 @@ export async function run(options: RunOptions = {}): Promise<Report> {
       return false
     })
     readable.forEach(diagnose)
-    if (report.errors.length) return finish()
+    if (report.errors.length) {
+      session?.dependencies.clear()
+      return finish()
+    }
     const translator = new Translator(program, checker, packageName)
-    for (const file of readable) laws.push(...translator.translateFile(program.getSourceFile(file)!, selected))
+    if (session && !partial) session.dependencies.clear()
+    for (const file of readable) {
+      laws.push(...translator.translateFile(program.getSourceFile(file)!, selected))
+      if (session) {
+        const deps = collectDependencies(program, checker, file)
+        for (const reached of translator.fileReached.get(file) ?? []) deps.add(resolve(reached))
+        session.dependencies.set(resolve(file), deps)
+      }
+    }
     for (const file of translator.reached) if (!readable.includes(file)) diagnose(file)
-    if (report.errors.length) return finish()
-    const map = runtimeMap(program, checker, message => report.errors.push(message.replaceAll(cwd + "/", "")))
-    if (report.errors.length) return finish()
+    if (report.errors.length) {
+      session?.dependencies.clear()
+      return finish()
+    }
+    const map = runtimeMap(program, checker, message => report.errors.push(message.replaceAll(cwd + "/", "").replaceAll(cwd + "\\", "")))
+    if (report.errors.length) {
+      session?.dependencies.clear()
+      return finish()
+    }
     if (config.crossCheck !== false) executable = map
   } finally {
     api.close()
@@ -512,6 +616,7 @@ export async function run(options: RunOptions = {}): Promise<Report> {
     } catch (error) {
       if (!(error instanceof TooLarge)) throw error
       law.problem = { kind: "unsupported", message: error.message, file: law.file, line: law.line, column: law.column }
+      for (const instance of law.instances) instance.obligations = []
     }
   }
 
@@ -521,13 +626,14 @@ export async function run(options: RunOptions = {}): Promise<Report> {
   const candidates = laws.filter(law => law.index >= 0)
   const job: Job | undefined = executable && {
     map: executable,
-    budget: RUNTIME_BUDGET,
+    budget: FALLBACK_RUNTIME_BUDGET,
     files: lawFiles.map(file => ({
       file,
       registered: candidates.filter(law => law.file === file).length,
       laws: candidates.filter(law => law.file === file && law.mode === "run" && law.problem?.kind !== "invalid").map(law => ({
         index: law.index,
         unproved: law.problem !== undefined,
+        budget: law.problem ? FALLBACK_RUNTIME_BUDGET : PROVED_RUNTIME_BUDGET,
         mentioned: law.mentioned,
         instances: law.instances.map(instance => ({
           binders: instance.binders, arg: instance.arg, obligations: instance.obligations.map(o => ({ guard: o.guard, claim: o.claim, inexact: o.kind === "overflow" || o.kind === "nan" || o.kind === "round" || o.kind === "inherited" })),
@@ -555,8 +661,14 @@ export async function run(options: RunOptions = {}): Promise<Report> {
   report.obligations = statements.length
   report.cachedObligations = statements.length - fresh.length
   if (config.emit) {
+    const comments = new Map<string, string>()
+    for (const { law, instance, obligation, checks } of pending) {
+      const mapping = instance.binders.filter(b => b.label !== b.name).map(b => `${b.name} = ${b.label}`).join(", ")
+      const note = `${displayPath(cwd, obligation.file)}:${obligation.line} "${law.name.replace(/\r?\n/g, "\\n")}"${mapping ? ` (${mapping})` : ""}`
+      for (const check of checks) if (!comments.has(check.statement)) comments.set(check.statement, note)
+    }
     mkdirSync(dirname(resolve(cwd, config.emit)), { recursive: true })
-    writeFileSync(resolve(cwd, config.emit), render(FAST_HEADER, statements))
+    writeFileSync(resolve(cwd, config.emit), render(FAST_HEADER, statements, comments))
   }
   // Everything starts under the fast imports. A proof the author supplied may
   // name lemmas from anywhere in Lean's core library, so one that fails is
@@ -637,6 +749,7 @@ export async function run(options: RunOptions = {}): Promise<Report> {
           message: obligation.kind === "nothrow" ? "this divides by zero"
             : obligation.kind === "falloff" ? "this function reaches its end without returning a value"
             : obligation.kind === "missing" ? "this reads a property the object does not have"
+            : obligation.kind === "null" ? "this reads a property of null, or calls it"
             : obligation.kind === "undefined" ? "this reads a property of undefined, or calls it" : "this throw is reached",
         })
       }
@@ -649,12 +762,15 @@ export async function run(options: RunOptions = {}): Promise<Report> {
         : obligation.kind === "nothrow" || obligation.kind === "nan" ? "Lean could not prove that the divisor is never zero"
         : obligation.kind === "overflow" ? "Lean could not prove that this result stays small enough for a number to hold exactly"
         : obligation.kind === "round" ? "Lean could not prove that this number stays small enough for Math.round to round its quotient exactly"
+        : obligation.kind === "null" ? "Lean could not prove that this value is never null"
         : obligation.kind === "undefined" ? "Lean could not prove that this value is never undefined"
         : obligation.kind === "falloff" ? "Lean could not prove that this function always returns a value"
         : obligation.kind === "missing" ? "Lean could not prove that this key is always a property of the object"
         : obligation.kind === "inherited" ? "Lean could not prove that this key never names a property every object inherits"
         : "Lean could not prove that this throw is never reached"
-      entry.findings.push({ kind: "unproved", message, ...at, detail: rejected.message.split("\n").slice(0, 8).join("\n") })
+      const mapping = instance.binders.filter(b => b.label !== b.name).map(b => `${b.name} = ${b.label}`).join(", ")
+      const leanDetail = rejected.message.split("\n").slice(0, 8).join("\n")
+      entry.findings.push({ kind: "unproved", message, ...at, detail: mapping ? `where ${mapping}\n${leanDetail}` : leanDetail })
     }
   }
 
@@ -700,7 +816,7 @@ export async function run(options: RunOptions = {}): Promise<Report> {
     for (const { file } of job.files) {
       const outcome = outcomes.get(file)
       for (const note of outcome?.rerouted ?? []) {
-        report.warnings.push(`the laws ran against the files TypeScript read, which are not the ones Node would load: ${note.replaceAll(cwd + "/", "")}`)
+        report.warnings.push(`the laws ran against the files TypeScript read, which are not the ones Node would load: ${note.replaceAll(cwd + "/", "").replaceAll(cwd + "\\", "")}`)
       }
       const reason = outcome?.error ?? (outcome ? undefined : timedOut ? `executing the laws took longer than ${RUNTIME_TIMEOUT_MS / 1000} s` : "the worker that executes laws stopped unexpectedly")
       if (outcome?.throws) {
