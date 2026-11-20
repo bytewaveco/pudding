@@ -42,22 +42,25 @@ export function assignments(binders: readonly Binder[], pool: Pool, budget: numb
   const pools = binders.map(b => b.domain ?? (b.ty === "int" ? integers(b) : b.ty === "bool" ? [true, false] : strings))
   const total = pools.reduce((n, pool) => n * pool.length, 1)
   const finite = binders.every(b => b.domain)
-  const grid = total <= budget
+  // Keep grid + random draws within `budget`: for unbounded spaces leave room for random exploration.
+  const grid = finite ? total <= budget : total <= Math.floor(budget * 0.6)
   return {
     exhaustive: finite && grid,
     each(visit) {
       const env = new Map<string, Scalar>()
+      let ran = 0
       if (grid) {
         const index = pools.map(() => 0)
         for (let n = 0; n < total; n++) {
           binders.forEach((b, i) => env.set(b.name, pools[i]![index[i]!]!))
+          ran++
           if (visit(env)) return
           for (let i = pools.length - 1; i >= 0 && ++index[i]! === pools[i]!.length; i--) index[i] = 0
         }
       }
       if (finite && grid) return
       const random = generator(0x9e3779b9)
-      const draws = Math.min(budget, 5_000)
+      const draws = Math.max(0, Math.min(budget - ran, 5_000))
       for (let n = 0; n < draws; n++) {
         binders.forEach((b, i) => {
           const pool = pools[i]!
@@ -106,26 +109,83 @@ function stringPool(expressions: readonly Expr[]): string[] {
   return [...pool].slice(0, 96)
 }
 
-function truthy(e: Expr, env: Map<string, Scalar>): boolean {
-  try {
-    return ir.evaluate(e, env) === true
-  } catch (error) {
-    if (error instanceof ir.EvaluationError) return false
-    throw error
+function truthyFn(evalCond: (env: ReadonlyMap<string, Scalar>) => Scalar): (env: Map<string, Scalar>) => boolean {
+  return env => {
+    try {
+      return evalCond(env) === true
+    } catch (error) {
+      if (error instanceof ir.EvaluationError) return false
+      throw error
+    }
   }
+}
+
+/** Shrink a found counterexample toward simpler values (0 / bounds for ints, shorter text for strings). */
+function shrink(binders: readonly Binder[], holds: (env: Map<string, Scalar>) => boolean, initial: Map<string, Scalar>): Map<string, Scalar> {
+  const cur = new Map(initial)
+  for (let pass = 0; pass < 3; pass++) {
+    let improved = false
+    for (const b of binders) {
+      if (b.domain) continue
+      const current = cur.get(b.name)
+      if (b.ty === "int" && typeof current === "bigint") {
+        const [lo, hi] = b.range ?? [undefined, undefined]
+        const inRange = (v: bigint) => lo === undefined || (v >= lo && v <= hi!)
+        const target = lo !== undefined && lo > 0n ? lo : hi !== undefined && hi < 0n ? hi : 0n
+        if (current === target) continue
+        if (inRange(target)) {
+          cur.set(b.name, target)
+          if (holds(cur)) { improved = true; continue }
+          cur.set(b.name, current)
+        }
+        let low = target
+        let high = current
+        while (low !== high) {
+          const mid = low + (high - low) / 2n
+          if (mid === low || mid === high) break
+          cur.set(b.name, mid)
+          if (inRange(mid) && holds(cur)) { high = mid; improved = true }
+          else { cur.set(b.name, high); low = mid }
+        }
+        cur.set(b.name, high)
+      } else if (b.ty === "str" && typeof current === "string" && current.length > 0) {
+        let bestStr = current
+        const tryStr = (candidate: string) => {
+          cur.set(b.name, candidate)
+          if (holds(cur)) {
+            bestStr = candidate
+            improved = true
+            return true
+          }
+          cur.set(b.name, bestStr)
+          return false
+        }
+        if (tryStr("")) continue
+        let best = [...bestStr]
+        for (let len = Math.floor(best.length / 2); len >= 1; len = Math.floor(len / 2)) {
+          if (tryStr(best.slice(0, len).join(""))) best = best.slice(0, len)
+          else if (tryStr(best.slice(-len).join(""))) best = best.slice(-len)
+        }
+      }
+    }
+    if (!improved) break
+  }
+  return cur
 }
 
 export function findInput(binders: readonly Binder[], condition: Expr): { found: Map<string, Scalar> | undefined; exhaustive: boolean } {
   if (condition === ir.TRUE) return { found: new Map(), exhaustive: true }
   const free = ir.freeVariables(condition)
   const used = binders.filter(b => free.has(b.name))
+  const holds = truthyFn(ir.compile(condition))
   const space = assignments(used, valuePool([condition]), SEARCH_BUDGET)
   let found: Map<string, Scalar> | undefined
   space.each(env => {
-    if (!truthy(condition, env)) return false
+    if (!holds(env)) return false
     found = new Map(env)
     return true
   })
+  if (found && !space.exhaustive) found = shrink(used, holds, found)
   return { found, exhaustive: space.exhaustive }
 }
 

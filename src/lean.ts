@@ -1,12 +1,14 @@
 // Print obligations as Lean theorems and run Lean over them.
 
 import { execFile } from "node:child_process"
-import { randomUUID } from "node:crypto"
-import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs"
+import { createHash, randomUUID } from "node:crypto"
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { mkdtemp, rm, writeFile } from "node:fs/promises"
 import { availableParallelism, tmpdir } from "node:os"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
 import { setTimeout as sleep } from "node:timers/promises"
+import { threadId } from "node:worker_threads"
+import { cacheDirectory } from "./install.ts"
 import * as ir from "./ir.ts"
 import type { Binder, Expr, Scalar } from "./ir.ts"
 
@@ -105,35 +107,35 @@ function leanScalar(value: Scalar): string {
   return leanString(value)
 }
 
-function print(e: Expr, memo: Map<Expr, string>): string {
-  if (e.t === "var") return e.name
-  if (e.t === "lit") return leanScalar(e.value)
-  const known = memo.get(e)
-  if (known !== undefined) return known
-  const [a, b, c] = e.args.map(arg => print(arg, memo)) as [string, string, string]
-  let text: string
+/** Minimum printed length before a shared subexpression is bound with `let`. */
+const CSE_MIN_LENGTH = 24
+/** Finite-only theorems above this many cases quantify consecutive linear integer ranges with `grind`. */
+const FINITE_QUANTIFY_THRESHOLD = 256
+/** Max concurrent Lean chunks where `--incr-load` improves wall time without memory contention. */
+const SNAPSHOT_MAX_CHUNKS = 8
+
+function printOp(e: Extract<Expr, { t: "op" }>, a: string, b: string, c: string): string {
   switch (e.op) {
-    case "not": text = `(!${a})`; break
-    case "and": text = `(${a} && ${b})`; break
-    case "or": text = `(${a} || ${b})`; break
-    case "eq": text = `(${a} == ${b})`; break
-    case "lt": text = `(decide (${a} < ${b}))`; break
-    case "le": text = `(decide (${a} ≤ ${b}))`; break
-    case "add": text = `(${a} + ${b})`; break
-    case "sub": text = `(${a} - ${b})`; break
-    case "mul": text = `(${a} * ${b})`; break
-    case "neg": text = `(-${a})`; break
-    case "concat": text = `(${a} ++ ${b})`; break
-    case "str": text = `(toString ${a})`; break
-    case "ite": text = `(if ${a} then ${b} else ${c})`; break
+    case "not": return `(!${a})`
+    case "and": return `(${a} && ${b})`
+    case "or": return `(${a} || ${b})`
+    case "eq": return `(${a} == ${b})`
+    case "lt": return `(decide (${a} < ${b}))`
+    case "le": return `(decide (${a} ≤ ${b}))`
+    case "add": return `(${a} + ${b})`
+    case "sub": return `(${a} - ${b})`
+    case "mul": return `(${a} * ${b})`
+    case "neg": return `(-${a})`
+    case "concat": return `(${a} ++ ${b})`
+    case "str": return `(toString ${a})`
+    case "ite": return `(if ${a} then ${b} else ${c})`
     case "fdiv": {
       // Lean's `/` on integers rounds toward minus infinity when the divisor
       // is positive, so a literal divisor needs no case split.
       const divisor = e.args[1]!
-      if (divisor.t === "lit" && (divisor.value as bigint) > 0n) text = `(${a} / ${divisor.value})`
-      else if (divisor.t === "lit" && (divisor.value as bigint) < 0n) text = `((-${a}) / ${-(divisor.value as bigint)})`
-      else text = `(Int.fdiv ${a} ${b})`
-      break
+      if (divisor.t === "lit" && (divisor.value as bigint) > 0n) return `(${a} / ${divisor.value})`
+      if (divisor.t === "lit" && (divisor.value as bigint) < 0n) return `((-${a}) / ${-(divisor.value as bigint)})`
+      return `(Int.fdiv ${a} ${b})`
     }
     case "div":
     case "mod": {
@@ -147,46 +149,107 @@ function print(e: Expr, memo: Map<Expr, string>): string {
         const magnitude = (divisor.value as bigint) < 0n ? -(divisor.value as bigint) : (divisor.value as bigint)
         const flip = e.op === "div" && (divisor.value as bigint) < 0n
         const body = `(if (0 : Int) ≤ ${a} then ${a} ${symbol} ${magnitude} else -((-${a}) ${symbol} ${magnitude}))`
-        text = flip ? `(-${body})` : body
-      } else text = `(Int.${e.op === "div" ? "tdiv" : "tmod"} ${a} ${b})`
-      break
+        return flip ? `(-${body})` : body
+      }
+      return `(Int.${e.op === "div" ? "tdiv" : "tmod"} ${a} ${b})`
     }
   }
-  memo.set(e, text)
-  return text
 }
 
-function printExpr(e: Expr): string {
-  if (ir.treeSize(e) > MAX_TERM_SIZE) throw new TooLarge("the translated expression is too large to check")
-  const text = print(e, new Map())
-  if (text.length > MAX_TERM_TEXT) throw new TooLarge("the translated expression is too large to check")
-  return text
+/**
+ * Print an expression DAG, sharing repeated subexpressions via `let _vN := ...`
+ * so loops and literal `div`/`mod` (which mentions its dividend three times)
+ * do not expand exponentially.
+ */
+function printExpr(root: Expr): string {
+  if (ir.dagSize(root) > MAX_TERM_SIZE) throw new TooLarge("the translated expression is too large to check")
+  const refs = new Map<Expr, number>()
+  const visited = new Set<Expr>()
+  const postorder: Expr[] = []
+  const stack: [Expr, boolean][] = [[root, false]]
+  while (stack.length) {
+    const [e, expanded] = stack.pop()!
+    if (e.t !== "op") continue
+    if (expanded) {
+      postorder.push(e)
+      continue
+    }
+    refs.set(e, (refs.get(e) ?? 0) + 1)
+    if (!visited.has(e)) {
+      visited.add(e)
+      if ((e.op === "div" || e.op === "mod") && e.args[1]!.t === "lit" && e.args[1]!.value !== 0n && e.args[0]!.t === "op") {
+        refs.set(e.args[0]!, (refs.get(e.args[0]!) ?? 0) + 2)
+      }
+      stack.push([e, true])
+      for (let i = e.args.length - 1; i >= 0; i--) stack.push([e.args[i]!, false])
+    }
+  }
+  const lets: string[] = []
+  const printed = new Map<Expr, string>()
+  let totalChars = 0
+  const textOf = (e: Expr): string => (e.t === "var" ? e.name : e.t === "lit" ? leanScalar(e.value) : printed.get(e)!)
+  for (const e of postorder) {
+    if (e.t !== "op") continue
+    const [a, b, c] = e.args.map(textOf) as [string, string, string]
+    const text = printOp(e, a, b, c)
+    if ((refs.get(e) ?? 0) >= 2 && text.length >= CSE_MIN_LENGTH && e !== root) {
+      const name = `_v${lets.length}`
+      const binding = `let ${name} := ${text}`
+      totalChars += binding.length + 2
+      if (totalChars > MAX_TERM_TEXT) throw new TooLarge("the translated expression is too large to check")
+      lets.push(binding)
+      printed.set(e, name)
+    } else {
+      if (text.length > MAX_TERM_TEXT) throw new TooLarge("the translated expression is too large to check")
+      printed.set(e, text)
+    }
+  }
+  const body = textOf(root)
+  const full = lets.length ? `(${lets.join("; ")}; ${body})` : body
+  if (full.length > MAX_TERM_TEXT) throw new TooLarge("the translated expression is too large to check")
+  return full
 }
 
 /** An upper bound on the length of any string the expression builds, given inputs with listed values. */
 function longestString(body: Expr, inputs: readonly Binder[]): number {
   const given = new Map(inputs.map(input => [input.name, Math.max(0, ...(input.domain ?? []).map(value => typeof value === "string" ? value.length : 0))]))
   const memo = new Map<Expr, number>()
+  const postorder: Expr[] = []
+  const visited = new Set<Expr>()
+  const stack: [Expr, boolean][] = [[body, false]]
+  while (stack.length) {
+    const [e, expanded] = stack.pop()!
+    if (e.t !== "op") continue
+    if (expanded) {
+      postorder.push(e)
+      continue
+    }
+    if (visited.has(e)) continue
+    visited.add(e)
+    stack.push([e, true])
+    for (let i = e.args.length - 1; i >= 0; i--) stack.push([e.args[i]!, false])
+  }
   let longest = 0
-  const length = (e: Expr): number => {
+  const lengthOf = (e: Expr): number => {
     if (e.t === "var") return given.get(e.name) ?? 0
     if (e.t === "lit") {
       const own = typeof e.value === "string" ? e.value.length : 0
-      longest = Math.max(longest, own)
+      if (own > longest) longest = own
       return own
     }
-    const known = memo.get(e)
-    if (known !== undefined) return known
-    const parts = e.args.map(length)
+    return memo.get(e) ?? 0
+  }
+  for (const e of postorder) {
+    if (e.t !== "op") continue
+    const parts = e.args.map(lengthOf)
     const own = e.ty !== "str" ? 0
       : e.op === "concat" ? parts[0]! + parts[1]!
       : e.op === "ite" ? Math.max(parts[1]!, parts[2]!)
       : INTEGER_TEXT
     memo.set(e, own)
-    longest = Math.max(longest, own)
-    return own
+    if (own > longest) longest = own
   }
-  length(body)
+  lengthOf(body)
   return longest
 }
 
@@ -221,23 +284,43 @@ function consecutive(binder: Binder): [bigint, bigint] | undefined {
   return sorted.every((value, i) => i === 0 || value === sorted[i - 1]! + 1n) ? [sorted[0]!, sorted.at(-1)!] : undefined
 }
 
-/** Whether a variable is divided by, or multiplied with something that is not a constant. */
-function usedNonlinearly(e: Expr, name: string, seen = new Set<Expr>()): boolean {
-  if (e.t !== "op" || seen.has(e)) return false
-  seen.add(e)
+/** Whether a variable is divided by, multiplied nonlinearly, or formatted as text (which tactics cannot decide). */
+function usedNonLinearly(root: Expr, name: string): boolean {
+  const seen = new Set<Expr>()
+  const stack: Expr[] = [root]
   const mentions = (part: Expr) => ir.freeVariables(part).has(name)
-  const [a, b] = e.args as [Expr, Expr]
-  if ((e.op === "div" || e.op === "mod" || e.op === "fdiv") && mentions(b)) return true
-  if (e.op === "mul" && a.t !== "lit" && b.t !== "lit" && (mentions(a) || mentions(b))) return true
-  return e.args.some(arg => usedNonlinearly(arg, name, seen))
+  while (stack.length) {
+    const e = stack.pop()!
+    if (e.t !== "op" || seen.has(e)) continue
+    seen.add(e)
+    const [a, b] = e.args as [Expr, Expr]
+    if (e.op === "str" && mentions(a)) return true
+    if ((e.op === "div" || e.op === "mod" || e.op === "fdiv") && mentions(b)) return true
+    if (e.op === "mul" && a.t !== "lit" && b.t !== "lit" && (mentions(a) || mentions(b))) return true
+    for (const arg of e.args) stack.push(arg)
+  }
+  return false
 }
 
 export function checksFor(binders: readonly Binder[], guard: Expr, claim: Expr, tactic: string | undefined): Check[] {
   const body = implication(guard, claim)
   const free = ir.freeVariables(body)
   const used = binders.filter(b => free.has(b.name))
-  if (used.every(b => b.domain)) {
-    const cases = used.reduce((n, b) => n * b.domain!.length, 1)
+  const allFinite = used.every(b => b.domain)
+  const finiteCases = allFinite ? used.reduce((n, b) => n * b.domain!.length, 1) : 0
+  // An integer input over a run of consecutive values does not have to be
+  // split into cases: its bounds can be stated instead, which the arithmetic
+  // tactics use directly. For large finite-only spaces (e.g. [1..200]^2),
+  // quantifying consecutive linear integer ranges is an order of magnitude
+  // faster than `decide +kernel`.
+  const bounded = new Map<string, [bigint, bigint]>()
+  if (!allFinite || (tactic === undefined && finiteCases > FINITE_QUANTIFY_THRESHOLD)) {
+    for (const binder of used) {
+      const range = consecutive(binder)
+      if (range && !usedNonLinearly(body, binder.name)) bounded.set(binder.name, range)
+    }
+  }
+  if (allFinite && bounded.size === 0) {
     if (longestString(body, used) > MAX_STRING_LENGTH) {
       throw new TooLarge(`a string here can grow past ${MAX_STRING_LENGTH} characters, which is too large to check`)
     }
@@ -245,16 +328,7 @@ export function checksFor(binders: readonly Binder[], guard: Expr, claim: Expr, 
     for (const binder of [...used].reverse()) {
       text = `([${binder.domain!.map(leanScalar).join(", ")}].all fun ${binder.name} => ${text})`
     }
-    return [{ statement: ` : ${text} = true := by ${FINITE_TACTIC}`, cases }]
-  }
-  // An integer input over a run of consecutive values does not have to be
-  // split into cases: its bounds can be stated instead, which the arithmetic
-  // tactics use directly. Splitting is kept where the input is multiplied or
-  // divided by, because fixing its value is what makes that arithmetic linear.
-  const bounded = new Map<string, [bigint, bigint]>()
-  for (const binder of used) {
-    const range = consecutive(binder)
-    if (range && !usedNonlinearly(body, binder.name)) bounded.set(binder.name, range)
+    return [{ statement: ` : ${text} = true := by ${FINITE_TACTIC}`, cases: finiteCases }]
   }
   const finite = used.filter(b => b.domain && !bounded.has(b.name))
   const symbolic = used.filter(b => !b.domain || bounded.has(b.name))
@@ -264,6 +338,17 @@ export function checksFor(binders: readonly Binder[], guard: Expr, claim: Expr, 
   }
   const combinations = finite.reduce((n, b) => n * b.domain!.length, 1)
   if (combinations > MAX_SPECIALIZATIONS) {
+    // When all inputs are actually finite, fall back to direct enumeration if specialization would overflow.
+    if (allFinite) {
+      if (longestString(body, used) > MAX_STRING_LENGTH) {
+        throw new TooLarge(`a string here can grow past ${MAX_STRING_LENGTH} characters, which is too large to check`)
+      }
+      let text = printExpr(body)
+      for (const binder of [...used].reverse()) {
+        text = `([${binder.domain!.map(leanScalar).join(", ")}].all fun ${binder.name} => ${text})`
+      }
+      return [{ statement: ` : ${text} = true := by ${FINITE_TACTIC}`, cases: finiteCases }]
+    }
     throw new TooLarge(`the finite inputs have ${combinations} combinations alongside unbounded ones; the limit is ${MAX_SPECIALIZATIONS}`)
   }
   // An author's script goes inside parentheses, so that it has to be a complete
@@ -281,7 +366,8 @@ export function checksFor(binders: readonly Binder[], guard: Expr, claim: Expr, 
     const remaining = ir.freeVariables(implication(g, c))
     const parameters = symbolic.filter(b => remaining.has(b.name)).map(b => ` (${b.name} : ${leanType(b.ty)})`).join("")
     const proposition = g === ir.TRUE ? `${printExpr(c)} = true` : `${printExpr(g)} = true → ${printExpr(c)} = true`
-    checks.push({ statement: `${parameters} : ${proposition} := by ${script}`, cases: 0 })
+    // Attribute the full covered finite domain once on the first emitted check so skipped trivial specializations stay counted.
+    checks.push({ statement: `${parameters} : ${proposition} := by ${script}`, cases: allFinite && checks.length === 0 ? finiteCases : 0 })
   }
   visit(0, new Map())
   return checks
@@ -389,30 +475,101 @@ function abandoned(file: string): string | undefined {
   }
 }
 
-function runFile(lean: string, source: string, directory: string, name: string, timeout: number): Promise<LeanMessage[]> {
+/** Cached Lean header snapshots per `(lean binary, stdlib, header)`, published atomically as a directory holding both `.snap` and `.snap.deps`. */
+const snapshotPromises = new Map<string, Promise<string | undefined>>()
+
+function headerSnapshotDir(lean: string, header: string): string | undefined {
+  if (header === FULL_HEADER) return undefined
+  try {
+    const stat = statSync(lean)
+    const coreOlean = join(dirname(dirname(lean)), "lib", "lean", "Init", "Core.olean")
+    const libSig = existsSync(coreOlean) ? (() => { const s = statSync(coreOlean); return `${s.mtimeMs}:${s.size}` })() : ""
+    const id = createHash("sha256").update(`${lean}:${stat.mtimeMs}:${stat.size}\0${libSig}\0${header}`).digest("hex").slice(0, 24)
+    return join(cacheDirectory(), "snapshots", id)
+  } catch {
+    return undefined
+  }
+}
+
+async function ensureHeaderSnapshot(lean: string, header: string, directory: string): Promise<string | undefined> {
+  const targetDir = headerSnapshotDir(lean, header)
+  if (!targetDir) return undefined
+  const targetSnap = join(targetDir, "header.snap")
+  if (existsSync(targetSnap) && existsSync(`${targetSnap}.deps`)) return targetSnap
+  const pending = snapshotPromises.get(targetDir)
+  if (pending) return pending
+  const created = (async () => {
+    const stagingDir = `${targetDir}.tmp.${process.pid}.${threadId}.${randomUUID().slice(0, 8)}`
+    try {
+      mkdirSync(stagingDir, { recursive: true })
+      const probe = join(directory, `.snap-${process.pid}-${threadId}.lean`)
+      const stagedSnap = join(stagingDir, "header.snap")
+      await writeFile(probe, `${header}\n#check Nat\n`)
+      const release = await slot(30_000)
+      try {
+        await new Promise<void>((resolve, reject) => {
+          execFile(lean, [`--incr-header-save=${stagedSnap}`, "-DmaxErrors=0", "--json", probe], { maxBuffer: 1 << 26, timeout: 20_000, killSignal: "SIGKILL" }, error => {
+            if (error) reject(error)
+            else resolve()
+          })
+        })
+      } finally {
+        release()
+      }
+      if (existsSync(stagedSnap) && existsSync(`${stagedSnap}.deps`)) {
+        try {
+          renameSync(stagingDir, targetDir)
+        } catch {
+          // Another process published the same snapshot directory concurrently.
+          rmSync(stagingDir, { recursive: true, force: true })
+        }
+        if (existsSync(targetSnap) && existsSync(`${targetSnap}.deps`)) return targetSnap
+      }
+    } catch {
+      // Snapshots are purely an optimization; fall back to loading imports normally.
+    } finally {
+      rmSync(stagingDir, { recursive: true, force: true })
+      snapshotPromises.delete(targetDir)
+    }
+    return undefined
+  })()
+  snapshotPromises.set(targetDir, created)
+  return created
+}
+
+function runFile(lean: string, source: string, directory: string, name: string, timeout: number, snapshot?: string): Promise<LeanMessage[]> {
   return new Promise((resolve, reject) => {
     const file = join(directory, name)
     writeFile(file, source).then(() => {
-      // Lean stops reporting after 100 errors unless told otherwise, and a theorem it never reported on must not pass for proved.
-      execFile(lean, ["-DmaxErrors=0", "--json", file], { maxBuffer: 1 << 28, timeout, killSignal: "SIGKILL" }, (error, stdout, stderr) => {
-        if (error?.killed) return reject(new LeanTimeout())
-        if (error && typeof (error as NodeJS.ErrnoException).code === "string") {
-          return reject(new Error(`could not run Lean at ${lean}: ${error.message}`))
-        }
-        const messages: LeanMessage[] = []
-        for (const line of stdout.split("\n")) {
-          if (!line.startsWith("{")) continue
-          try {
-            messages.push(JSON.parse(line) as LeanMessage)
-          } catch {
-            // Not a diagnostic line.
+      const invoke = (snap: string | undefined) => {
+        const args = [...(snap ? [`--incr-load=${snap}`] : []), "-DmaxErrors=0", "--json", file]
+        // Lean stops reporting after 100 errors unless told otherwise, and a theorem it never reported on must not pass for proved.
+        execFile(lean, args, { maxBuffer: 1 << 28, timeout, killSignal: "SIGKILL" }, (error, stdout, stderr) => {
+          if (error?.killed) return reject(new LeanTimeout())
+          if (error && typeof (error as NodeJS.ErrnoException).code === "string") {
+            return reject(new Error(`could not run Lean at ${lean}: ${error.message}`))
           }
-        }
-        if (error && !messages.some(m => m.severity === "error")) {
-          return reject(new Error(`Lean exited abnormally: ${(stderr || stdout).trim().slice(0, 2000)}`))
-        }
-        resolve(messages)
-      })
+          const messages: LeanMessage[] = []
+          for (const line of stdout.split("\n")) {
+            if (!line.startsWith("{")) continue
+            try {
+              messages.push(JSON.parse(line) as LeanMessage)
+            } catch {
+              // Not a diagnostic line.
+            }
+          }
+          if (error && !messages.some(m => m.severity === "error")) {
+            // If a cached header snapshot is corrupt or incompatible, discard its directory and retry normally once.
+            if (snap) {
+              try { rmSync(dirname(snap), { recursive: true, force: true }) } catch { /* ignore */ }
+              return invoke(undefined)
+            }
+            return reject(new Error(`Lean exited abnormally: ${(stderr || stdout).trim().slice(0, 2000)}`))
+          }
+          resolve(messages)
+        })
+      }
+      invoke(snapshot)
     }, reject)
   })
 }
@@ -420,7 +577,7 @@ function runFile(lean: string, source: string, directory: string, name: string, 
 /** The axioms of Lean's own logic. A proof that rests on anything else, `sorry` above all, is not a proof. */
 const ACCEPTED_AXIOMS = new Set(["propext", "Classical.choice", "Quot.sound"])
 
-async function runChunk(lean: string, header: string, statements: string[], directory: string, name: string, strict: boolean, timeout: number): Promise<LeanOutcome[]> {
+async function runChunk(lean: string, header: string, statements: string[], directory: string, name: string, strict: boolean, timeout: number, snapshot?: string): Promise<LeanOutcome[]> {
   // Each theorem is followed by a question about it: which axioms does it
   // rest on? A theorem counts as proved only when Lean reports no error for
   // it *and* answers that question acceptably. Silence is never taken for
@@ -437,7 +594,7 @@ async function runChunk(lean: string, header: string, statements: string[], dire
   // The file ends with a command that always answers, to show that Lean reached the end.
   const sentinel = lines.length + 1
   lines.push("#check Nat")
-  const messages = await runFile(lean, lines.join("\n") + "\n", directory, name, timeout)
+  const messages = await runFile(lean, lines.join("\n") + "\n", directory, name, timeout, snapshot)
   if (!messages.some(message => message.severity === "information" && message.pos?.line === sentinel)) {
     throw new Error("Lean stopped before it had checked every theorem, so no result can be trusted")
   }
@@ -495,6 +652,9 @@ export async function prove(lean: string, header: string, statements: string[], 
       const size = Math.ceil(statements.length / workers)
       for (let i = 0; i < statements.length; i += size) chunks.push(statements.slice(i, i + size))
     }
+    // Reuse a cached header snapshot when running a modest number of chunks
+    // (avoids memory contention on wide fan-out while cutting startup in half).
+    const snapshot = chunks.length <= SNAPSHOT_MAX_CHUNKS ? await ensureHeaderSnapshot(lean, header, directory) : undefined
     // Lean bounds its tactics by work done, not by the clock, and reading a
     // huge theorem is not bounded at all. A file that runs past its time is
     // tried again one theorem at a time, so that only the slow one goes unproved.
@@ -504,7 +664,7 @@ export async function prove(lean: string, header: string, statements: string[], 
         // The slot is held while Lean runs, never while waiting for another.
         const release = await slot(timeout + 10_000)
         try {
-          return await runChunk(lean, header, chunk, directory, file, alone, timeout)
+          return await runChunk(lean, header, chunk, directory, file, alone, timeout, snapshot)
         } finally {
           release()
         }
@@ -540,6 +700,10 @@ export async function prove(lean: string, header: string, statements: string[], 
 }
 
 /** The Lean source for a set of statements, for inspection. */
-export function render(header: string, statements: string[]): string {
-  return header + "\n\n" + statements.map((statement, i) => `theorem c${i}${statement}`).join("\n\n") + "\n"
+export function render(header: string, statements: string[], comments?: ReadonlyMap<string, string>): string {
+  return header + "\n\n" + statements.map((statement, i) => {
+    const note = comments?.get(statement)
+    const comment = note ? note.split(/\r?\n/).map(line => `-- ${line}`).join("\n") + "\n" : ""
+    return `${comment}theorem c${i}${statement}`
+  }).join("\n\n") + "\n"
 }

@@ -1,8 +1,8 @@
 // Download the Lean release Pudding was built against, and keep the part of it Pudding uses.
 
-import { execFileSync, spawn } from "node:child_process"
+import { execFileSync, spawn, spawnSync } from "node:child_process"
 import { createHash } from "node:crypto"
-import { createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync } from "node:fs"
+import { copyFileSync, createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 import { Readable, Transform } from "node:stream"
@@ -106,12 +106,14 @@ export async function installLean(cwd: string, options: { full: boolean; local: 
     options.log("Unpacking")
     await unpack(archive, staging)
     if (!options.full) prune(join(staging, name))
+    const stagedBinary = join(staging, name, "bin", "lean")
+    const versionText = execFileSync(stagedBinary, ["--version"], { encoding: "utf8" }).trim()
     rmSync(target, { recursive: true, force: true })
     renameSync(join(staging, name), target)
+    options.log(`Installed ${versionText}`)
   } finally {
     rmSync(staging, { recursive: true, force: true })
   }
-  options.log(`Installed ${execFileSync(binary, ["--version"], { encoding: "utf8" }).trim()}`)
   return binary
 }
 
@@ -174,5 +176,19 @@ export function prune(target: string) {
       visit(path)
       if (!readdirSync(path).length) rmSync(path, { recursive: true })
     } else if (!keep.has(path) && !/^lib(leanshared|Init_shared).*\.(dylib|so)$/.test(entry.name)) rmSync(path)
+  }
+  // Strip local symbols from the kept binary and shared libraries when the host tools are available.
+  // Keep a backup of each file so a failed strip or macOS ad-hoc codesign never leaves a broken binary.
+  const stripArgs = process.platform === "darwin" ? ["-x"] : process.platform === "linux" ? ["--strip-unneeded"] : undefined
+  if (stripArgs) {
+    const binaries = [join(target, "bin", "lean"), ...readdirSync(library).filter(name => /^lib(leanshared|Init_shared).*\.(dylib|so)$/.test(name)).map(name => join(library, name))]
+    for (const file of binaries) {
+      const backup = `${file}.orig`
+      copyFileSync(file, backup)
+      const stripped = spawnSync("strip", [...stripArgs, file], { stdio: "ignore" })
+      const signedOk = stripped.status === 0 && (process.platform !== "darwin" || spawnSync("codesign", ["--force", "--sign", "-", file], { stdio: "ignore" }).status === 0)
+      if (!signedOk) renameSync(backup, file)
+      else rmSync(backup, { force: true })
+    }
   }
 }
