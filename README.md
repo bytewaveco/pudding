@@ -373,9 +373,12 @@ export default defineConfig({
 5. **Cross-check.** In a worker thread, each law is executed against the real code and compared with the model.
 
 Proved theorems are remembered by their full text and the Lean version, so
-Lean is only asked about what changed. The TypeScript side is read afresh on
-every run: reusing a whole result would mean guessing that nothing affecting
-module resolution had changed.
+Lean is only asked about what changed. They are remembered once for the
+whole machine, in Pudding's cache directory (`PUDDING_CACHE_DIR` moves it),
+so a new worktree or another project does not prove them again. Each version
+of Pudding keeps its own. The TypeScript
+side is read afresh on every run: reusing a whole result would mean guessing
+that nothing affecting module resolution had changed.
 
 All runs on the machine share one limit of a Lean process per core, so
 Vitest proving several law files at once does not start a Lean per core for

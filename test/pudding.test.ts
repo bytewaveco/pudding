@@ -2,7 +2,7 @@ import assert from "node:assert/strict"
 import { spawnSync } from "node:child_process"
 import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { isAbsolute, join } from "node:path"
 import { after, before, describe, test } from "node:test"
 import * as ir from "../src/ir.ts"
 import { checksFor, FAST_HEADER, prove } from "../dist/lean.js"
@@ -10,6 +10,12 @@ import { locateLean, run, type Report } from "../dist/runner.js"
 
 const fixtures = join(import.meta.dirname, "fixtures")
 const lean = locateLean({}, join(import.meta.dirname, ".."))
+// Every run here, and every Vitest it starts, uses that Lean and a proof log of its own.
+// A Lean found only on the PATH is left to be found there again.
+if (isAbsolute(lean)) process.env["PUDDING_LEAN"] = lean
+const cacheDirectory = mkdtempSync(join(tmpdir(), "pudding-cache-"))
+process.env["PUDDING_CACHE_DIR"] = cacheDirectory
+after(() => rmSync(cacheDirectory, { recursive: true, force: true }))
 const law = (report: Report, name: string) => {
   const found = report.laws.find(entry => entry.name === name)
   assert.ok(found, `no law named ${name}`)
@@ -343,6 +349,25 @@ law("a rectangle of height two has twice its width as area", domain<bigint>(), w
     assert.equal(third.laws.length, first.laws.length + 1)
     assert.equal(law(third, "a rectangle of height two has twice its width as area").status, "proved")
     assert.equal(third.obligations - third.cachedObligations, 3)
+  })
+
+  test("a theorem proved in one project is not proved again in another", async () => {
+    const [first, second] = [mkdtempSync(join(fixtures, ".tmp-")), mkdtempSync(join(fixtures, ".tmp-"))]
+    const log = mkdtempSync(join(tmpdir(), "pudding-cache-"))
+    process.env["PUDDING_CACHE_DIR"] = log
+    try {
+      for (const project of [first, second]) {
+        for (const name of ["tsconfig.json", "shapes.ts", "shapes.law.ts"]) cpSync(join(fixtures, "suite", name), join(project, name))
+      }
+      assert.equal((await run({ cwd: first })).cachedObligations, 0)
+      assert.equal((await run({ cwd: second, cache: false })).cachedObligations, 0)
+      const report = await run({ cwd: second })
+      // Only the false law's two rejected theorems go to Lean.
+      assert.equal(report.obligations - report.cachedObligations, 2)
+    } finally {
+      process.env["PUDDING_CACHE_DIR"] = cacheDirectory
+      for (const directory of [first, second, log]) rmSync(directory, { recursive: true, force: true })
+    }
   })
 
   test("a file that changes how an import resolves is seen at once", async () => {
