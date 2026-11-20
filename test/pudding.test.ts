@@ -179,7 +179,7 @@ describe("constructs that once produced a wrong proof", () => {
   for (const crossCheck of [true, false]) {
     test(`nothing is proved ${crossCheck ? "with" : "without"} executing the laws`, async () => {
       const report = await run({ cwd: join(fixtures, "soundness"), cache: false, crossCheck })
-      assert.equal(report.laws.length, 54)
+      assert.equal(report.laws.length, 55)
       // Two laws in merged.law.ts state the same functions correctly and must still be proved.
       for (const entry of report.laws) assert.equal(entry.status, entry.name.startsWith("FALSE") ? "failed" : "proved", `${entry.name}: ${JSON.stringify(entry.findings)}`)
       assert.equal(report.laws.filter(entry => entry.status === "proved").length, 2)
@@ -288,7 +288,13 @@ describe("constructs that once produced a wrong proof", () => {
 
   test("a built-in or a prototype changed without assigning to one of its properties is still seen", async () => {
     // A method called on a prototype itself, a getter defined on one, a built-in replaced, a prototype taken out by a pattern.
-    for (const [directory, reason] of [["method", /a prototype is modified/], ["getter", /a prototype is modified/], ["replaced", /`Map` is modified/], ["destructured", /a prototype is modified/]] as const) {
+    // Also a prototype taken out by a pattern from wherever the built-in is, by a parameter, through the global object, or by a quoted name.
+    const cases = [
+      ["method", /a prototype is modified/], ["getter", /a prototype is modified/], ["replaced", /`Map` is modified/], ["destructured", /a prototype is modified/],
+      ["pattern", /a prototype is modified/], ["nested", /a prototype is modified/], ["parameter", /a prototype is modified/], ["global", /a prototype is modified/],
+      ["quoted", /a prototype is modified/], ["globalGet", /a prototype is modified/],
+    ] as const
+    for (const [directory, reason] of cases) {
       const report = await run({ cwd: join(fixtures, "tampered", directory), cache: false, crossCheck: false })
       assert.equal(report.laws.length, 1)
       assert.equal(report.laws[0]!.status, "failed", directory)
@@ -304,6 +310,18 @@ describe("constructs that once produced a wrong proof", () => {
       assert.match(entry.findings[0]?.message ?? "", /without `strictNullChecks`/)
     }
     assert.equal(report.laws.length, 2)
+  })
+
+  test("a project that leaves `strict` to the compiler has strictNullChecks, and its domains are proved over", async () => {
+    const report = await run({ cwd: join(fixtures, "defaulted"), cache: false, crossCheck: false })
+    assert.deepEqual(report.errors, [])
+    assert.equal(law(report, "a value that may be undefined gives a bigint").status, "proved")
+    assert.equal(law(report, "FALSE: a value that may be undefined is itself").findings[0]?.kind, "counterexample")
+  })
+
+  test("a law whose inputs leave out part of its domain is never said to cover every input", async () => {
+    const report = await run({ cwd: join(fixtures, "loose"), cache: false })
+    for (const entry of report.laws) assert.notEqual(entry.status, "checked", entry.name)
   })
 
   test("an input type that refers to itself is refused without stopping the run", async () => {

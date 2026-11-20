@@ -121,3 +121,12 @@ export function missingMethod(): bigint {
   const holder = {} as { run: () => bigint }
   return holder.run()
 }
+
+/** `.filter` settles which elements it asks before the first callback, so what a callback appends is not asked. */
+export function filterWhileGrowing(): number[] {
+  const list = [1, 2]
+  return list.filter(item => {
+    if (item < 3) list.push(item + 2)
+    return true
+  })
+}

@@ -1,6 +1,6 @@
 import { describe, domain, expect, law, type Integer } from "@bytewaveco/pudding"
 import {
-  allOrThrow, anyOrThrow, copyOf, firstOrThrow, ownPrototype, priceOf, someThrows,
+  allOrThrow, anyOrThrow, copyOf, firstOrThrow, grownWhileFiltered, hasTwo, ownPrototype, priceOf, someThrows,
   addIf, allocate, area, bothOr, byStart, countDown, countUntilNegative, describeNode, distinct, end, expand, firstNegative, firstProblem, half, headAndRest,
   isSet, knows, labelOr, last, lookup, middle, orElse, orTruthy, overlap, positives, roundTo, scale, second, secondUnsafe, setEither, setOf, smallest, stepOr,
   sumOfDays, sumOfPositives, sumOfRounds, tally, third, third3, throughNext, twice, without, type Step,
@@ -212,6 +212,25 @@ describe("lists", () => {
     expect(countDown(3)).toEqual([3, 2, 1])
     expect(countDown(0)).toEqual([])
     expect(copyOf([1n, 2n])).toEqual([1n, 2n])
+  })
+
+  law("filter asks the elements the list had when it started", () => {
+    expect(grownWhileFiltered()).toEqual([1, 2])
+  })
+
+  law("CHECKED: a callback that ends without returning counts as false", () => {
+    expect(hasTwo()).toBe(true)
+  })
+
+  law("FALSE when executed: two Sets of different dates are equal", () => {
+    expect(new Set([new Date(1)])).toEqual(new Set([new Date(2)]))
+    expect(new Date(1)).toEqual(new Date(2))
+  })
+
+  law("CHECKED: dates are compared by their time", () => {
+    expect(new Set([new Date(1)])).toEqual(new Set([new Date(1)]))
+    expect(new Date(1)).not.toEqual(new Date(2))
+    expect(/a/).not.toEqual(/b/)
   })
 
   law("FALSE: a callback that throws gives an answer", domain<bigint>(), a => {

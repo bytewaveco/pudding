@@ -1,6 +1,6 @@
 import { domain, expect, law } from "@bytewaveco/pudding"
 import {
-  callAfterChain, compound, defaultBeforeBody, filterStale, flatShared, fromList, fromSet, listPatternBeforeItsName, missingMethod, patternBeforeItsName, patternPastEnd,
+  callAfterChain, compound, defaultBeforeBody, filterStale, filterWhileGrowing, flatShared, fromList, fromSet, listPatternBeforeItsName, missingMethod, patternBeforeItsName, patternPastEnd,
   perRound, restoredBySome, spreadThenPush,
 } from "./callbacks.ts"
 
@@ -65,4 +65,8 @@ law("FALSE: a callback .some never reaches puts the variable back", () => {
 
 law("FALSE: a method the object does not have gives a value", () => {
   expect(missingMethod()).toBe(0n)
+})
+
+law("FALSE: filter also asks what its callback appended", () => {
+  expect(filterWhileGrowing()).toEqual([1, 2, 3, 4])
 })

@@ -76,6 +76,8 @@ export interface Law {
   mentioned: Expr[]
   /** Every `expect()` in the law and in the functions it calls, keyed by `file:line:column`. */
   expectSites: Map<string, { file: string; line: number; column: number; text: string }>
+  /** Set when the inputs that can be built leave out part of what the domain declares, so executing the law does not cover it. */
+  narrowed?: boolean
   /** Set when the law could not be translated. */
   problem: ({ kind: "unsupported" | "invalid"; message: string } & Location) | undefined
 }
@@ -496,7 +498,8 @@ export class Translator {
       // Without strictNullChecks the compiler drops `undefined` from every type, so a domain that names
       // it would be covered without it. The instances are kept, so the law can still be executed.
       const options = this.program.getCompilerOptions()
-      if (hasDomain && !(options.strictNullChecks ?? options.strict ?? false)) {
+      if (hasDomain && !(options.strictNullChecks ?? options.strict ?? true)) {
+        law.narrowed = true
         throw new Unsupported("inputs are listed from their types, and without `strictNullChecks` a type does not say whether it holds undefined; turn it on in the tsconfig the laws are read with", args[1])
       }
       const waiting = law.instances
@@ -2077,11 +2080,17 @@ export class Translator {
     if (this.tampering === null) {
       this.tampering = undefined
       const builtins = new Set(["Math", "Object", "Array", "String", "Number", "BigInt", "Boolean", "JSON", "Reflect", "Function", "Symbol", "Map", "Set", "globalThis"])
+      // Whether an expression names a built-in, directly or through the global object: `Array`, `globalThis.Array`.
+      const fromBuiltin = (node: N): boolean => {
+        const root = rootOf(node)
+        return root.kind === K.Identifier && (root.text === "globalThis" || this.isBuiltin(root))
+      }
       // A prototype reached without naming a built-in first: `Object.getPrototypeOf(x)`, `x.__proto__`, or one held under another name.
       const prototype = (node: N): boolean =>
-        (node.kind === K.PropertyAccessExpression && (node.name.text === "__proto__" ||
-          (node.name.text === "prototype" && node.expression.kind === K.Identifier && this.isBuiltin(node.expression)))) ||
-        (node.kind === K.CallExpression && /^(Object|Reflect)\.getPrototypeOf$/.test(node.expression.getText(node.getSourceFile())) && this.isBuiltin(node.expression.expression))
+        (node.kind === K.PropertyAccessExpression && (node.name.text === "__proto__" || (node.name.text === "prototype" && fromBuiltin(node.expression)))) ||
+        (node.kind === K.ElementAccessExpression && node.argumentExpression.kind === K.StringLiteral &&
+          (node.argumentExpression.text === "__proto__" || (node.argumentExpression.text === "prototype" && fromBuiltin(node.expression)))) ||
+        (node.kind === K.CallExpression && /(^|\.)(Object|Reflect)\.getPrototypeOf$/.test(node.expression.getText(node.getSourceFile())))
       const throughPrototype = (node: N): boolean => {
         for (;;) {
           if (prototype(node)) return true
@@ -2136,12 +2145,16 @@ export class Translator {
         // A pattern can take the prototype out of a built-in under another name: `const { prototype } = Object`.
         const taken = node.kind === K.BindingElement ? node.propertyName ?? node.name : undefined
         if ((taken?.kind === K.Identifier || taken?.kind === K.StringLiteral) && (taken.text === "prototype" || taken.text === "__proto__")) {
-          // `__proto__` of any object is a prototype. `prototype` is one when the pattern takes a built-in apart.
-          let declaration = node.parent
-          while (declaration.kind === K.ObjectBindingPattern || declaration.kind === K.ArrayBindingPattern || declaration.kind === K.BindingElement) declaration = declaration.parent
-          let source = declaration.initializer
-          while (source && (source.kind === K.ParenthesizedExpression || source.kind === K.AsExpression || source.kind === K.NonNullExpression || source.kind === K.SatisfiesExpression)) source = source.expression
-          if (taken.text === "__proto__" || (source?.kind === K.Identifier && this.isBuiltin(source))) escapes = true
+          // `__proto__` of any object is a prototype. `prototype` is one when what the pattern takes apart
+          // is a built-in, whichever way it got there: its `prototype` is then declared by the language's
+          // own library. Where the type does not say, it is taken for one.
+          const whole = this.checker.getTypeAtLocation(node.parent)
+          const property = whole && !(whole.flags & (TypeFlags.Any | TypeFlags.Unknown)) ? this.checker.getPropertyOfType(whole, "prototype") : undefined
+          const declared = property?.declarations[0]?.resolve()
+          // A parameter's own type says nothing about what a caller hands it.
+          let holder = node.parent
+          while (holder.kind === K.ObjectBindingPattern || holder.kind === K.ArrayBindingPattern || holder.kind === K.BindingElement) holder = holder.parent
+          if (taken.text === "__proto__" || holder.kind === K.Parameter || !declared || this.program.isSourceFileDefaultLibrary(declared.getSourceFile())) escapes = true
         }
         if (escapes || (target && target.kind !== K.Identifier && throughPrototype(target)) ||
           (writes && (node.arguments as N[]).slice(0, 1).some(throughPrototype))) {
@@ -2333,8 +2346,10 @@ export class Translator {
           let reached: Expr = ir.TRUE
           return items.map((item, index) => {
             if (reached.t === "lit" && !reached.value) return { item, pass: method === "every" ? ir.TRUE : ir.FALSE }
+            const started = this.instance?.obligations.length ?? 0
             const answer = this.under(reached, () => invoke(first, [item, position(index)]))
             // A callback that throws wherever it is reached ends everything there: nothing later is asked.
+            if (answer.k === "bottom") this.refuseFallOff(started, node)
             const pass = answer.k === "bottom" ? (method === "every" ? ir.TRUE : ir.FALSE) : this.truthy(answer, node)
             reached = answer.k === "bottom" ? ir.FALSE : ir.and(reached, ir.not(settles(pass)))
             return { item, pass }
@@ -2351,11 +2366,19 @@ export class Translator {
         // Every element is asked, in order. Each one that may or may not pass doubles the lists there
         // could be, so only a few may be undecided.
         // What is kept is the element as it was read, before its callback ran: a callback may change the list.
+        // The range is settled before the first callback, so what a callback appends is not asked;
+        // each element is read when its turn comes.
         const asked: { item: Value; pass: Expr }[] = []
-        for (const [index, item] of items.entries()) {
+        const length = items.length
+        for (let index = 0; index < length; index++) {
+          const item = items[index]!
+          const started = this.instance?.obligations.length ?? 0
           const answer = invoke(first, [item, position(index)])
           // A callback that always throws ends the call there.
-          if (answer.k === "bottom") return BOTTOM
+          if (answer.k === "bottom") {
+            this.refuseFallOff(started, node)
+            return BOTTOM
+          }
           asked.push({ item, pass: this.truthy(answer, node) })
         }
         if (asked.filter(({ pass }) => pass.t !== "lit").length > MAX_UNDECIDED) throw new Unsupported(`\`.filter\` over more than ${MAX_UNDECIDED} elements that may or may not pass is not supported`, node)
@@ -2383,6 +2406,18 @@ export class Translator {
       }
       default:
         throw new Unsupported(`the array method \`.${method}\` is not supported`, node)
+    }
+  }
+
+  /**
+   * A callback that ends without returning gives undefined, which a list
+   * method takes as false and goes on. A call that ends that way is modeled
+   * as never giving a value, like a throw, so such a callback is refused
+   * rather than taken for one that throws.
+   */
+  private refuseFallOff(since: number, node: N) {
+    if (this.instance?.obligations.slice(since).some(obligation => obligation.kind === "falloff")) {
+      throw new Unsupported("a callback that ends without returning a value is not supported here; return a value on every path", node)
     }
   }
 
