@@ -1,9 +1,12 @@
 // Print obligations as Lean theorems and run Lean over them.
 
 import { execFile } from "node:child_process"
+import { randomUUID } from "node:crypto"
+import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { mkdtemp, rm, writeFile } from "node:fs/promises"
 import { availableParallelism, tmpdir } from "node:os"
 import { join } from "node:path"
+import { setTimeout as sleep } from "node:timers/promises"
 import * as ir from "./ir.ts"
 import type { Binder, Expr, Scalar } from "./ir.ts"
 
@@ -299,6 +302,93 @@ interface LeanMessage {
 /** Lean was stopped because it ran past its time limit. */
 class LeanTimeout extends Error {}
 
+/**
+ * How many Lean processes may run at once on this machine, counting every
+ * Pudding run. Vitest proves each law file in a worker of its own, and
+ * without a shared limit each of them would start a Lean per core.
+ */
+const SLOTS = availableParallelism()
+const slotDirectory = join(tmpdir(), `pudding-slots-${process.getuid?.() ?? "user"}`)
+/** Waiting this long for a slot means the slots are stuck, not busy, and Lean then runs unpaced. */
+const SLOT_WAIT_MS = 120_000
+/** The slots this thread holds, given back if it exits while Lean runs. */
+const held = new Map<string, string>()
+process.on("exit", () => {
+  for (const [file, token] of held) release(file, token)
+})
+
+/**
+ * Wait for one of the machine's Lean slots, and return what gives it back. A
+ * slot is a file created exclusively, holding its owner's process id and the
+ * time by which its Lean will have been stopped, counted from when the slot
+ * was taken. A slot whose owner has exited or is past that time is taken
+ * over. Slots only pace the work: where they cannot be used, Lean runs unpaced.
+ */
+async function slot(timeout: number): Promise<() => void> {
+  if (!slotsUsable()) return () => {}
+  const started = Date.now()
+  for (let wait = 5; Date.now() - started < SLOT_WAIT_MS; wait = Math.min(wait * 2, 50)) {
+    for (let n = 0; n < SLOTS; n++) {
+      const file = join(slotDirectory, String(n))
+      const token = `${process.pid} ${Date.now() + timeout} ${randomUUID()}`
+      try {
+        writeFileSync(file, token, { flag: "wx" })
+        held.set(file, token)
+        return () => {
+          held.delete(file)
+          release(file, token)
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") return () => {}
+        // Only the claim judged abandoned is removed, never one made since.
+        const claim = abandoned(file)
+        if (claim !== undefined) release(file, claim)
+      }
+    }
+    await sleep(wait)
+  }
+  return () => {}
+}
+
+function slotsUsable(): boolean {
+  try {
+    mkdirSync(slotDirectory, { recursive: true, mode: 0o700 })
+    // A directory another user made first would let them hold every slot.
+    return process.getuid === undefined || statSync(slotDirectory).uid === process.getuid()
+  } catch {
+    return false
+  }
+}
+
+/** Give a slot back only while it is still this run's: one taken over belongs to another run now. */
+function release(file: string, token: string): void {
+  try {
+    if (readFileSync(file, "utf8") === token) rmSync(file, { force: true })
+  } catch {
+    // Already gone.
+  }
+}
+
+/** The claim in a slot, when its owner has exited or overrun its deadline. */
+function abandoned(file: string): string | undefined {
+  let claim: string
+  try {
+    claim = readFileSync(file, "utf8")
+  } catch {
+    return undefined
+  }
+  const [pid, deadline] = claim.split(" ").map(Number)
+  try {
+    // An empty slot is being written, or its owner stopped before writing it.
+    if (!pid || !deadline) return Date.now() - statSync(file).mtimeMs > 1_000 ? claim : undefined
+    if (Date.now() > deadline) return claim
+    process.kill(pid, 0)
+    return undefined
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ESRCH" ? claim : undefined
+  }
+}
+
 function runFile(lean: string, source: string, directory: string, name: string, timeout: number): Promise<LeanMessage[]> {
   return new Promise((resolve, reject) => {
     const file = join(directory, name)
@@ -411,7 +501,13 @@ export async function prove(lean: string, header: string, statements: string[], 
     const attempt = async (chunk: string[], file: string): Promise<LeanOutcome[]> => {
       const timeout = FILE_TIMEOUT_MS + THEOREM_TIMEOUT_MS * chunk.length
       try {
-        return await runChunk(lean, header, chunk, directory, file, alone, timeout)
+        // The slot is held while Lean runs, never while waiting for another.
+        const release = await slot(timeout + 10_000)
+        try {
+          return await runChunk(lean, header, chunk, directory, file, alone, timeout)
+        } finally {
+          release()
+        }
       } catch (error) {
         if (!(error instanceof LeanTimeout)) throw error
         if (chunk.length === 1) return [{ ok: false, message: `Lean did not finish within ${timeout / 1000} seconds` }]
@@ -420,12 +516,23 @@ export async function prove(lean: string, header: string, statements: string[], 
         return outcomes
       }
     }
+    // At most `processes` files at a time from this run, each starting as soon
+    // as one before it finishes, and all within the machine's Lean slots.
     const results: LeanOutcome[][] = []
-    // At most one process per core at a time.
-    for (let i = 0; i < chunks.length; i += Math.max(1, processes)) {
-      const wave = chunks.slice(i, i + Math.max(1, processes))
-      results.push(...await Promise.all(wave.map((chunk, n) => attempt(chunk, `Proof${i + n}.lean`))))
+    let next = 0
+    let stopped = false
+    const worker = async () => {
+      while (!stopped && next < chunks.length) {
+        const i = next++
+        try {
+          results[i] = await attempt(chunks[i]!, `Proof${i}.lean`)
+        } catch (error) {
+          stopped = true
+          throw error
+        }
+      }
     }
+    await Promise.all(Array.from({ length: Math.min(Math.max(1, processes), chunks.length) }, worker))
     return results.flat()
   } finally {
     await rm(directory, { recursive: true, force: true })
