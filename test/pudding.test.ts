@@ -67,7 +67,7 @@ describe("the suite project", () => {
 
   test("code outside the supported subset is executed instead and says so", () => {
     const sampled = law(report, "SAMPLED: the total of a pair is their sum")
-    assert.match(sampled.notes[0] ?? "", /not proved: the array method `\.filter` is not supported \(fallback\.ts:2:10\)/)
+    assert.match(sampled.notes[0] ?? "", /not proved: the array method `\.concat` is not supported \(fallback\.ts:2:10\)/)
     assert.equal(law(report, "FALSE when executed: totals ignore the first amount").findings[0]?.kind, "counterexample")
   })
 
@@ -129,8 +129,7 @@ describe("imperative code", () => {
 
   test("what cannot be modeled exactly is refused by name", () => {
     const note = (name: string) => law(report, name).notes[0] ?? ""
-    assert.match(note("SAMPLED: a closure that writes an outer variable"), /uses `count`, a variable that is reassigned outside it/)
-    assert.match(note("CHECKED: a closure that reads a reassigned variable"), /uses `value`, a variable that is reassigned outside it/)
+    assert.match(note("SAMPLED: a closure that outlives the variable it assigns"), /uses `count`, a variable that is reassigned, after the function that declared it has returned/)
     assert.match(note("SAMPLED: assignment used as a value"), /assignment used as a value/)
     assert.match(note("counted loops > SAMPLED: a loop bounded by a large input cannot be unrolled"), /how many times this loop runs depends on a value that is not known here/)
   })
@@ -180,7 +179,7 @@ describe("constructs that once produced a wrong proof", () => {
   for (const crossCheck of [true, false]) {
     test(`nothing is proved ${crossCheck ? "with" : "without"} executing the laws`, async () => {
       const report = await run({ cwd: join(fixtures, "soundness"), cache: false, crossCheck })
-      assert.equal(report.laws.length, 39)
+      assert.equal(report.laws.length, 52)
       // Two laws in merged.law.ts state the same functions correctly and must still be proved.
       for (const entry of report.laws) assert.equal(entry.status, entry.name.startsWith("FALSE") ? "failed" : "proved", `${entry.name}: ${JSON.stringify(entry.findings)}`)
       assert.equal(report.laws.filter(entry => entry.status === "proved").length, 2)
@@ -270,6 +269,38 @@ describe("constructs that once produced a wrong proof", () => {
     // With execution the law is run on a sample, which does not happen to include the one value that breaks it.
     const executed = await run({ cwd: join(fixtures, "patched"), cache: false })
     assert.equal(law(executed, "FALSE: a magnitude is never negative").status, "sampled")
+  })
+
+  test("a module that replaces how Maps and Sets answer loses the model of them", async () => {
+    const report = await run({ cwd: join(fixtures, "collections"), cache: false, crossCheck: false })
+    assert.match(law(report, "FALSE: a Map gives what was put into it").findings[0]?.message ?? "", /`Map` is modified at .*collections\.ts:2/)
+    assert.match(law(report, "FALSE: a Set only has what was added").findings[0]?.message ?? "", /`Map` is modified/)
+  })
+
+  test("a prototype held under another name is not trusted to stay as it is", async () => {
+    for (const crossCheck of [true, false]) {
+      const report = await run({ cwd: join(fixtures, "prototype"), cache: false, crossCheck })
+      const entry = law(report, "FALSE: a property the object does not have is undefined")
+      assert.equal(entry.status, "failed")
+      assert.match(JSON.stringify(entry.findings), crossCheck ? /the law fails when executed/ : /a prototype is modified, stored or handed on at .*prototype\.ts:2/)
+    }
+  })
+
+  test("a built-in or a prototype changed without assigning to one of its properties is still seen", async () => {
+    // A method called on a prototype itself, a getter defined on one, a built-in replaced, a prototype taken out by a pattern.
+    for (const [directory, reason] of [["method", /a prototype is modified/], ["getter", /a prototype is modified/], ["replaced", /`Map` is modified/], ["destructured", /a prototype is modified/]] as const) {
+      const report = await run({ cwd: join(fixtures, "tampered", directory), cache: false, crossCheck: false })
+      assert.equal(report.laws.length, 1)
+      assert.equal(report.laws[0]!.status, "failed", directory)
+      assert.match(report.laws[0]!.findings[0]?.message ?? "", reason, directory)
+    }
+  })
+
+  test("an input type that refers to itself is refused without stopping the run", async () => {
+    const report = await run({ cwd: join(fixtures, "recursive"), cache: false })
+    assert.deepEqual(report.errors, [])
+    assert.match(JSON.stringify(law(report, "recursive type").findings), /refers to itself/)
+    assert.equal(law(report, "an ordinary law in the same file").status, "proved")
   })
 
   test("an import that TypeScript and Node resolve to different files stops the run", async () => {
@@ -476,6 +507,39 @@ test("objects changed in place: no false law is proved by the model alone", asyn
     if (name.startsWith("FALSE") || name.startsWith("REFUSED")) assert.equal(entry.status, "failed", entry.name)
     else assert.equal(entry.status, "proved", `${entry.name}: ${JSON.stringify(entry.findings)}`)
   }
+})
+
+describe("everyday idioms: undefined, defaults, rounding, lists, Maps and running totals", () => {
+  // Each construct has a law that states it correctly and one that states it
+  // wrongly. The wrong ones must fail on the model alone, without executing.
+  for (const crossCheck of [true, false]) {
+    test(`every law lands in the status its name announces, ${crossCheck ? "with" : "without"} executing the laws`, async () => {
+      const report = await run({ cwd: join(fixtures, "idioms"), cache: false, crossCheck })
+      assert.deepEqual(report.errors, [])
+      assert.ok(report.laws.length >= 50)
+      for (const entry of report.laws) {
+        const expected = announced(entry.name)
+        // Without executing, a law that is refused has nothing behind it and fails.
+        assert.equal(entry.status, crossCheck || expected === "proved" ? expected : "failed", `${entry.name}: ${JSON.stringify(entry.findings)}`)
+      }
+      assert.deepEqual(report.laws.flatMap(entry => entry.findings).filter(f => f.kind === "mismatch"), [])
+    })
+  }
+
+  test("what is refused, and what throws, is named", async () => {
+    const report = await run({ cwd: join(fixtures, "idioms"), cache: false })
+    const note = (name: string) => law(report, name).notes[0] ?? ""
+    const finding = (name: string) => law(report, name).findings[0]
+    assert.match(note("callbacks with a running total > SAMPLED: a callback of .some that updates a variable"), /a callback of `\.some` assigns to a variable outside it/)
+    assert.match(note("callbacks with a running total > SAMPLED: a closure that outlives the variable it updates"), /after the function that declared it has returned/)
+    assert.match(note("callbacks with a running total > SAMPLED: an update on the right side of &&"), /the right side of `&&` assigns to a variable outside it/)
+    assert.match(note("lists > SAMPLED: sorting by keys that are not known"), /sorting is supported where the order of the elements is known here/)
+    assert.match(note("Map and Set > SAMPLED: a callback that uses the variable of a for loop around it"), /uses `i`, the variable of a `for` loop around it/)
+    assert.equal(finding("values that may be undefined > FALSE: there is always a second node")?.kind, "throws")
+    assert.match(finding("values that may be undefined > FALSE: what follows a ?. never throws")?.message ?? "", /reads a property of undefined/)
+    assert.deepEqual(finding("rounding > FALSE: a half rounds away from zero")?.inputs, { n: "-1" })
+    assert.equal(finding("rounding > FALSE: any whole number rounds exactly")?.kind, "inexact")
+  })
 })
 
 test("padStart and padEnd follow JavaScript for known strings and the text of whole numbers", async () => {

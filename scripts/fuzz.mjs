@@ -137,7 +137,9 @@ class Generator {
   expr(type, scope, depth) {
     const r = this.random
     const leaf = () => {
-      const candidates = scope.visible().filter(e => e.kind === "var" && e.type === type && !(e.outside && e.mutable))
+      // A closure reads a reassigned variable of an enclosing function as it is when the closure is called.
+      const far = r.chance(0.5)
+      const candidates = scope.visible().filter(e => e.kind === "var" && e.type === type && (far || !(e.outside && e.mutable)))
       if (candidates.length && r.chance(0.75)) {
         const chosen = r.pick(candidates)
         scope.noteRead(chosen.name)
@@ -186,6 +188,27 @@ class Generator {
         return `${fn.name}(${args.join(", ")})`
       })
     }
+    // A predicate over one element of a list, with the element in scope.
+    const predicate = t => {
+      const inner = new Scope(scope, true)
+      const name = `e${this.counter++}`
+      inner.names.set(name, { kind: "var", type: t })
+      return `${name} => ${this.expr("bool", inner, depth - 1)}`
+    }
+    // A value that may be undefined, and what stands in for it.
+    const maybe = t => r.pick([
+      () => `(${sub("bool")} ? ${sub(t)} : undefined)`,
+      () => `(${sub("bool")} ? { p: ${sub(t)} } : undefined)?.p`,
+      () => `({ p: ${sub(t)} } as { p: ${TS[t]}; q?: ${TS[t]} }).${r.pick(["p", "q"])}`,
+      () => `[${sub(t)}, ${sub(t)}].find(${predicate(t)})`,
+      () => `[${sub(t)}, ${sub(t)}].at(${r.pick([-3, -1, 0, 1, 2])})`,
+      () => `new Map<string, ${TS[t]}>([[${sub("str")}, ${sub(t)}], [${sub("str")}, ${sub(t)}]]).get(${sub("str")})`,
+    ])()
+    add(1.2, () => `(${maybe(type)} ?? ${sub(type)})`)
+    // TypeScript rejects a literal as the left side, so the value goes through a call.
+    const opaque = t => `call((): ${TS[t]} => ${sub(t)})`
+    if (type !== "bool") add(0.8, () => `(${opaque(type)} ${r.pick(["||", "&&"])} ${sub(type)})`)
+    add(0.5, () => `(${maybe(type)} || ${sub(type)})`)
     const table = this.tables.find(t => !t.list && t.type === type && scope.lookup(t.key))
     if (table) add(1.5, () => `${table.name}[${table.key}]`)
     const listTable = this.tables.find(t => t.list && scope.lookup(t.key))
@@ -193,6 +216,18 @@ class Generator {
     if (type === "bool") {
       const cmp = r.pick(["big", "num"])
       add(2, () => `(!${sub("bool")})`)
+      // Zero, the empty string and undefined count as false; everything else as true.
+      add(1, () => `(!${opaque(r.pick(["big", "num", "str"]))})`)
+      add(0.8, () => {
+        const t = r.pick(TYPES)
+        return `(${maybe(t)} ${r.pick(["===", "!=="])} undefined)`
+      })
+      add(0.6, () => `(${sub("num")} ${r.pick(["<", "<=", ">", ">="])} (${maybe("num")} ?? ${r.pick(["Infinity", "-Infinity"])}))`)
+      add(0.6, () => {
+        const t = r.pick(["big", "num", "str"])
+        return `new Set([${sub(t)}, ${sub(t)}]).has(${sub(t)})`
+      })
+      add(0.4, () => `new Set<number | bigint>([${sub("num")}, ${sub("big")}]).has(${sub(r.pick(["num", "big"]))})`)
       add(2, () => `(${sub("bool")} ${r.pick(["&&", "||"])} ${sub("bool")})`)
       add(3, () => {
         const t = r.pick(TYPES)
@@ -220,6 +255,8 @@ class Generator {
       add(0.4, () => `(${sub("big")} ${r.pick(["/", "%"])} ${sub("big")})`)
       add(0.7, () => `BigInt(${sub("num")})`)
       add(1, () => `[${sub("big")}, ${sub("big")}, ${sub("big")}].reduce((s, e) => s ${r.pick(["+", "-", "*"])} e, ${sub("big")})`)
+      add(0.8, () => `[${sub("big")}, ${sub("big")}, ${sub("big")}].filter(${predicate("big")}).reduce((s, e) => s + e, ${sub("big")})`)
+      add(0.5, () => `[${sub("big")}, ${sub("big")}].flatMap(e => (${sub("bool")} ? [e, ${sub("big")}] : [])).reduce((s, e) => s - e, ${sub("big")})`)
     } else if (type === "num") {
       add(4, () => `(${sub("num")} ${r.pick(["+", "-", "*"])} ${sub("num")})`)
       add(1, () => `(-${sub("num")})`)
@@ -229,6 +266,17 @@ class Generator {
       add(1.5, () => `Math.${r.pick(["abs", "sign"])}(${sub("num")})`)
       add(1.5, () => `Math.${r.pick(["min", "max"])}(${sub("num")}, ${sub("num")})`)
       add(0.7, () => `Number(${sub("big")})`)
+      // A half rounds upward, whatever its sign.
+      add(1.5, () => `Math.round(${sub("num")} / ${literal(r.pick(NUMS.filter(v => v !== 0)))})`)
+      add(0.7, () => {
+        const t = r.pick(TYPES)
+        return `new Set([${sub(t)}, ${sub(t)}, ${sub(t)}]).size`
+      })
+      add(0.7, () => `[${sub("big")}, ${sub("big")}, ${sub("big")}].filter(${predicate("big")}).length`)
+      add(0.5, () => {
+        const values = r.sample(NUMS, 3)
+        return `[${values.map(literal).join(", ")}].sort((x, y) => ${r.pick(["x - y", "y - x", "Math.abs(x) - Math.abs(y)"])})[${r.int(3)}]!`
+      })
       add(0.7, () => `[${sub(r.pick(TYPES))}, ${sub("bool")}].length`)
       if (listTable) add(1, () => `${listTable.name}[${listTable.key}].length`)
     } else {
@@ -315,7 +363,9 @@ class Generator {
       scope.names.set(name, { kind: "var", type, mutable })
       return [`${mutable ? "let" : "const"} ${name}: ${TS[type]} = ${value}`]
     })
-    const assignable = scope.visible().filter(e => e.kind === "var" && e.mutable && !e.outside)
+    // A function may assign to a variable of the function it is declared in.
+    const reach = r.chance(0.5)
+    const assignable = scope.visible().filter(e => e.kind === "var" && e.mutable && (reach || !e.outside))
     if (assignable.length) {
       add(4, () => {
         const target = r.pick(assignable)
@@ -450,6 +500,43 @@ class Generator {
       scope.names.set(m, { kind: "var", type, mutable: true })
       // Make the outcome depend on the running value.
       lines.push(`if ((${m} as ${TS[type]}) === (${literal(this.value(type))} as ${TS[type]})) return ${this.expr(context.returns, scope, 1)}`)
+      return lines
+    })
+    // A function called in the middle of an expression changes what the rest of the expression
+    // reads: a list that is being spread, filtered or mapped, or the variable being assigned to.
+    add(1.2, () => {
+      const [l, g, k] = [`l${this.counter++}`, `g${this.counter++}`, `k${this.counter++}`]
+      const value = () => this.expr("big", scope, 1)
+      // Growing the list is left to the uses that read its length once, or they would never end.
+      const grows = r.chance(0.5)
+      const effect = grows ? `${l}.push(${value()})` : `${l}[${r.int(2)}] = ${value()}`
+      const uses = [
+        `[...${l}, ${g}(), ...${l}]`,
+        `${l}.filter(e => ${g}() !== e)`,
+        `${l}.flatMap(e => (${g}() === e ? ${l} : [e, ...${l}]))`,
+        `${l}.map(e => e + ${g}())`,
+        `[${g}(), ...${l}].map((e, i) => e - (${l}[i] ?? ${value()}))`,
+        `[${l}.length === ${2 + r.int(2)} ? ${g}() : ${value()}, ${l}.at(-1) ?? ${value()}, ...${l}]`,
+      ]
+      if (!grows) uses.push(`Array.from(${l}, e => e - ${g}())`)
+      const lines = [
+        `const ${l}: bigint[] = [${value()}, ${value()}]`,
+        `const ${g} = (): bigint => { ${effect}; return ${value()} }`,
+        `const ${k}: bigint = ${r.pick(uses)}.reduce((s, e) => s * 3n + e, ${value()})`,
+      ]
+      scope.names.set(k, { kind: "var", type: "big", mutable: false })
+      return lines
+    })
+    add(0.8, () => {
+      const type = r.pick(["big", "num"])
+      const [t, b] = [`t${this.counter++}`, `b${this.counter++}`]
+      const value = () => (type === "num" ? literal(this.value("num")) : this.expr("big", scope, 1))
+      const lines = [
+        `let ${t}: ${TS[type]} = ${value()}`,
+        `const ${b} = (): ${TS[type]} => { ${t} ${r.pick(["=", "+=", "-="])} ${value()}; return ${value()} }`,
+        r.pick([`${t} ${r.pick(["+=", "-="])} ${b}()`, `${t} = ${t} ${r.pick(["+", "-"])} ${b}()`, `${t} = ${b}() ${r.pick(["+", "-"])} ${t}`, `${t} ${r.pick(["+=", "-="])} (${this.expr("bool", scope, 1)} ? ${b}() : ${value()})`]),
+      ]
+      scope.names.set(t, { kind: "var", type, mutable: true })
       return lines
     })
     // A variable that holds a value only on some paths.

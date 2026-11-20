@@ -1,12 +1,16 @@
 import { domain, expect, law } from "@bytewaveco/pudding"
-import { chained, makeCounter, mutatesObject, pushes, readsLater, whileLoop } from "./refused.ts"
+import { chained, countsLater, makeCounter, mutatesObject, pushes, readsLater, whileLoop } from "./refused.ts"
 
-law("SAMPLED: a closure that writes an outer variable", domain<bigint>(), start => {
+law("a closure may assign to a variable of the function that is still running", domain<bigint>(), start => {
   expect(makeCounter(start)).toEqual(start + 1n)
 })
 
-law("CHECKED: a closure that reads a reassigned variable", domain<boolean>(), flag => {
+law("a closure reads a reassigned variable as it is when called", domain<boolean>(), flag => {
   expect(readsLater(flag)).toEqual(flag ? 2n : 1n)
+})
+
+law("SAMPLED: a closure that outlives the variable it assigns", domain<bigint>(), start => {
+  expect(countsLater(start)).toEqual(start + 2n)
 })
 
 law("an object the function made itself may be changed in place", domain<bigint>(), amount => {

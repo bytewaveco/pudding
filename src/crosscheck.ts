@@ -69,6 +69,7 @@ function buildArgument(shape: ArgShape, env: Map<string, Scalar>, numbers: Set<s
   switch (shape.k) {
     case "binder": return numbers.has(shape.name) ? Number(env.get(shape.name)) : env.get(shape.name)
     case "const": return shape.num ? Number(shape.value) : shape.value
+    case "undefined": return undefined
     case "array": return shape.items.map(item => buildArgument(item, env, numbers))
     case "record": return Object.fromEntries(shape.fields.map(([key, field]) => [key, buildArgument(field, env, numbers)]))
   }

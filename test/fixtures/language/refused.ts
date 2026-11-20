@@ -8,6 +8,20 @@ export function makeCounter(start: bigint): bigint {
   return count
 }
 
+function counterFrom(start: bigint) {
+  let count = start
+  return () => {
+    count += 1n
+    return count
+  }
+}
+
+export function countsLater(start: bigint): bigint {
+  const next = counterFrom(start)
+  next()
+  return next()
+}
+
 export function readsLater(flag: boolean): bigint {
   let value = 1n
   const read = () => value
