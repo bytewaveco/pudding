@@ -77,3 +77,9 @@ jobs:
       - run: npm publish --provenance ${{ inputs.dry-run && '--dry-run' || '' }}
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      # Until there is a release that is not a beta, `latest` follows the newest beta,
+      # so that a plain `npm install` does not get an older one.
+      - if: ${{ !inputs.dry-run }}
+        run: npm dist-tag add "@bytewaveco/pudding@$(node -p "require('./package.json').version")" latest
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

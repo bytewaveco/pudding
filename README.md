@@ -388,7 +388,8 @@ things.
 
 2. **Pudding itself.** Set the version in `package.json`, commit, and run
    Release with target `package`. It is published under the dist-tag in
-   `publishConfig`, which is `beta` for now.
+   `publishConfig`, which is `beta` for now, and `latest` is moved to it as
+   well while every release is a beta.
 
 Both need an `NPM_TOKEN` secret that may publish to the `@bytewaveco` scope.
 Tick `dry-run` to go through everything except the upload.
