@@ -292,7 +292,7 @@ describe("constructs that once produced a wrong proof", () => {
     const cases = [
       ["method", /a prototype is modified/], ["getter", /a prototype is modified/], ["replaced", /`Map` is modified/], ["destructured", /a prototype is modified/],
       ["pattern", /a prototype is modified/], ["nested", /a prototype is modified/], ["parameter", /a prototype is modified/], ["global", /a prototype is modified/],
-      ["quoted", /a prototype is modified/], ["globalGet", /a prototype is modified/],
+      ["quoted", /a prototype is modified/], ["globalGet", /a prototype is modified/], ["computed", /a prototype is modified/],
     ] as const
     for (const [directory, reason] of cases) {
       const report = await run({ cwd: join(fixtures, "tampered", directory), cache: false, crossCheck: false })
@@ -321,6 +321,7 @@ describe("constructs that once produced a wrong proof", () => {
 
   test("a law whose inputs leave out part of its domain is never said to cover every input", async () => {
     const report = await run({ cwd: join(fixtures, "loose"), cache: false })
+    assert.equal(law(report, "SAMPLED: a value that may be undefined is a bigint").status, "sampled")
     for (const entry of report.laws) assert.notEqual(entry.status, "checked", entry.name)
   })
 

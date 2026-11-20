@@ -1,6 +1,6 @@
 import { describe, domain, expect, law, type Integer } from "@bytewaveco/pudding"
 import {
-  allOrThrow, anyOrThrow, copyOf, firstOrThrow, grownWhileFiltered, hasTwo, ownPrototype, priceOf, someThrows,
+  allOrThrow, anyOrThrow, copyOf, sortOne, firstOrThrow, grownWhileFiltered, hasTwo, ownPrototype, priceOf, someThrows,
   addIf, allocate, area, bothOr, byStart, countDown, countUntilNegative, describeNode, distinct, end, expand, firstNegative, firstProblem, half, headAndRest,
   isSet, knows, labelOr, last, lookup, middle, orElse, orTruthy, overlap, positives, roundTo, scale, second, secondUnsafe, setEither, setOf, smallest, stepOr,
   sumOfDays, sumOfPositives, sumOfRounds, tally, third, third3, throughNext, twice, without, type Step,
@@ -202,6 +202,10 @@ describe("lists", () => {
     const list = [3, 1, 2]
     expect(smallest(list)).toBe(1)
     expect(list).toEqual([1, 2, 3])
+  })
+
+  law("CHECKED: a comparing function that could throw", domain<1 | 2>(), a => {
+    expect(sortOne(a)).toEqual([a])
   })
 
   law("SAMPLED: sorting by keys that are not known", domain<[Integer, Integer]>(), ([a, b]) => {

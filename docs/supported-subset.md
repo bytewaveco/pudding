@@ -39,8 +39,8 @@ the subset grows.
 ## Limits worth knowing
 
 - `Math.round` of a quotient is exact while the number divided stays strictly between -2^52 and 2^52, which each use must prove like any other bound.
-- `.sort` and `.toSorted` take up to 64 elements, because every three of them are checked against each other.
-- Law inputs are listed from their types, which needs `strictNullChecks`: without it a type does not say whether it holds `undefined`, and a law with a domain is executed instead of proved.
+- `.sort` and `.toSorted` take up to 64 elements, because every three of them are checked against each other. The comparing function may not assert or be able to throw: every pair is compared to check it, which is more than an engine compares.
+- Law inputs are listed from their types, which needs `strictNullChecks`: without it a type does not say whether it holds `undefined`, and a law with a domain is not proved. Where laws are executed, it is run on the inputs the compiler still lists and reported as sampled.
 - Each element of a `.filter` that may or may not pass, and each result of a `.flatMap` that depends on a condition, doubles the lists there could be. Up to 8 such elements are followed.
 - Each optional property of an input, and each part of it that may be `undefined`, multiplies the shapes the input can take. More than 64 shapes are refused, and so is an input type that refers to itself or has more than 10,000 parts.
 - Looping over a `Map` or a `Set` needs to know which of its keys are equal. Keys that are inputs are fine for `.get`, `.has` and `.size`.

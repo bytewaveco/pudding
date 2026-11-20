@@ -201,6 +201,14 @@ export function someThrows(a: bigint): boolean {
   })
 }
 
+/** An engine never compares the only element of a list with itself, so this never throws. */
+export function sortOne(a: number): number[] {
+  return [a].sort((x, y) => {
+    if (x === y) throw new Error("compared with itself")
+    return x - y
+  })
+}
+
 /** Sorts the caller's list in place and returns the smallest. */
 export function smallest(list: number[]): number | undefined {
   list.sort((a, b) => a - b)

@@ -1732,11 +1732,23 @@ export class Translator {
           if (element.kind !== K.SpreadElement) return { spread: false, value: this.evalExpr(element, env) }
           return { spread: true, value: this.copied(this.evalExpr(element.expression, env), element, "cannot spread", "into an array") }
         })
-        const join = (index: number, items: Value[]): Value => {
-          const part = parts[index]
-          if (!part) return this.fresh({ k: "array", items })
-          if (!part.spread) return join(index + 1, [...items, part.value])
-          return this.over(part.value, copy => (copy.k === "array" ? join(index + 1, [...items, ...copy.items]) : BOTTOM))
+        // Elements and lists that are one thing are joined in a row; only a list that depends on a condition forks.
+        const join = (from: number, before: Value[]): Value => {
+          const items = [...before]
+          let index = from
+          for (; index < parts.length; index++) {
+            const part = parts[index]!
+            if (!part.spread) {
+              items.push(part.value)
+              continue
+            }
+            const copy = this.settled(part.value)
+            if (copy.k === "choice") break
+            if (copy.k !== "array") return BOTTOM
+            items.push(...copy.items)
+          }
+          if (index === parts.length) return this.fresh({ k: "array", items })
+          return this.over(parts[index]!.value, copy => (copy.k === "array" ? join(index + 1, [...items, ...copy.items]) : BOTTOM))
         }
         return join(0, [])
       }
@@ -2143,8 +2155,10 @@ export class Translator {
           escapes = stored || passed || called
         }
         // A pattern can take the prototype out of a built-in under another name: `const { prototype } = Object`.
-        const taken = node.kind === K.BindingElement ? node.propertyName ?? node.name : undefined
-        if ((taken?.kind === K.Identifier || taken?.kind === K.StringLiteral) && (taken.text === "prototype" || taken.text === "__proto__")) {
+        // The name a pattern takes: `{ prototype }`, `{ prototype: p }` and `{ ["prototype"]: p }` alike.
+        const named = node.kind === K.BindingElement ? node.propertyName ?? node.name : undefined
+        const taken = named?.kind === K.ComputedPropertyName ? named.expression : named
+        if ((taken?.kind === K.Identifier || taken?.kind === K.StringLiteral || taken?.kind === K.NoSubstitutionTemplateLiteral) && (taken.text === "prototype" || taken.text === "__proto__")) {
           // `__proto__` of any object is a prototype. `prototype` is one when what the pattern takes apart
           // is a built-in, whichever way it got there: its `prototype` is then declared by the language's
           // own library. Where the type does not say, it is taken for one.
@@ -2382,14 +2396,31 @@ export class Translator {
           asked.push({ item, pass: this.truthy(answer, node) })
         }
         if (asked.filter(({ pass }) => pass.t !== "lit").length > MAX_UNDECIDED) throw new Unsupported(`\`.filter\` over more than ${MAX_UNDECIDED} elements that may or may not pass is not supported`, node)
-        const keep = (index: number, kept: Value[]): Value => (index === asked.length ? this.fresh({ k: "array", items: kept })
-          : this.branch(asked[index]!.pass, () => keep(index + 1, [...kept, asked[index]!.item]), () => keep(index + 1, kept)))
+        // Elements that are known to pass or not are taken in a row; only one that may or may not pass forks.
+        const keep = (from: number, before: Value[]): Value => {
+          const kept = [...before]
+          let index = from
+          for (; index < asked.length && asked[index]!.pass.t === "lit"; index++) if ((asked[index]!.pass as { value: Scalar }).value) kept.push(asked[index]!.item)
+          if (index === asked.length) return this.fresh({ k: "array", items: kept })
+          return this.branch(asked[index]!.pass, () => keep(index + 1, [...kept, asked[index]!.item]), () => keep(index + 1, kept))
+        }
         return keep(0, [])
       }
       case "flatMap": {
         // Each callback runs in order; what it returns is spread one level if it is a list.
         // A list a callback returns is copied as it returns: a later callback may change that list.
-        const parts = items.map((item, index) => this.over(invoke(first, [item, position(index)]), part => (part.k === "array" ? this.fresh({ k: "array", items: [...part.items] }) : part)))
+        const parts: Value[] = []
+        const length = items.length
+        for (let index = 0; index < length; index++) {
+          const started = this.instance?.obligations.length ?? 0
+          const answer = invoke(first, [items[index]!, position(index)])
+          // A callback that always throws ends the call there.
+          if (answer.k === "bottom") {
+            this.refuseFallOff(started, node)
+            return BOTTOM
+          }
+          parts.push(this.over(answer, part => (part.k === "array" ? this.fresh({ k: "array", items: [...part.items] }) : part)))
+        }
         let undecided = 0
         const count = (part: Value): void => {
           if (part.k === "choice") {
@@ -2400,8 +2431,20 @@ export class Translator {
         }
         parts.forEach(count)
         if (undecided > MAX_UNDECIDED) throw new Unsupported(`\`.flatMap\` over more than ${MAX_UNDECIDED} results that depend on a condition is not supported`, node)
-        const join = (index: number, joined: Value[]): Value => (index === parts.length ? this.fresh({ k: "array", items: joined })
-          : this.over(parts[index]!, part => (part.k === "bottom" ? BOTTOM : join(index + 1, part.k === "array" ? [...joined, ...part.items] : [...joined, part]))))
+        // Results that are one thing are joined in a row; only one that depends on a condition forks.
+        const join = (from: number, before: Value[]): Value => {
+          const joined = [...before]
+          let index = from
+          for (; index < parts.length; index++) {
+            const part = this.settled(parts[index]!)
+            if (part.k === "choice") break
+            if (part.k === "bottom") return BOTTOM
+            if (part.k === "array") joined.push(...part.items)
+            else joined.push(part)
+          }
+          if (index === parts.length) return this.fresh({ k: "array", items: joined })
+          return this.over(parts[index]!, part => (part.k === "bottom" ? BOTTOM : join(index + 1, part.k === "array" ? [...joined, ...part.items] : [...joined, part])))
+        }
         return join(0, [])
       }
       default:
@@ -2434,12 +2477,16 @@ export class Translator {
     // Every pair is compared and every three are checked against each other.
     if (items.length > MAX_SORTED) throw new Unsupported(`sorting more than ${MAX_SORTED} elements is not supported`, node)
     const refusal = () => new Unsupported("sorting is supported where the order of the elements is known here: each comparison has to come out as a known number", node)
+    const started = this.instance?.obligations.length ?? 0
     const signs = this.unchanging("a comparing function of `.sort`", node, () => items.map(a => items.map(b => {
       const result = compare(a, b)
       if (!isNumber(result) || result.k !== "scalar") throw refusal()
       const value = this.settle(result.e, refusal).value as bigint
       return value < 0n ? -1 : value > 0n ? 1 : 0
     })))
+    // Every pair was compared here, which an engine does not do. Anything a comparison asserts, or could
+    // throw on, would count for pairs that are never compared when the code runs.
+    if ((this.instance?.obligations.length ?? 0) > started) throw new Unsupported("a comparing function of `.sort` that asserts, or that could throw, is not supported", node)
     const n = items.length
     for (let i = 0; i < n; i++) {
       for (let j = 0; j < n; j++) {
@@ -2485,7 +2532,14 @@ export class Translator {
       const made: Value[] = []
       for (let index = 0; index < items.length; index++) {
         if (index >= MAX_ITERATIONS) throw new Unsupported(`a list of more than ${MAX_ITERATIONS} elements is too long to build`, node)
-        made.push(this.call(make, [items[index]!, scalar(ir.lit(BigInt(index)), true)], node))
+        const started = this.instance?.obligations.length ?? 0
+        const item = this.call(make, [items[index]!, scalar(ir.lit(BigInt(index)), true)], node)
+        // A function that always throws ends the call there. One that ends without returning gives undefined, which is modeled like a throw, so it is refused.
+        if (item.k === "bottom") {
+          this.refuseFallOff(started, node)
+          return BOTTOM
+        }
+        made.push(item)
         if (entered !== undefined && (from as { log: { items: Value[] } }).log.items.length !== entered) {
           throw new Unsupported("adding to a Map or a Set inside the function that `Array.from` walks it with is not supported", node)
         }
@@ -2585,7 +2639,6 @@ export class Translator {
   }
 
   private collectionMethod(collection: Extract<Value, { k: "map" | "set" }>, method: string, args: Value[], node: N): Value {
-    const entries = this.entries(collection)
     const [first, second] = args
     if (collection.k === "map" && method === "set" && args.length === 2) {
       this.add(collection, [first!, second!], node)
@@ -2598,6 +2651,7 @@ export class Translator {
     if ((method === "has" || (method === "get" && collection.k === "map")) && args.length === 1) {
       // Looking up a value that cannot be a key finds nothing.
       const wanted = this.settled(first!)
+      const entries = this.entries(collection)
       if (wanted.k === "choice" || wanted.k === "bottom") throw new Unsupported(`\`.${method}\` is supported with a key that is one kind of value`, node)
       const matches = entries.map(entry => (wanted.k === "scalar" ? this.sameKey(entry.key, wanted) : ir.FALSE))
       if (method === "has") return scalar(matches.reduce(ir.or, ir.FALSE))
