@@ -590,6 +590,7 @@ export async function run(options: RunOptions = {}): Promise<Report> {
           message: obligation.kind === "nothrow" ? "this divides by zero"
             : obligation.kind === "falloff" ? "this function reaches its end without returning a value"
             : obligation.kind === "missing" ? "this reads a property the object does not have"
+            : obligation.kind === "inherited" ? "this reads a property that every object inherits, which is not modeled"
             : obligation.kind === "undefined" ? "this reads a property of undefined, or calls it" : "this throw is reached",
         })
       }
@@ -605,6 +606,7 @@ export async function run(options: RunOptions = {}): Promise<Report> {
         : obligation.kind === "undefined" ? "Lean could not prove that this value is never undefined"
         : obligation.kind === "falloff" ? "Lean could not prove that this function always returns a value"
         : obligation.kind === "missing" ? "Lean could not prove that this key is always a property of the object"
+        : obligation.kind === "inherited" ? "Lean could not prove that this key never names a property every object inherits"
         : "Lean could not prove that this throw is never reached"
       entry.findings.push({ kind: "unproved", message, ...at, detail: rejected.message.split("\n").slice(0, 8).join("\n") })
     }

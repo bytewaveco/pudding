@@ -104,3 +104,20 @@ export function defaultBeforeBody(c: number, a = () => inner()) {
   function inner() { return 1 }
   return a() + c
 }
+
+/** `.some` stops at the first match, so the second callback never puts the first value back. */
+export function restoredBySome(): bigint {
+  const zero = 0n
+  let n = zero
+  ;[true, false].some(flag => {
+    n = flag ? 1n : zero
+    return true
+  })
+  return n
+}
+
+/** Calling a method the object does not have throws. */
+export function missingMethod(): bigint {
+  const holder = {} as { run: () => bigint }
+  return holder.run()
+}

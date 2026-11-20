@@ -179,7 +179,7 @@ describe("constructs that once produced a wrong proof", () => {
   for (const crossCheck of [true, false]) {
     test(`nothing is proved ${crossCheck ? "with" : "without"} executing the laws`, async () => {
       const report = await run({ cwd: join(fixtures, "soundness"), cache: false, crossCheck })
-      assert.equal(report.laws.length, 52)
+      assert.equal(report.laws.length, 54)
       // Two laws in merged.law.ts state the same functions correctly and must still be proved.
       for (const entry of report.laws) assert.equal(entry.status, entry.name.startsWith("FALSE") ? "failed" : "proved", `${entry.name}: ${JSON.stringify(entry.findings)}`)
       assert.equal(report.laws.filter(entry => entry.status === "proved").length, 2)
@@ -521,6 +521,9 @@ describe("everyday idioms: undefined, defaults, rounding, lists, Maps and runnin
         const expected = announced(entry.name)
         // Without executing, a law that is refused has nothing behind it and fails.
         assert.equal(entry.status, crossCheck || expected === "proved" ? expected : "failed", `${entry.name}: ${JSON.stringify(entry.findings)}`)
+        // A false law has to be refuted by the model, not just refused by it, unless its name says it is only caught when executed.
+        const own = entry.name.split(" > ").at(-1)!
+        if (!crossCheck && own.startsWith("FALSE:")) assert.ok(entry.findings.length > 0 && entry.findings.every(f => f.kind !== "unsupported"), `${entry.name}: ${JSON.stringify(entry.findings)}`)
       }
       assert.deepEqual(report.laws.flatMap(entry => entry.findings).filter(f => f.kind === "mismatch"), [])
     })

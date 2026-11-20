@@ -39,6 +39,17 @@ export function secondUnsafe(node: Node): bigint {
   return node.next!.value
 }
 
+/** A key the object does not have reads as undefined, whether or not the key is known where it is used. */
+export function priceOf(key: string): bigint {
+  return ({ a: 1n } as Record<string, bigint | undefined>)[key] ?? 0n
+}
+
+/** A property called `prototype` on an ordinary object is an ordinary property. */
+export function ownPrototype(a: bigint): bigint {
+  const { prototype } = { prototype: a }
+  return prototype
+}
+
 export function isSet(node: Node | undefined): boolean {
   return node !== undefined
 }
@@ -119,6 +130,28 @@ export function firstNegative(list: bigint[]): bigint | undefined {
 
 export function expand(list: bigint[]): bigint[] {
   return list.flatMap(item => (item > 0n ? [item, item] : []))
+}
+
+/** A callback after the first match is never called, so its throw is never reached. */
+export function firstOrThrow(a: bigint): bigint | undefined {
+  return [a, a + 1n].find(item => {
+    if (item === a) return true
+    throw new Error("asked past the first match")
+  })
+}
+
+export function anyOrThrow(a: bigint): boolean {
+  return [a, a + 1n].some(item => {
+    if (item === a) return true
+    throw new Error("asked past the first match")
+  })
+}
+
+export function allOrThrow(a: bigint): boolean {
+  return [a, a + 1n].every(item => {
+    if (item === a) return false
+    throw new Error("asked past the first failure")
+  })
 }
 
 export function last(list: bigint[]): bigint | undefined {
