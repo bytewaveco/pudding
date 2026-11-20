@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 372" width="800" height="372" role="img" aria-labelledby="title desc">
+  <title id="title">A Vitest run with a unit test and two laws</title>
+  <desc id="desc">Output of npx vitest run with the verbose reporter. The unit test in pages.test.ts passes, having checked one input. The law "every item is on a page" in pages.law.ts passes, proved for 100,000,000 inputs. The law "the last page is never empty" fails: the expectation (pageCount(items, perPage) - 1) * perPage &lt; items does not hold with items = 1 and perPage = 1, where the actual value is false and the expected value is true. Test files: 1 failed, 1 passed. Tests: 1 failed, 2 passed.</desc>
+  <style>
+    svg { --card: #ffffff; --stroke: #d1d9e0; --text: #1f2328; --muted: #59636e; --green: #1a7f37; --red: #cf222e; --amber: #9a6700; --shadow: 0.07; }
+    @media (prefers-color-scheme: dark) { svg { --card: #161b22; --stroke: #30363d; --text: #e6edf3; --muted: #9198a1; --green: #3fb950; --red: #f85149; --amber: #d29922; --shadow: 0; } }
+    text { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; font-size: 13.5px; fill: var(--text); white-space: pre; }
+    .card { fill: var(--card); stroke: var(--stroke); stroke-width: 1; }
+    .shadow { flood-color: #1f2328; flood-opacity: var(--shadow); }
+    .muted { fill: var(--muted); }
+    .green { fill: var(--green); }
+    .red { fill: var(--red); }
+    .amber { fill: var(--amber); }
+    .bold { font-weight: 600; }
+    .note { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif; font-size: 11.5px; font-weight: 600; }
+    .pill { fill-opacity: 0.1; stroke-opacity: 0.4; stroke-width: 1; }
+    rect.muted { stroke: var(--muted); }
+    rect.green { stroke: var(--green); }
+    rect.red { stroke: var(--red); }
+  </style>
+  <defs>
+    <filter id="shadow" x="-5%" y="-10%" width="110%" height="130%">
+      <feDropShadow class="shadow" dx="0" dy="1" stdDeviation="2"/>
+    </filter>
+  </defs>
+
+  <rect class="card" x="16" y="12" width="768" height="348" rx="12" filter="url(#shadow)"/>
+
+  <text x="40" y="48" xml:space="preserve"><tspan class="muted">$</tspan> npx vitest run --reporter verbose</text>
+
+  <text x="40" y="92" xml:space="preserve"> <tspan class="green">✓</tspan> src/pages.test.ts <tspan class="muted">&gt;</tspan> 25 items at 10 a page take 3 pages</text>
+  <rect class="pill muted" x="668" y="77" width="92" height="22" rx="11"/>
+  <text class="note muted" x="714" y="92" text-anchor="middle">1 input</text>
+
+  <text x="40" y="118" xml:space="preserve"> <tspan class="green">✓</tspan> src/pages.law.ts <tspan class="muted">&gt;</tspan> every item is on a page</text>
+  <rect class="pill green" x="552" y="103" width="208" height="22" rx="11"/>
+  <text class="note green" x="656" y="118" text-anchor="middle">proved for 100,000,000 inputs</text>
+
+  <text x="40" y="144" xml:space="preserve"> <tspan class="red">×</tspan> src/pages.law.ts <tspan class="muted">&gt;</tspan> the last page is never empty</text>
+  <rect class="pill red" x="636" y="129" width="124" height="22" rx="11"/>
+  <text class="note red" x="698" y="144" text-anchor="middle">counterexample</text>
+
+  <text class="red" x="40" y="170" xml:space="preserve">   → the expectation does not hold</text>
+  <text x="40" y="196" xml:space="preserve">  expect((pageCount(items, perPage) - 1) * perPage &lt; items).toBe(true)</text>
+  <text x="40" y="222" xml:space="preserve">  with <tspan class="amber bold">items = 1, perPage = 1</tspan></text>
+  <text x="40" y="248" xml:space="preserve">  actual:   false</text>
+  <text x="40" y="274" xml:space="preserve">  expected: true</text>
+
+  <text x="40" y="314" xml:space="preserve"><tspan class="muted"> Test Files</tspan>  <tspan class="red bold">1 failed</tspan> <tspan class="muted">|</tspan> <tspan class="green bold">1 passed</tspan> <tspan class="muted">(2)</tspan></text>
+  <text x="40" y="340" xml:space="preserve"><tspan class="muted">      Tests</tspan>  <tspan class="red bold">1 failed</tspan> <tspan class="muted">|</tspan> <tspan class="green bold">2 passed</tspan> <tspan class="muted">(3)</tspan></text>
+</svg>
