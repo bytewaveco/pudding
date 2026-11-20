@@ -244,6 +244,8 @@ describe(name, () => { ... })               // also describe.skip, describe.only
 | an object type | every plain object with exactly its properties, in every combination of their values |
 | a tuple | every combination of its elements |
 | a union of object types | every alternative |
+| any of these, or `undefined` | every value, and `undefined` |
+| an optional property | the property with every value, and the object without it |
 
 A plain `number` cannot be an input, because it also covers fractions, NaN and
 infinities. Functions that take a `number` accept an `Integer`. An object type
@@ -266,9 +268,11 @@ are made of. The [examples](examples) cover money, orders, stock, ballots, job
 queues and leave requests.
 
 - **Proved:** booleans, bigints, strings and whole numbers; objects, arrays
-  and tuples; `if`, `switch` and loops of known length; local changes in
-  place; functions in any module; `const` tables; `Math` rounding; `.map`,
-  `.reduce`, `.some`, `.every` and `.includes`.
+  and tuples; values that may be `undefined`, with `??`, `?.` and defaults;
+  `if`, `switch` and loops of known length; local changes in place;
+  functions in any module, and callbacks that keep a running total; `const`
+  tables; `Map` and `Set`; `Math` rounding; `.map`, `.filter`, `.find`,
+  `.reduce`, `.some`, `.every`, `.includes` and `.sort`.
 - **Refused:** fractions, loops whose length depends on an input, recursion,
   classes, async code, regular expressions and library calls.
 
@@ -309,9 +313,9 @@ $ npx pudding --reporter verbose
 A failed law says why:
 
 - **A counterexample.** The inputs are named as the law names them, with both sides of the failed equality.
-- **A throw that can be reached**, including division by zero, a lookup with a key the table does not have, and a function that ends without returning. A law holds only if the code it calls cannot throw for the inputs it covers.
+- **A throw that can be reached**, including division by zero, a lookup with a key the table does not have, reading a property of `undefined`, and a function that ends without returning. A law holds only if the code it calls cannot throw for the inputs it covers.
 - **A law file that throws when it is loaded.** Nothing in it holds at run time, whatever was proved.
-- **A number that stops being exact.** A result beyond 2^53 − 1, or a remainder by zero.
+- **A number that stops being exact.** A result beyond 2^53 − 1, a remainder by zero, or a `Math.round` of a quotient whose dividend reaches 2^52.
 - **An expectation that is never reached.** A guard that is never true would otherwise pass silently. When Pudding can neither find an input that reaches an expectation nor prove that none exists, the law keeps its verdict and carries a note saying so.
 - **No proof and no counterexample.** The law may be true but beyond the automation. [Supply a proof](#supplying-a-proof).
 - **A disagreement between the model and the running code.** See [What a proof means](#what-a-proof-means).

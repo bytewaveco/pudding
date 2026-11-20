@@ -47,6 +47,7 @@ export type ArgShape =
   | { k: "const"; value: Scalar; num?: boolean }
   | { k: "record"; fields: [string, ArgShape][] }
   | { k: "array"; items: ArgShape[] }
+  | { k: "undefined" }
 
 export interface LawInstance {
   /** What is known about the inputs beyond their types, such as the bounds of an integer. */
@@ -90,6 +91,17 @@ type Value =
   | { k: "bottom" }
   /** `undefined`, as returned by a function that returns nothing. */
   | { k: "void" }
+  /** `Infinity` or `-Infinity`. It can be compared with a number and nothing else. */
+  | { k: "infinite"; negative: boolean }
+  /**
+   * A `Map` or a `Set`, as the list of what was put into it, oldest first: a
+   * `[key, value]` pair for each `set`, a `[key]` for each `add`. A later
+   * entry with the same key replaces an earlier one. The list is an ordinary
+   * array of the model, so adding to a collection is a change in place like
+   * any other.
+   */
+  | { k: "map"; log: Extract<Value, { k: "array" }> }
+  | { k: "set"; log: Extract<Value, { k: "array" }> }
   /** A `const` or `let` whose block has been entered but whose declaration has not run yet. */
   | { k: "uninitialized" }
 
@@ -130,6 +142,10 @@ type Shape =
   | { k: "record"; fields: [string, Shape][] }
   | { k: "tuple"; items: Shape[] }
   | { k: "union"; alts: Shape[] }
+  /** `undefined` as an input. */
+  | { k: "void" }
+  /** An optional property that the object does not have. Only an alternative of a property's shape. */
+  | { k: "absent" }
 
 /** A variable. Only variables that are reassigned somewhere are `mutable`. */
 interface Cell {
@@ -173,10 +189,10 @@ class Env {
   child() {
     return new Env(this)
   }
-  /** Names of the reassignable variables visible from here. */
-  mutableNames(into = new Set<string>()): Set<string> {
-    for (const [name, cell] of this.vars) if (cell.mutable) into.add(name)
-    return this.parent ? this.parent.mutableNames(into) : into
+  /** The reassignable variables visible from here, by name. An inner one hides an outer one of the same name. */
+  mutableCells(into = new Map<string, Cell | undefined>()): Map<string, Cell | undefined> {
+    for (const [name, cell] of this.vars) if (!into.has(name)) into.set(name, cell.mutable ? cell : undefined)
+    return this.parent ? this.parent.mutableCells(into) : into
   }
 }
 
@@ -212,6 +228,9 @@ const MAX_ITERATIONS = 2_000
 const MAX_INSTANCES = 256
 const NUMBER_HELP = "`number` covers fractions, NaN and infinities, which are not modeled; use `Integer` from pudding for whole numbers, or bigint"
 const MAX_ALTERNATIVES = 64
+const MAX_TYPE_DEPTH = 24
+/** How many elements of one `.filter` or `.flatMap` may depend on a condition; the lists there could be double with each. */
+const MAX_UNDECIDED = 8
 const MODULE_DECLARATIONS = new Set<number>([
   K.ImportDeclaration, K.ExportDeclaration, K.ExportAssignment, K.VariableStatement, K.FunctionDeclaration, K.ClassDeclaration,
   K.InterfaceDeclaration, K.TypeAliasDeclaration, K.EnumDeclaration, K.ModuleDeclaration, K.ImportEqualsDeclaration, K.EmptyStatement,
@@ -249,6 +268,9 @@ function describe(value: Value): string {
     case "choice": return "a value that depends on a condition"
     case "bottom": return "a thrown error"
     case "void": return "nothing"
+    case "infinite": return "Infinity"
+    case "map": return "a Map"
+    case "set": return "a Set"
     case "uninitialized": return "a variable that is not initialized yet"
   }
 }
@@ -265,6 +287,8 @@ export class Translator {
   private pc: Expr[] = []
   /** Every reassignable variable that is live, so their values can be saved and merged around branches. */
   private cells: Cell[] = []
+  /** Where in `cells` the variables of the function being evaluated start; those before it belong to its callers. */
+  private frame = 0
   /** For each function being evaluated, the names it assigns to anywhere in its body. */
   private assigned: Set<string>[] = []
   private steps = 0
@@ -470,6 +494,7 @@ export class Translator {
         this.pc = [...instance.assumptions]
         this.stack = []
         this.cells = []
+        this.frame = 0
         bindingLog.length = 0
         this.writes = []
         this.epoch = ++epochs
@@ -479,7 +504,11 @@ export class Translator {
         this.assigned = [facts.assigned]
         const env = scope ? scope.child() : new Env()
         try {
-          if (instance.arg) this.bind(callback.parameters[0].name, this.valueOf(instance.arg), env, true, true)
+          if (instance.arg) {
+            // Every name of the pattern is in scope, uninitialized, while the defaults before it run.
+            for (const bound of boundNames(callback.parameters[0].name)) env.set(bound, UNINITIALIZED)
+            this.bind(callback.parameters[0].name, this.valueOf(instance.arg), env, true, true)
+          }
           const body = callback.body
           if (body.kind === K.Block) this.block(body.statements, env, { next: () => VOID })
           else this.effect(body, env)
@@ -561,7 +590,9 @@ export class Translator {
 
   // ---------------------------------------------------------------- domains
 
-  private shapeOf(type: Type, at: Node): Shape {
+  private shapeOf(type: Type, at: Node, depth = 0): Shape {
+    // A type that refers to itself, as a list node does, has no end to list.
+    if (depth > MAX_TYPE_DEPTH) throw new Unsupported("this input type is nested too deeply to list its values, or refers to itself", at)
     const flags = type.flags
     const name = () => this.checker.typeToString(type)
     if (flags & TypeFlags.Boolean) return { k: "scalar", ty: "bool", values: [true, false] }
@@ -576,6 +607,7 @@ export class Translator {
       return { k: "scalar", ty: "int", num: true, values: [BigInt(value)] }
     }
     if (flags & TypeFlags.Number) throw new Unsupported(NUMBER_HELP, at)
+    if (flags & TypeFlags.Undefined) return { k: "void" }
     if (type.isIntersectionType()) {
       // `Integer<Min, Max>` is `number` intersected with a marker that carries the bounds.
       const members = type.getTypes()
@@ -597,19 +629,24 @@ export class Translator {
       }
     }
     if (type.isUnionType()) {
-      const members = type.getTypes().map(member => this.shapeOf(member, at))
-      const first = members[0] as Extract<Shape, { k: "scalar" }>
-      if (members.every(m => m.k === "scalar" && m.values && m.ty === first.ty && !!m.num === !!first.num)) {
+      // `undefined` may join any other type: the input is then a value of that type, or undefined.
+      const all = type.getTypes().map(member => this.shapeOf(member, at, depth + 1))
+      const members = all.filter(member => member.k !== "void")
+      const first = members[0] as Extract<Shape, { k: "scalar" }> | undefined
+      let shape: Shape
+      if (!first) shape = { k: "void" }
+      else if (members.every(m => m.k === "scalar" && m.values && m.ty === first.ty && !!m.num === !!first.num)) {
         const values = [...new Set(members.flatMap(m => (m as { values: Scalar[] }).values))]
-        return { k: "scalar", ty: first.ty, values, ...(first.num ? { num: true } : {}) }
-      }
-      if (members.every(m => m.k !== "scalar")) return { k: "union", alts: members }
-      throw new Unsupported(`the union type ${name()} mixes kinds of values that are not supported together`, at)
+        shape = { k: "scalar", ty: first.ty, values, ...(first.num ? { num: true } : {}) }
+      } else if (members.length === 1) shape = first
+      else if (members.every(m => m.k !== "scalar")) shape = { k: "union", alts: members }
+      else throw new Unsupported(`the union type ${name()} mixes kinds of values that are not supported together`, at)
+      return members.length < all.length && first ? { k: "union", alts: [...(shape.k === "union" ? shape.alts : [shape]), { k: "void" }] } : shape
     }
     if (this.checker.isTupleType(type)) {
       const elementFlags = ((type as N).getTarget?.().elementFlags ?? (type as N).elementFlags ?? []) as number[]
       if (elementFlags.some(flag => flag !== ElementFlags.Required)) throw new Unsupported("optional and rest tuple elements are not supported", at)
-      return { k: "tuple", items: this.checker.getTypeArguments(type as N).map(item => this.shapeOf(item, at)) }
+      return { k: "tuple", items: this.checker.getTypeArguments(type as N).map(item => this.shapeOf(item, at, depth + 1)) }
     }
     if (this.checker.isArrayType(type)) throw new Unsupported("arrays of unknown length are not supported as inputs; use a tuple", at)
     if (flags & TypeFlags.Object) {
@@ -619,12 +656,13 @@ export class Translator {
       }
       const fields: [string, Shape][] = []
       for (const property of this.checker.getPropertiesOfType(type)) {
-        if (property.flags & SymbolFlags.Optional) throw new Unsupported(`optional property \`${property.name}\` is not supported in an input`, at)
         // A property keyed by a symbol has no string name; its compiler name starts like this.
         if (String(property.escapedName).startsWith("__@")) throw new Unsupported(`${name()} has a property keyed by a symbol, which is not supported in an input`, at)
         const propertyType = this.checker.getTypeOfSymbol(property)
         if (!propertyType) throw new Unsupported(`the type of \`${property.name}\` could not be resolved`, at)
-        fields.push([property.name, this.shapeOf(propertyType, at)])
+        const shape = this.shapeOf(propertyType, at, depth + 1)
+        // An optional property is there, with any of its values, or it is not there at all.
+        fields.push([property.name, property.flags & SymbolFlags.Optional ? { k: "union", alts: [...(shape.k === "union" ? shape.alts : [shape]), { k: "absent" }] } : shape])
       }
       return { k: "record", fields }
     }
@@ -640,11 +678,13 @@ export class Translator {
         return next
       }, [[]])
     switch (shape.k) {
-      case "scalar": return [shape]
+      case "scalar":
+      case "void":
+      case "absent": return [shape]
       case "union": return shape.alts.flatMap(alt => this.expand(alt, at))
       case "tuple": return product(shape.items.map(item => this.expand(item, at))).map(items => ({ k: "tuple", items }))
       case "record": return product(shape.fields.map(([, field]) => this.expand(field, at)))
-        .map(row => ({ k: "record", fields: row.map((field, i) => [shape.fields[i]![0], field] as [string, Shape]) }))
+        .map(row => ({ k: "record", fields: row.map((field, i) => [shape.fields[i]![0], field] as [string, Shape]).filter(([, field]) => field.k !== "absent") }))
     }
   }
 
@@ -665,7 +705,9 @@ export class Translator {
       }
       case "tuple": return { k: "array", items: shape.items.map(item => this.instantiate(item, instance)) }
       case "record": return { k: "record", fields: shape.fields.map(([key, field]) => [key, this.instantiate(field, instance)]) }
-      case "union": throw new Error("unions are expanded before instantiation")
+      case "void": return { k: "undefined" }
+      case "union":
+      case "absent": throw new Error("unions are expanded before instantiation")
     }
   }
 
@@ -676,6 +718,7 @@ export class Translator {
         return scalar(ir.variable(binder.name, binder.ty), binder.num)
       }
       case "const": return scalar(ir.lit(arg.value), arg.num)
+      case "undefined": return VOID
       case "array": return { k: "array", items: arg.items.map(item => this.valueOf(item)) }
       case "record": return { k: "record", fields: new Map(arg.fields.map(([key, field]) => [key, this.valueOf(field)])) }
     }
@@ -736,6 +779,8 @@ export class Translator {
     if (a.k === "choice") return ir.ite(a.cond, this.equal(a.a, b, at, identity), this.equal(a.b, b, at, identity))
     if (b.k === "choice") return ir.ite(b.cond, this.equal(a, b.a, at, identity), this.equal(a, b.b, at, identity))
     if (this.isPlain(a) && this.isPlain(b)) return this.strictEqual(a, b, at)
+    // An object is never undefined, however the two are compared.
+    if ((a.k === "void" && isObject(b)) || (b.k === "void" && isObject(a))) return ir.FALSE
     if (identity) throw new Unsupported("toBe compares identity, which is only modeled for booleans, bigints, numbers and strings; use toEqual", at)
     if (a.k === "array" && b.k === "array") {
       if (a.items.length !== b.items.length) return ir.FALSE
@@ -823,7 +868,7 @@ export class Translator {
       if (seen.has(part)) return false
       seen.add(part)
       return part.k === "record" ? [...part.fields.values()].some(inside) : part.k === "array" ? part.items.some(inside)
-        : part.k === "choice" ? inside(part.a) || inside(part.b) : false
+        : part.k === "choice" ? inside(part.a) || inside(part.b) : part.k === "map" || part.k === "set" ? inside(part.log) : false
     }
     if (inside(value)) throw new Unsupported("storing an object inside itself is not supported", at)
   }
@@ -862,7 +907,7 @@ export class Translator {
         if (dead === "true") onTrue = onFalse
         if (dead === "false") onFalse = onTrue
         if (onTrue === undefined && onFalse === undefined) continue
-        if (onTrue === undefined || onFalse === undefined) throw new Unsupported("an array that grows on only one side of a condition is not supported", undefined)
+        if (onTrue === undefined || onFalse === undefined) throw new Unsupported("an array, a Map or a Set that grows on only one side of a condition is not supported", undefined)
         const merged = this.mergeHeld(cond, onTrue, onFalse)
         if (merged !== now) this.write(target, slot, merged)
       }
@@ -877,10 +922,13 @@ export class Translator {
   private unchanging<T>(what: string, at: N, run: () => T): T {
     const written = this.writes.length
     const objects = objectsCreated
+    const held = this.cells.map(cell => cell.value)
     const result = run()
     for (let i = written; i < this.writes.length; i++) {
       if (this.writes[i]!.target.own!.born < objects) throw new Unsupported(`${what} changes an object in place, which is not modeled there; make the change in a statement of its own`, at)
     }
+    // The same goes for a variable that a function called there assigns to.
+    if (held.some((value, i) => this.cells[i]!.value !== value)) throw new Unsupported(`${what} assigns to a variable outside it, which is not modeled there; make the change in a statement of its own`, at)
     return result
   }
 
@@ -901,12 +949,11 @@ export class Translator {
 
   /**
    * Evaluate both sides of a condition and merge their results. Each side
-   * starts from the same state. The variables afterwards are as they were
-   * before: an expression cannot assign, and a statement branch evaluated
-   * this way has already run to the end of its function on both sides.
-   * Objects are different, because a change to one outlives the function
-   * that made it: each object changed on either side ends up holding the
-   * value of the side taken.
+   * starts from the same state. A statement branch evaluated this way has
+   * already run to the end of its function on both sides, so that function's
+   * own variables no longer matter. What outlives the sides is merged: each
+   * object changed on either side, and each variable a function called there
+   * assigned to, ends up holding the value of the side taken.
    */
   private branch(cond: Expr, whenTrue: () => Value, whenFalse: () => Value, control = false): Value {
     if (cond.t === "lit") return cond.value ? whenTrue() : whenFalse()
@@ -916,13 +963,25 @@ export class Translator {
     // instead; this is the net under that.
     if (control && this.merging > 0) throw new Unsupported("this combination of branches and assignments is not supported", undefined)
     const before = this.save()
+    // A function called on either side may have assigned to a variable that
+    // outlives the side: any variable for an expression, and for statements,
+    // which run to the end of their function, a variable of one of its callers.
+    const outlives = control ? this.frame : before.values.length
     const a = this.under(cond, whenTrue)
     const changedA = this.changesSince(before)
+    const heldA = this.cells.slice(0, outlives).map(cell => cell.value)
     this.restore(before)
     const b = this.under(ir.not(cond), whenFalse)
     const changedB = this.changesSince(before)
+    const heldB = this.cells.slice(0, outlives).map(cell => cell.value)
     this.restore(before)
     this.mergeChanges(cond, changedA, changedB, a.k === "bottom" ? "true" : b.k === "bottom" ? "false" : undefined)
+    for (let i = 0; i < outlives; i++) {
+      // A side that never continues leaves the variable as the other side has it.
+      const onTrue = a.k === "bottom" ? heldB[i]! : heldA[i]!
+      const onFalse = b.k === "bottom" ? heldA[i]! : heldB[i]!
+      if (onTrue !== before.values[i] || onFalse !== before.values[i]) this.cells[i]!.value = onTrue === onFalse ? onTrue : this.merge(cond, onTrue, onFalse)
+    }
     return this.merge(cond, a, b)
   }
 
@@ -1062,26 +1121,60 @@ export class Translator {
       if (label) this.relabel(value, pattern.text)
       return
     }
+    // The value may be one of several depending on a condition; each name then holds its part of whichever it is.
     if (pattern.kind === K.ArrayBindingPattern) {
-      if (value.k !== "array") throw new Unsupported(`cannot destructure ${describe(value)} as an array`, pattern)
+      const part = (read: (array: Extract<Value, { k: "array" }>) => Value) => this.over(value, whole => {
+        if (whole.k === "bottom") return BOTTOM
+        if (whole.k !== "array") throw new Unsupported(`cannot destructure ${describe(whole)} as an array`, pattern)
+        return read(whole)
+      })
+      // A pattern reads the list as it goes and stops for good at its end, so a default that changes the
+      // list would have to be followed position by position. That is refused instead.
+      const lists = new Set<Value>()
+      const collect = (whole: Value): void => {
+        if (whole.k === "choice") {
+          collect(whole.a)
+          collect(whole.b)
+        } else lists.add(whole)
+      }
+      collect(value)
+      const written = this.writes.length
+      const unchanged = (at: N) => {
+        for (let w = written; w < this.writes.length; w++) {
+          if (lists.has(this.writes[w]!.target)) throw new Unsupported("a default in a pattern that changes the list being taken apart is not supported", at)
+        }
+      }
       ;(pattern.elements as N[]).forEach((element, i) => {
-        if (element.kind === K.OmittedExpression) return
-        if (element.dotDotDotToken || element.initializer) throw new Unsupported("rest elements and defaults are not supported in destructuring", element)
-        const item = value.items[i]
-        if (!item) throw new Unsupported("destructuring reads past the end of the array", element)
-        this.bind(element.name, item, env, label, reassignable)
+        unchanged(element)
+        // A position the pattern skips, which one compiler gives as an element without a name.
+        if (element.kind === K.OmittedExpression || !element.name) return
+        // The rest is a new array of what the earlier names left.
+        if (element.dotDotDotToken) return this.bind(element.name, part(array => this.fresh({ k: "array", items: array.items.slice(i) })), env, label, reassignable)
+        // Past the end of the array there is undefined.
+        const item = part(array => array.items[i] ?? this.absent(undefined, element))
+        this.bind(element.name, element.initializer ? this.defaulted(item, element.initializer, env) : item, env, label, reassignable)
       })
       return
     }
     if (pattern.kind === K.ObjectBindingPattern) {
-      if (value.k !== "record") throw new Unsupported(`cannot destructure ${describe(value)} as an object`, pattern)
+      const part = (read: (record: Extract<Value, { k: "record" }>) => Value) => this.over(value, whole => {
+        if (whole.k === "bottom") return BOTTOM
+        if (whole.k !== "record") throw new Unsupported(`cannot destructure ${describe(whole)} as an object`, pattern)
+        return read(whole)
+      })
+      const taken = new Set<string>()
       for (const element of pattern.elements as N[]) {
-        if (element.dotDotDotToken || element.initializer) throw new Unsupported("rest elements and defaults are not supported in destructuring", element)
+        // The rest is a new object holding the properties the earlier names did not take.
+        if (element.dotDotDotToken) {
+          const named = new Set(taken)
+          this.bind(element.name, part(record => this.fresh({ k: "record", fields: new Map([...record.fields].filter(([name]) => !named.has(name))) })), env, label, reassignable)
+          continue
+        }
         const key = element.propertyName ?? element.name
         if (key.kind !== K.Identifier && key.kind !== K.StringLiteral) throw new Unsupported("computed property names are not supported", element)
-        const field = value.fields.get(key.text)
-        if (!field) throw new Unsupported(`property \`${key.text}\` does not exist on this object`, element)
-        this.bind(element.name, field, env, label, reassignable)
+        taken.add(key.text)
+        const field = part(record => record.fields.get(key.text) ?? this.absent(key.text, element))
+        this.bind(element.name, element.initializer ? this.defaulted(field, element.initializer, env) : field, env, label, reassignable)
       }
       return
     }
@@ -1090,6 +1183,7 @@ export class Translator {
 
   private call(fn: Value, args: Value[], at: N): Value {
     if (fn.k === "choice") return this.branch(fn.cond, () => this.call(fn.a, args, at), () => this.call(fn.b, args, at))
+    if (fn.k === "void") return this.throwsOnUndefined(at)
     if (fn.k !== "closure") throw new Unsupported(`cannot call ${describe(fn)}`, at)
     const node = fn.node
     if (this.stack.includes(node)) throw new Unsupported("recursive functions are not supported", at)
@@ -1098,14 +1192,20 @@ export class Translator {
     const facts = this.factsOf(node)
     if (facts.usesVar) throw new Unsupported("`var` is not supported; use `const` or `let`", facts.usesVar)
     this.noteExpectations(node)
-    // A function that reads or writes a variable someone reassigns would need
-    // that variable's value at the moment of the call, on every path. That is
-    // not tracked, so such closures are refused.
-    for (const name of fn.env.mutableNames()) {
-      if (facts.mentioned.has(name)) throw new Unsupported(`this function uses \`${name}\`, a variable that is reassigned outside it; that is not modeled`, at)
+    // A function may read and assign a variable declared outside it while the
+    // function that declared the variable is still running: the variable then
+    // holds its value on the path being followed, and every branch merges it.
+    // Once that function has returned, nothing keeps the variable in step any
+    // more, so a function that outlived it is refused.
+    for (const [name, cell] of fn.env.mutableCells()) {
+      if (cell && facts.mentioned.has(name) && !this.cells.includes(cell)) {
+        throw new Unsupported(`this function uses \`${name}\`, a variable that is reassigned, after the function that declared it has returned; that is not modeled`, at)
+      }
     }
     const env = fn.env.child()
     const live = this.cells.length
+    const frame = this.frame
+    this.frame = live
     // A call runs to its own end, whatever its caller is in the middle of.
     const merging = this.merging
     this.merging = 0
@@ -1119,14 +1219,9 @@ export class Translator {
       for (const parameter of parameters) for (const name of boundNames(parameter.name)) env.set(name, UNINITIALIZED)
       parameters.forEach((parameter, i) => {
         if (parameter.dotDotDotToken) throw new Unsupported("rest parameters are not supported", parameter)
-        let value = args[i]
-        // A default applies when the argument is missing or undefined.
-        if (value?.k === "choice" && parameter.initializer) throw new Unsupported("an argument that may or may not be undefined, for a parameter with a default, is not supported", at)
-        if (!value || value.k === "void") {
-          if (parameter.initializer) value = this.evalExpr(parameter.initializer, env)
-          else if (!value) throw new Unsupported("a call must pass every parameter that has no default", at)
-        }
-        this.bind(parameter.name, value, env, false, true)
+        // A parameter the call does not pass holds undefined, and a default applies when it does.
+        const value = args[i] ?? VOID
+        this.bind(parameter.name, parameter.initializer ? this.defaulted(value, parameter.initializer, env) : value, env, false, true)
       })
       if (node.body.kind !== K.Block) return this.evalExpr(node.body, env)
       // Reaching the end of a function that returns values elsewhere yields
@@ -1144,6 +1239,7 @@ export class Translator {
       this.stack.pop()
       this.assigned.pop()
       this.cells.length = live
+      this.frame = frame
       this.merging = merging
     }
   }
@@ -1265,13 +1361,21 @@ export class Translator {
         const header = env.child()
         for (const name of boundNames(declared[0].name)) header.set(name, UNINITIALIZED)
         const body = statement.statement
-        const loop = (items: Value, after: () => Value): Value => {
-          if (items.k === "bottom") return BOTTOM
+        const loop = (source: Value, after: () => Value): Value => {
+          if (source.k === "bottom") return BOTTOM
+          const items = this.listed(source, statement.expression)
           if (items.k !== "array") throw new Unsupported(`a loop needs an array whose length is known here, but this is ${describe(items)}`, statement.expression)
+          const entered = source.k === "map" || source.k === "set" ? source.log.items.length : undefined
           const iterate = (index: number): Value => {
+            // A loop over a Map or a Set also visits what its body adds, which the list made on entry does not hold.
+            if (entered !== undefined && (source as { log: { items: Value[] } }).log.items.length !== entered) {
+              throw new Unsupported("adding to a Map or a Set inside a loop over it is not supported", statement)
+            }
             const item = items.items[index]
             if (!item) return after()
             const scope = env.child()
+            // Every name of the pattern is in scope, uninitialized, while the defaults before it run.
+            for (const bound of boundNames(declared[0].name)) scope.set(bound, UNINITIALIZED)
             this.bind(declared[0].name, item, scope, false, reassignable)
             const onward = () => iterate(index + 1)
             return this.block(body.kind === K.Block ? body.statements : [body], scope.child(), { next: onward, cont: onward, brk: after })
@@ -1306,6 +1410,18 @@ export class Translator {
         // only depends on a counter and on lengths known here.
         const scope = env.child()
         const initializer = statement.kind === K.ForStatement ? statement.initializer : undefined
+        if (initializer?.kind === K.VariableDeclarationList && initializer.flags & NodeFlags.Let) {
+          // JavaScript gives each round of the loop its own copy of these variables, so a function made in
+          // one round keeps that round's value. Here the rounds share one, which only shows to such a function.
+          const names = new Set((initializer.declarations as N[]).flatMap(declaration => boundNames(declaration.name)))
+          const captured = (node: N, inside: boolean): N | undefined => {
+            if (inside && node.kind === K.Identifier && names.has(node.text)) return node
+            const deeper = inside || node.kind === K.ArrowFunction || node.kind === K.FunctionExpression || node.kind === K.FunctionDeclaration
+            return node.forEachChild((child: N) => captured(child, deeper))
+          }
+          const use = captured(statement, false)
+          if (use) throw new Unsupported(`a function that uses \`${use.text}\`, the variable of a \`for\` loop around it, is not supported; copy it into a \`const\` inside the loop`, use)
+        }
         if (initializer?.kind === K.VariableDeclarationList) {
           for (const declaration of initializer.declarations as N[]) for (const name of boundNames(declaration.name)) scope.set(name, UNINITIALIZED)
           this.declare(initializer, scope)
@@ -1353,9 +1469,10 @@ export class Translator {
         return
       }
       const cell = this.assignable(node.left, env)
-      // The right-hand side is evaluated first; it cannot change the variable, because closures over it are refused.
+      // JavaScript's order: the old value, then the right-hand side, which may call a function that assigns to the same variable.
+      const old = cell.value
       const right = this.evalExpr(node.right, env)
-      cell.value = base === undefined ? right : this.arithmetic(base, cell.value, right, node)
+      cell.value = base === undefined ? right : this.arithmetic(base, old, right, node)
       return
     }
     if ((node.kind === K.PrefixUnaryExpression || node.kind === K.PostfixUnaryExpression) &&
@@ -1452,9 +1569,54 @@ export class Translator {
   }
 
   private bool(node: N, env: Env): Expr {
-    const value = this.evalExpr(node, env)
-    if (value.k !== "scalar" || value.e.ty !== "bool") throw new Unsupported(`a condition must be a boolean; JavaScript truthiness of ${describe(value)} is not modeled`, node)
-    return value.e
+    return this.truthy(this.evalExpr(node, env), node)
+  }
+
+  /**
+   * Whether JavaScript takes a value for true. `false`, zero, the empty string
+   * and undefined are not; every object, array and function is. A number is
+   * the whole number it holds, so it has no NaN to be false as well.
+   */
+  private truthy(value: Value, at: Node): Expr {
+    value = this.settled(value)
+    switch (value.k) {
+      case "scalar": return value.e.ty === "bool" ? value.e : ir.not(ir.eq(value.e, ir.lit(value.e.ty === "int" ? 0n : "")))
+      case "void": return ir.FALSE
+      case "record":
+      case "array":
+      case "closure":
+      case "infinite":
+      case "map":
+      case "set": return ir.TRUE
+      case "choice": return ir.ite(value.cond, this.truthy(value.a, at), this.truthy(value.b, at))
+      default: throw new Unsupported(`${describe(value)} cannot be used as a condition`, at)
+    }
+  }
+
+  /**
+   * Reading a property of undefined, or calling it, throws. Like any throw,
+   * that is allowed only where it is proved never to happen.
+   */
+  private throwsOnUndefined(at: N): Value {
+    this.emit("undefined", ir.FALSE, at)
+    return BOTTOM
+  }
+
+  /** The value a default replaces `undefined` with, where there is one. The default only runs when it is needed. */
+  private defaulted(value: Value, initializer: N, env: Env): Value {
+    return this.over(value, given => (given.k === "void" ? this.evalExpr(initializer, env) : given))
+  }
+
+  /**
+   * What reading a property that an object does not have gives, or a position
+   * outside an array: undefined. Objects here hold exactly their own
+   * properties, so the only other source is `Object.prototype`, whose names
+   * are refused, and a prototype that some file has added to.
+   */
+  private absent(name: string | undefined, at: N): Value {
+    if (name !== undefined && name in Object.prototype) throw new Unsupported(`\`${name}\` is a property every object inherits, which is not modeled`, at)
+    this.assertBuiltinsIntact(at)
+    return VOID
   }
 
   private wellFormed(text: string, at: Node): string {
@@ -1464,10 +1626,12 @@ export class Translator {
 
   private evalExpr(node: N, env: Env): Value {
     switch (node.kind) {
+      case K.NonNullExpression:
+        if (inOptionalChain(node)) return this.chain(node, env, value => value)
+        return this.evalExpr(node.expression, env)
       case K.ParenthesizedExpression:
       case K.AsExpression:
       case K.SatisfiesExpression:
-      case K.NonNullExpression:
       case K.TypeAssertionExpression:
         return this.evalExpr(node.expression, env)
       case K.StringLiteral:
@@ -1489,6 +1653,7 @@ export class Translator {
         if (node.operator === K.ExclamationToken) return scalar(ir.not(this.bool(node.operand, env)))
         if (node.operator === K.MinusToken) {
           const operand = this.evalExpr(node.operand, env)
+          if (operand.k === "infinite") return { k: "infinite", negative: !operand.negative }
           return scalar(ir.neg(this.scalarOf(operand, node.operand, "int")), isNumber(operand))
         }
         throw new Unsupported("this operator is not supported", node)
@@ -1524,38 +1689,33 @@ export class Translator {
         return this.fresh({ k: "record", fields })
       }
       case K.ArrayLiteralExpression: {
-        const items: Value[] = []
-        for (const element of node.elements as N[]) {
-          if (element.kind === K.SpreadElement) {
-            const spread = this.evalExpr(element.expression, env)
-            if (spread.k !== "array") throw new Unsupported(`cannot spread ${describe(spread)} into an array`, element)
-            items.push(...spread.items)
-          } else if (element.kind === K.OmittedExpression) throw new Unsupported("array holes are not supported", node)
-          else items.push(this.evalExpr(element, env))
-        }
-        return this.fresh({ k: "array", items })
-      }
-      case K.PropertyAccessExpression: {
-        if (node.questionDotToken) throw new Unsupported("optional chaining is not supported", node)
-        if (this.isNamespace(node.expression, env)) return this.global(node.name)
-        const name = node.name.text as string
-        if (name === "__proto__") throw new Unsupported("reading `__proto__` is not modeled", node)
-        return this.over(this.evalExpr(node.expression, env), object => {
-          if (object.k === "bottom") return BOTTOM
-          if (name === "length" && object.k === "array") return scalar(ir.lit(BigInt(object.items.length)), true)
-          if (name === "length" && object.k === "scalar" && object.e.ty === "str") {
-            // JavaScript counts UTF-16 units and Lean counts characters, so only a known string has a length here.
-            if (object.e.t !== "lit") throw new Unsupported("the length of a string that is not known here is not modeled", node)
-            return scalar(ir.lit(BigInt((object.e.value as string).length)), true)
-          }
-          if (object.k !== "record") throw new Unsupported(`reading \`.${name}\` of ${describe(object)} is not supported`, node)
-          const field = object.fields.get(name)
-          if (!field) throw new Unsupported(`property \`${name}\` does not exist on this object`, node)
-          return field
+        // Every element is evaluated first, in order. A spread list may be one of several depending on a condition.
+        // Each element is evaluated in order, and a spread list is copied where it stands: a later
+        // element may change that list. The list may be one of several depending on a condition.
+        const parts = (node.elements as N[]).map(element => {
+          if (element.kind === K.OmittedExpression) throw new Unsupported("array holes are not supported", node)
+          if (element.kind !== K.SpreadElement) return { spread: false, value: this.evalExpr(element, env) }
+          return { spread: true, value: this.copied(this.evalExpr(element.expression, env), element, "cannot spread", "into an array") }
         })
+        const join = (index: number, items: Value[]): Value => {
+          const part = parts[index]
+          if (!part) return this.fresh({ k: "array", items })
+          if (!part.spread) return join(index + 1, [...items, part.value])
+          return this.over(part.value, copy => (copy.k === "array" ? join(index + 1, [...items, ...copy.items]) : BOTTOM))
+        }
+        return join(0, [])
       }
-      case K.ElementAccessExpression: return this.elementAccess(node, env)
-      case K.CallExpression: return this.callExpression(node, env)
+      case K.PropertyAccessExpression:
+        if (inOptionalChain(node)) return this.chain(node, env, value => value)
+        if (this.isNamespace(node.expression, env)) return this.global(node.name)
+        return this.over(this.evalExpr(node.expression, env), object => this.property(object, node))
+      case K.ElementAccessExpression:
+        if (inOptionalChain(node)) return this.chain(node, env, value => value)
+        return this.over(this.evalExpr(node.expression, env), object => this.element(object, node, env))
+      case K.CallExpression:
+        if (inOptionalChain(node)) return this.chain(node, env, value => value)
+        return this.callExpression(node, env)
+      case K.NewExpression: return this.construct(node, env)
       default:
         throw new Unsupported("this expression is not supported", node)
     }
@@ -1576,6 +1736,7 @@ export class Translator {
       const symbol = shorthand ? undefined : this.checker.getSymbolAtLocation(node)
       if (symbol && this.checker.isUndefinedSymbol(symbol)) return VOID
     }
+    if (node.text === "Infinity" && !shorthand && this.isBuiltin(node)) return { k: "infinite", negative: false }
     return this.global(node, shorthand)
   }
 
@@ -1585,12 +1746,21 @@ export class Translator {
    * or undefined depending on that very test holds the something.
    */
   private settled(value: Value): Value {
+    if (value.k !== "choice") return value
+    // What holds on this path, taken apart: both sides of an `and`, and the negation of each side of a refuted `or`.
+    const known: Expr[] = []
+    const learn = (e: Expr) => {
+      if (e.t === "op" && e.op === "and") e.args.forEach(learn)
+      else if (e.t === "op" && e.op === "not" && e.args[0]!.t === "op" && e.args[0]!.op === "or") e.args[0]!.args.forEach(arg => learn(ir.not(arg)))
+      else known.push(e)
+    }
+    this.pc.forEach(learn)
     while (value.k === "choice") {
       const cond = value.cond
-      if (this.pc.some(known => ir.same(known, cond))) value = value.a
+      if (known.some(fact => ir.same(fact, cond))) value = value.a
       else {
         const negated = ir.not(cond)
-        if (this.pc.some(known => ir.same(known, negated))) value = value.b
+        if (known.some(fact => ir.same(fact, negated))) value = value.b
         else break
       }
     }
@@ -1602,13 +1772,18 @@ export class Translator {
    * a number is a different kind from a bigint even when both are whole.
    */
   private strictEqual(a: Value, b: Value, at: Node): Expr {
-    if (a.k === "void" || b.k === "void") return a.k === b.k ? ir.TRUE : this.isPlain(a) && this.isPlain(b) ? ir.FALSE : this.refuseEquality(a, b, at)
+    // Undefined equals only itself: no number, string or object is undefined.
+    if (a.k === "void" || b.k === "void") return a.k === b.k ? ir.TRUE : (this.isPlain(a) || isObject(a)) && (this.isPlain(b) || isObject(b)) ? ir.FALSE : this.refuseEquality(a, b, at)
+    if (a.k === "infinite" || b.k === "infinite") {
+      if (a.k === "infinite" && b.k === "infinite") return ir.lit(a.negative === b.negative)
+      return this.isPlain(a) && this.isPlain(b) ? ir.FALSE : this.refuseEquality(a, b, at)
+    }
     if (a.k !== "scalar" || b.k !== "scalar") return this.refuseEquality(a, b, at)
     return a.e.ty === b.e.ty && !!a.num === !!b.num ? ir.eq(a.e, b.e) : ir.FALSE
   }
 
   private isPlain(value: Value): boolean {
-    return value.k === "scalar" || value.k === "void"
+    return value.k === "scalar" || value.k === "void" || value.k === "infinite"
   }
 
   private refuseEquality(a: Value, b: Value, at: Node): never {
@@ -1617,12 +1792,19 @@ export class Translator {
 
   private binary(node: N, env: Env): Value {
     const operator = node.operatorToken.kind
-    if (operator === K.AmpersandAmpersandToken || operator === K.BarBarToken) {
-      const isAnd = operator === K.AmpersandAmpersandToken
-      const left = this.bool(node.left, env)
-      if (left.t === "lit" && left.value !== isAnd) return scalar(left)
-      const right = this.under(isAnd ? left : ir.not(left), () => this.unchanging(`the right side of \`${isAnd ? "&&" : "||"}\``, node.right, () => this.bool(node.right, env)))
-      return scalar(isAnd ? ir.and(left, right) : ir.or(left, right))
+    if (operator === K.AmpersandAmpersandToken || operator === K.BarBarToken || operator === K.QuestionQuestionToken) {
+      // The right side only runs where the left side does not decide, and the
+      // result is one of the two values themselves: `a || 1` is `a` or 1.
+      const symbol = operator === K.AmpersandAmpersandToken ? "&&" : operator === K.BarBarToken ? "||" : "??"
+      const right = () => this.unchanging(`the right side of \`${symbol}\``, node.right, () => this.evalExpr(node.right, env))
+      return this.over(this.evalExpr(node.left, env), left => {
+        if (left.k === "bottom") return BOTTOM
+        if (operator === K.QuestionQuestionToken) return left.k === "void" ? right() : left
+        const taken = this.truthy(left, node.left)
+        // Where a boolean, a number or a string did not pass, which value it holds is known.
+        const known = (value: boolean) => (left.k !== "scalar" ? left : left.e.ty === "bool" ? scalar(ir.lit(value)) : value ? left : scalar(ir.lit(left.e.ty === "int" ? 0n : ""), left.num))
+        return operator === K.AmpersandAmpersandToken ? this.branch(taken, right, () => known(false)) : this.branch(taken, () => known(true), right)
+      })
     }
     const leftValue = this.evalExpr(node.left, env)
     const rightValue = this.evalExpr(node.right, env)
@@ -1638,6 +1820,22 @@ export class Translator {
 
   /** `+ - * / %` and the comparisons, on values already evaluated. */
   private arithmetic(operator: number, leftValue: Value, rightValue: Value, node: N): Value {
+    // A side that is one kind of value or another, such as a number or undefined, is taken case by case.
+    if (leftValue.k === "choice" || rightValue.k === "choice") {
+      return this.over(leftValue, left => this.over(rightValue, right => this.arithmetic(operator, left, right, node)))
+    }
+    if (leftValue.k === "bottom" || rightValue.k === "bottom") return BOTTOM
+    if (leftValue.k === "infinite" || rightValue.k === "infinite") {
+      // Infinity is above every number and -Infinity below, which settles a comparison outright.
+      const rank = (value: Value) => (value.k === "infinite" ? (value.negative ? -1 : 1) : isNumber(value) ? 0 : undefined)
+      const left = rank(leftValue)
+      const right = rank(rightValue)
+      const result = left === undefined || right === undefined ? undefined
+        : operator === K.LessThanToken ? left < right : operator === K.LessThanEqualsToken ? left <= right
+          : operator === K.GreaterThanToken ? left > right : operator === K.GreaterThanEqualsToken ? left >= right : undefined
+      if (result === undefined) throw new Unsupported("Infinity is only modeled where it is compared with a number", node)
+      return scalar(ir.lit(result))
+    }
     if (operator === K.PlusToken && leftValue.k === "scalar" && rightValue.k === "scalar" && leftValue.e.ty === "str" && rightValue.e.ty === "str") {
       return scalar(ir.concat(leftValue.e, rightValue.e))
     }
@@ -1679,49 +1877,100 @@ export class Translator {
     }
   }
 
-  private elementAccess(node: N, env: Env): Value {
-    if (node.questionDotToken) throw new Unsupported("optional chaining is not supported", node)
+  /** `object.name`, for one object. */
+  private property(object: Value, node: N): Value {
+    const name = node.name.text as string
+    if (name === "__proto__") throw new Unsupported("reading `__proto__` is not modeled", node)
+    if (object.k === "bottom") return BOTTOM
+    if (object.k === "void") return this.throwsOnUndefined(node)
+    if (name === "length" && object.k === "array") return scalar(ir.lit(BigInt(object.items.length)), true)
+    if (name === "length" && object.k === "scalar" && object.e.ty === "str") {
+      // JavaScript counts UTF-16 units and Lean counts characters, so only a known string has a length here.
+      if (object.e.t !== "lit") throw new Unsupported("the length of a string that is not known here is not modeled", node)
+      return scalar(ir.lit(BigInt((object.e.value as string).length)), true)
+    }
+    if (object.k === "map" || object.k === "set") {
+      if (name === "size") return this.collectionSize(object, node)
+      throw new Unsupported(`reading \`.${name}\` of ${describe(object)} is not supported`, node)
+    }
+    if (object.k !== "record") throw new Unsupported(`reading \`.${name}\` of ${describe(object)} is not supported`, node)
+    return object.fields.get(name) ?? this.absent(name, node)
+  }
+
+  /** `object[index]`, for one object. */
+  private element(object: Value, node: N, env: Env): Value {
     const index = node.argumentExpression
-    return this.over(this.evalExpr(node.expression, env), object => {
+    if (object.k === "bottom") return BOTTOM
+    if (object.k === "void") return this.throwsOnUndefined(node)
+    if (object.k === "array") {
+      const position = this.evalExpr(index, env)
+      const refusal = () => new Unsupported("an array can only be indexed by a position that is known here", node)
+      if (!isNumber(position) || position.k !== "scalar") throw refusal()
+      // A position outside the array holds undefined.
+      return object.items[Number(this.settle(position.e, refusal).value)] ?? this.absent(undefined, node)
+    }
+    if (object.k !== "record") throw new Unsupported(`indexing ${describe(object)} is not supported`, node)
+    const key = this.scalarOf(this.evalExpr(index, env), index, "str")
+    if (key.t === "lit") return object.fields.get(key.value as string) ?? this.absent(key.value as string, node)
+    // The key is compared with every property name. A key that matches none
+    // would read `undefined`, which is not modeled, so that case must be
+    // proved impossible. The key's declared type is not trusted for this: a
+    // cast can make it claim anything.
+    const names = [...object.fields.keys()]
+    const pick = (i: number): Value => {
+      if (i === names.length) {
+        this.emit("missing", ir.FALSE, node)
+        return BOTTOM
+      }
+      return this.branch(ir.eq(key, ir.lit(names[i]!)), () => object.fields.get(names[i]!)!, () => pick(i + 1))
+    }
+    return pick(0)
+  }
+
+  /**
+   * Evaluate a link of an optional chain and hand its value to `then`. Where
+   * a `?.` finds undefined, the whole chain is undefined on that path and
+   * nothing after the `?.` runs, as in JavaScript: `a?.b.c` does not read `.c`.
+   */
+  private chain(node: N, env: Env, then: (value: Value) => Value): Value {
+    if (node.kind === K.NonNullExpression) return this.chain(node.expression, env, then)
+    if (!inOptionalChain(node)) return then(this.evalExpr(node, env))
+    const access = (link: N, object: Value) => (link.kind === K.PropertyAccessExpression ? this.property(object, link) : this.element(object, link, env))
+    if (node.kind === K.CallExpression) {
+      const callee = node.expression
+      if (callee.kind === K.PropertyAccessExpression || callee.kind === K.ElementAccessExpression) {
+        // A method call: the object, then the method, which is only looked up for an object that is there.
+        return this.chain(callee.expression, env, holder => this.over(holder, receiver => {
+          if (receiver.k === "bottom") return BOTTOM
+          if (callee.questionDotToken && receiver.k === "void") return VOID
+          if (!node.questionDotToken) {
+            if (callee.kind !== K.PropertyAccessExpression) throw new Unsupported("calling a method by a computed name is not supported", node)
+            return then(this.method(receiver, node, env))
+          }
+          // `object.method?.()` calls the method only if the object has it.
+          return this.over(access(callee, receiver), fn => (fn.k === "bottom" ? BOTTOM : fn.k === "void" ? VOID : then(this.call(fn, this.arguments(node, env), node))))
+        }))
+      }
+      // Only a call with a `?.` of its own gives undefined for a function that is not there; any other call of undefined throws.
+      return this.chain(callee, env, called => this.over(called, fn => (fn.k === "bottom" ? BOTTOM : fn.k === "void" && node.questionDotToken ? VOID : then(this.call(fn, this.arguments(node, env), node)))))
+    }
+    return this.chain(node.expression, env, holder => this.over(holder, object => {
       if (object.k === "bottom") return BOTTOM
-      if (object.k === "array") {
-        const position = this.evalExpr(index, env)
-        const refusal = () => new Unsupported("an array can only be indexed by a position that is known here", node)
-        if (!isNumber(position) || position.k !== "scalar") throw refusal()
-        const item = object.items[Number(this.settle(position.e, refusal).value)]
-        if (!item) throw new Unsupported("this index is outside the array", node)
-        return item
-      }
-      if (object.k !== "record") throw new Unsupported(`indexing ${describe(object)} is not supported`, node)
-      const key = this.scalarOf(this.evalExpr(index, env), index, "str")
-      if (key.t === "lit") {
-        const field = object.fields.get(key.value as string)
-        if (!field || key.value === "__proto__") throw new Unsupported(`property \`${key.value}\` does not exist on this object`, node)
-        return field
-      }
-      // The key is compared with every property name. A key that matches none
-      // would read `undefined`, which is not modeled, so that case must be
-      // proved impossible. The key's declared type is not trusted for this: a
-      // cast can make it claim anything.
-      const names = [...object.fields.keys()]
-      const pick = (i: number): Value => {
-        if (i === names.length) {
-          this.emit("missing", ir.FALSE, node)
-          return BOTTOM
-        }
-        return this.branch(ir.eq(key, ir.lit(names[i]!)), () => object.fields.get(names[i]!)!, () => pick(i + 1))
-      }
-      return pick(0)
+      if (node.questionDotToken && object.k === "void") return VOID
+      return then(access(node, object))
+    }))
+  }
+
+  private arguments(node: N, env: Env): Value[] {
+    return (node.arguments as N[]).map(argument => {
+      if (argument.kind === K.SpreadElement) throw new Unsupported("spread arguments are not supported", argument)
+      return this.evalExpr(argument, env)
     })
   }
 
   private callExpression(node: N, env: Env): Value {
-    if (node.questionDotToken) throw new Unsupported("optional chaining is not supported", node)
     const callee = node.expression
-    const args = () => (node.arguments as N[]).map(argument => {
-      if (argument.kind === K.SpreadElement) throw new Unsupported("spread arguments are not supported", argument)
-      return this.evalExpr(argument, env)
-    })
+    const args = () => this.arguments(node, env)
     if (callee.kind === K.Identifier && !env.get(callee.text) && node.arguments.length === 1 && this.isBuiltin(callee)) {
       this.assertBuiltinsIntact(node)
       if (callee.text === "String") return this.text(args()[0]!, node)
@@ -1735,27 +1984,38 @@ export class Translator {
     }
     if (callee.kind === K.PropertyAccessExpression && callee.expression.kind === K.Identifier && callee.expression.text === "Math" &&
       !env.get("Math") && this.isBuiltin(callee.expression)) return this.math(callee.name.text, node, env)
+    if (callee.kind === K.PropertyAccessExpression && callee.expression.kind === K.Identifier && callee.expression.text === "Array" && callee.name.text === "from" &&
+      !env.get("Array") && this.isBuiltin(callee.expression)) return this.arrayFrom(args(), node)
     if (callee.kind === K.PropertyAccessExpression && !this.isNamespace(callee.expression, env)) {
-      const method = callee.name.text as string
-      return this.over(this.evalExpr(callee.expression, env), receiver => {
-        if (receiver.k === "bottom") return BOTTOM
-        if (receiver.k === "scalar" && method === "toString" && node.arguments.length === 0) {
-          this.assertBuiltinsIntact(node)
-          return this.text(receiver, node)
-        }
-        if (receiver.k === "scalar" && receiver.e.ty === "str" && (method === "padStart" || method === "padEnd")) {
-          this.assertBuiltinsIntact(node)
-          return this.pad(receiver.e, method === "padStart", args(), node)
-        }
-        if (receiver.k === "array") {
-          this.assertBuiltinsIntact(node)
-          return this.arrayMethod(receiver, method, args(), node)
-        }
-        if (receiver.k === "record" && receiver.fields.has(method)) return this.call(receiver.fields.get(method)!, args(), node)
-        throw new Unsupported(`calling \`.${method}\` on ${describe(receiver)} is not supported`, node)
-      })
+      return this.over(this.evalExpr(callee.expression, env), receiver => this.method(receiver, node, env))
     }
     return this.call(this.evalExpr(callee, env), args(), node)
+  }
+
+  /** `receiver.method(...)`, for one receiver. The arguments are evaluated here, after the receiver. */
+  private method(receiver: Value, node: N, env: Env): Value {
+    const method = node.expression.name.text as string
+    const args = () => this.arguments(node, env)
+    if (receiver.k === "bottom") return BOTTOM
+    if (receiver.k === "void") return this.throwsOnUndefined(node)
+    if (receiver.k === "scalar" && method === "toString" && node.arguments.length === 0) {
+      this.assertBuiltinsIntact(node)
+      return this.text(receiver, node)
+    }
+    if (receiver.k === "scalar" && receiver.e.ty === "str" && (method === "padStart" || method === "padEnd")) {
+      this.assertBuiltinsIntact(node)
+      return this.pad(receiver.e, method === "padStart", args(), node)
+    }
+    if (receiver.k === "array") {
+      this.assertBuiltinsIntact(node)
+      return this.arrayMethod(receiver, method, args(), node)
+    }
+    if (receiver.k === "map" || receiver.k === "set") {
+      this.assertBuiltinsIntact(node)
+      return this.collectionMethod(receiver, method, args(), node)
+    }
+    if (receiver.k === "record" && receiver.fields.has(method)) return this.call(receiver.fields.get(method)!, args(), node)
+    throw new Unsupported(`calling \`.${method}\` on ${describe(receiver)} is not supported`, node)
   }
 
   /** The `Math` functions that keep whole numbers whole. */
@@ -1767,7 +2027,20 @@ export class Translator {
   private assertBuiltinsIntact(use: Node) {
     if (this.tampering === null) {
       this.tampering = undefined
-      const builtins = new Set(["Math", "Object", "Array", "String", "Number", "BigInt", "Boolean", "JSON", "Reflect", "Function", "Symbol", "globalThis"])
+      const builtins = new Set(["Math", "Object", "Array", "String", "Number", "BigInt", "Boolean", "JSON", "Reflect", "Function", "Symbol", "Map", "Set", "globalThis"])
+      // A prototype reached without naming a built-in first: `Object.getPrototypeOf(x)`, `x.__proto__`, or one held under another name.
+      const prototype = (node: N): boolean =>
+        (node.kind === K.PropertyAccessExpression && (node.name.text === "__proto__" ||
+          (node.name.text === "prototype" && node.expression.kind === K.Identifier && this.isBuiltin(node.expression)))) ||
+        (node.kind === K.CallExpression && /^(Object|Reflect)\.getPrototypeOf$/.test(node.expression.getText(node.getSourceFile())))
+      const throughPrototype = (node: N): boolean => {
+        for (;;) {
+          if (prototype(node)) return true
+          if (node.kind !== K.PropertyAccessExpression && node.kind !== K.ElementAccessExpression && node.kind !== K.ParenthesizedExpression &&
+            node.kind !== K.AsExpression && node.kind !== K.NonNullExpression) return false
+          node = node.expression
+        }
+      }
       const rootOf = (node: N): N => {
         while (node.kind === K.PropertyAccessExpression || node.kind === K.ElementAccessExpression || node.kind === K.ParenthesizedExpression ||
           node.kind === K.AsExpression || node.kind === K.NonNullExpression) node = node.expression
@@ -1783,10 +2056,41 @@ export class Translator {
         // Object.defineProperty(Array.prototype, ...). Passing one as a value, as in `.map(String)`, is not a write.
         const writes = node.kind === K.CallExpression && WRITERS.test(node.expression.getText(node.getSourceFile()))
         const handed = writes ? (node.arguments as N[]).slice(0, 1).map(rootOf).find(a => a.kind === K.Identifier && builtins.has(a.text)) : undefined
-        const culprit = root?.kind === K.Identifier && builtins.has(root.text) ? root : handed
+        // `Map = Other` replaces the built-in itself.
+        const replaced = target?.kind === K.Identifier && builtins.has(target.text) ? target : undefined
+        const culprit = root?.kind === K.Identifier && builtins.has(root.text) ? root : replaced ?? handed
         if (culprit && this.isBuiltin(culprit)) {
           const at = locate(node)
           this.tampering = { message: `\`${culprit.text}\` is modified at ${at.file}:${at.line}, so built-in behaviour cannot be assumed`, node }
+          return
+        }
+        // Every object inherits from a prototype, so one that is written to could change what any object
+        // holds. So could one that is stored under another name or handed to other code, where a later
+        // write to it would not be seen: that is treated as a write.
+        let escapes = false
+        if (prototype(node)) {
+          let outer = node
+          while (outer.parent.kind === K.ParenthesizedExpression || outer.parent.kind === K.AsExpression || outer.parent.kind === K.NonNullExpression) outer = outer.parent
+          const parent = outer.parent
+          const stored = ((parent.kind === K.VariableDeclaration || parent.kind === K.PropertyAssignment) && parent.initializer === outer) ||
+            (parent.kind === K.BinaryExpression && parent.right === outer && parent.operatorToken.kind >= K.FirstAssignment && parent.operatorToken.kind <= K.LastAssignment) ||
+            parent.kind === K.ArrayLiteralExpression || parent.kind === K.SpreadElement || parent.kind === K.SpreadAssignment || parent.kind === K.ShorthandPropertyAssignment
+          const passed = (parent.kind === K.CallExpression || parent.kind === K.NewExpression) && parent.expression !== outer
+          // A method called on the prototype itself may change it: `Array.prototype.push(x)`. One that is only
+          // borrowed from it, as in `Object.prototype.hasOwnProperty.call(x, key)`, is called on something else.
+          let method = parent
+          const borrowed = (parent.kind === K.PropertyAccessExpression || parent.kind === K.ElementAccessExpression) && parent.expression === outer
+          while (borrowed && (method.parent.kind === K.ParenthesizedExpression || method.parent.kind === K.AsExpression || method.parent.kind === K.NonNullExpression)) method = method.parent
+          const called = borrowed && method.parent.kind === K.CallExpression && method.parent.expression === method
+          escapes = stored || passed || called
+        }
+        // A pattern can take the prototype out of a built-in under another name: `const { prototype } = Object`.
+        const taken = node.kind === K.BindingElement ? node.propertyName ?? node.name : undefined
+        if ((taken?.kind === K.Identifier || taken?.kind === K.StringLiteral) && (taken.text === "prototype" || taken.text === "__proto__")) escapes = true
+        if (escapes || (target && target.kind !== K.Identifier && throughPrototype(target)) ||
+          (writes && (node.arguments as N[]).slice(0, 1).some(throughPrototype))) {
+          const at = locate(node)
+          this.tampering = { message: `a prototype is modified, stored or handed on at ${at.file}:${at.line}, so built-in behaviour cannot be assumed`, node }
           return
         }
         node.forEachChild(visit)
@@ -1813,12 +2117,20 @@ export class Translator {
       while (inner.kind === K.ParenthesizedExpression) inner = inner.expression
       if (inner.kind !== K.BinaryExpression || inner.operatorToken.kind !== K.SlashToken) return scalar(number(first), true)
       // Rounding a quotient of whole numbers. Dividing two exactly held whole
-      // numbers and rounding gives the same integer as exact division; that
-      // does not hold for Math.round, whose halfway cases depend on the fraction.
-      if (name === "round") throw new Unsupported("Math.round of a quotient is not modeled; use Math.floor or Math.trunc", node)
+      // numbers and rounding gives the same integer as exact division.
       const a = number(inner.left)
       const b = number(inner.right)
       this.emit("nan", ir.not(ir.eq(b, ir.lit(0n))), inner)
+      if (name === "round") {
+        // Math.round takes a half upward, so it is the floor of the quotient
+        // plus a half: floor((2a + b) / 2b). The quotient JavaScript rounds is
+        // a double, and that double is a half only when the true quotient is,
+        // as long as the dividend is below 2^52: nearer to a half than a
+        // double can tell apart, a fraction over `b` needs a larger dividend.
+        const limit = ir.lit(2n ** 52n)
+        this.emit("round", ir.and(ir.lt(ir.neg(limit), a), ir.lt(a, limit)), inner)
+        return scalar(ir.fdiv(ir.add(ir.mul(ir.lit(2n), a), b), ir.mul(ir.lit(2n), b)), true)
+      }
       if (name === "trunc") return scalar(ir.div(a, b), true)
       // The ceiling of a quotient is the negated floor of its negation.
       return scalar(name === "floor" ? ir.fdiv(a, b) : ir.neg(ir.fdiv(ir.neg(a), b)), true)
@@ -1901,13 +2213,6 @@ export class Translator {
       }
       return scalar(ir.lit(BigInt(items.length)), true)
     }
-    if (ARRAY_MUTATORS.has(method)) throw new Unsupported(`\`.${method}\` changes the array in place in a way that is not modeled; only \`.push\` and assigning to a position are`, node)
-    if (!["includes", "some", "every", "map", "reduce"].includes(method)) throw new Unsupported(`the array method \`.${method}\` is not supported`, node)
-    const [first, second] = args
-    const expected = method === "reduce" ? 2 : 1
-    if (!first || args.length !== expected) {
-      throw new Unsupported(method === "reduce" ? "`.reduce` is supported with a callback and an initial value" : `\`.${method}\` is supported with exactly one argument`, node)
-    }
     // A callback is passed each element and its position. One that declares
     // more parameters would also receive the array itself, which is refused.
     const invoke = (fn: Value, values: Value[]): Value => {
@@ -1915,9 +2220,44 @@ export class Translator {
       if (fn.k === "closure" && parametersOf(fn.node).length > values.length) throw new Unsupported("an array callback that takes the array itself is not supported", node)
       return this.call(fn, values, node)
     }
-    const callable = (fn: Value): boolean => fn.k === "closure" || (fn.k === "choice" && callable(fn.a) && callable(fn.b))
-    if (method !== "includes" && !callable(first)) throw new Unsupported(`\`.${method}\` needs a function, but this is ${describe(first)}`, node)
+    const callable = (fn: Value | undefined): boolean => fn?.k === "closure" || (fn?.k === "choice" && callable(fn.a) && callable(fn.b))
     const position = (index: number) => scalar(ir.lit(BigInt(index)), true)
+    /** A position given as a number known here, counted from the end when negative, as `.at` and `.slice` take it. */
+    const known = (value: Value | undefined, fallback: number, what: string) => {
+      if (!value || value.k === "void") return fallback
+      const refusal = () => new Unsupported(`\`.${method}\` is supported with ${what} known here`, node)
+      if (!isNumber(value) || value.k !== "scalar") throw refusal()
+      const given = Number(this.settle(value.e, refusal).value)
+      return given < 0 ? items.length + given : given
+    }
+    const [first, second] = args
+    if (method === "sort" || method === "toSorted") {
+      if (args.length !== 1 || !callable(first)) throw new Unsupported(`\`.${method}\` is supported with a comparing function; without one it compares the elements as text`, node)
+      const order = this.sorted(items, (a, b) => invoke(first!, [a, b]), node)
+      if (method === "toSorted") return this.fresh({ k: "array", items: order })
+      order.forEach((item, index) => {
+        if (items[index] === item) return
+        this.assertChangeable(array, item, node)
+        this.write(array, index, item)
+      })
+      return array
+    }
+    if (ARRAY_MUTATORS.has(method)) throw new Unsupported(`\`.${method}\` changes the array in place in a way that is not modeled; only \`.push\`, \`.sort\` and assigning to a position are`, node)
+    if (method === "at") {
+      if (args.length > 1) throw new Unsupported("`.at` takes one position", node)
+      return items[known(first, 0, "a position")] ?? this.absent(undefined, node)
+    }
+    if (method === "slice") {
+      if (args.length > 2) throw new Unsupported("`.slice` takes a start and an end", node)
+      const clamp = (index: number) => Math.min(Math.max(index, 0), items.length)
+      return this.fresh({ k: "array", items: items.slice(clamp(known(first, 0, "a start")), clamp(known(second, items.length, "an end"))) })
+    }
+    if (!["includes", "some", "every", "map", "reduce", "filter", "find", "flatMap"].includes(method)) throw new Unsupported(`the array method \`.${method}\` is not supported`, node)
+    const expected = method === "reduce" ? 2 : 1
+    if (!first || args.length !== expected) {
+      throw new Unsupported(method === "reduce" ? "`.reduce` is supported with a callback and an initial value" : `\`.${method}\` is supported with exactly one argument`, node)
+    }
+    if (method !== "includes" && !callable(first)) throw new Unsupported(`\`.${method}\` needs a function, but this is ${describe(first)}`, node)
     switch (method) {
       case "reduce":
         return items.reduce((accumulator, item, index) => invoke(first, [accumulator, item, position(index)]), second!)
@@ -1928,14 +2268,249 @@ export class Translator {
       case "some":
       case "every": {
         // JavaScript stops at the first element that settles the answer; the model asks every element.
-        const results = this.unchanging(`a callback of \`.${method}\``, node, () => items.map((item, index) => this.scalarOf(invoke(first, [item, position(index)]), node, "bool")))
+        const results = this.unchanging(`a callback of \`.${method}\``, node, () => items.map((item, index) => this.truthy(invoke(first, [item, position(index)]), node)))
         return scalar(method === "some" ? results.reduce(ir.or, ir.FALSE) : results.reduce(ir.and, ir.TRUE))
+      }
+      case "find": {
+        // As with `.some`, JavaScript stops asking at the first match. The result is the first element that passed.
+        const passes = this.unchanging("a callback of `.find`", node, () => items.map((item, index) => this.truthy(invoke(first, [item, position(index)]), node)))
+        return items.reduceRight<Value>((later, item, index) => this.branch(passes[index]!, () => item, () => later), VOID)
       }
       case "map":
         return this.fresh({ k: "array", items: items.map((item, index) => invoke(first, [item, position(index)])) })
+      case "filter": {
+        // Every element is asked, in order. Each one that may or may not pass doubles the lists there
+        // could be, so only a few may be undecided.
+        // What is kept is the element as it was read, before its callback ran: a callback may change the list.
+        const asked = items.map((item, index) => ({ item, pass: this.truthy(invoke(first, [item, position(index)]), node) }))
+        if (asked.filter(({ pass }) => pass.t !== "lit").length > MAX_UNDECIDED) throw new Unsupported(`\`.filter\` over more than ${MAX_UNDECIDED} elements that may or may not pass is not supported`, node)
+        const keep = (index: number, kept: Value[]): Value => (index === asked.length ? this.fresh({ k: "array", items: kept })
+          : this.branch(asked[index]!.pass, () => keep(index + 1, [...kept, asked[index]!.item]), () => keep(index + 1, kept)))
+        return keep(0, [])
+      }
+      case "flatMap": {
+        // Each callback runs in order; what it returns is spread one level if it is a list.
+        // A list a callback returns is copied as it returns: a later callback may change that list.
+        const parts = items.map((item, index) => this.over(invoke(first, [item, position(index)]), part => (part.k === "array" ? this.fresh({ k: "array", items: [...part.items] }) : part)))
+        let undecided = 0
+        const count = (part: Value): void => {
+          if (part.k === "choice") {
+            undecided++
+            count(part.a)
+            count(part.b)
+          }
+        }
+        parts.forEach(count)
+        if (undecided > MAX_UNDECIDED) throw new Unsupported(`\`.flatMap\` over more than ${MAX_UNDECIDED} results that depend on a condition is not supported`, node)
+        const join = (index: number, joined: Value[]): Value => (index === parts.length ? this.fresh({ k: "array", items: joined })
+          : this.over(parts[index]!, part => (part.k === "bottom" ? BOTTOM : join(index + 1, part.k === "array" ? [...joined, ...part.items] : [...joined, part]))))
+        return join(0, [])
+      }
       default:
         throw new Unsupported(`the array method \`.${method}\` is not supported`, node)
     }
+  }
+
+  /**
+   * The order `.sort` puts elements in. JavaScript only defines it when the
+   * comparing function orders the elements consistently, and then the result
+   * is the one stable order whatever algorithm sorts. So every pair is
+   * compared here, each result has to be known, and together they have to be
+   * consistent; an engine compares fewer pairs, which makes no difference when
+   * comparing changes nothing.
+   */
+  private sorted(items: Value[], compare: (a: Value, b: Value) => Value, node: N): Value[] {
+    if (items.some(item => item.k === "void" || item.k === "choice" || item.k === "bottom")) throw new Unsupported("sorting a list that may hold undefined is not supported", node)
+    const refusal = () => new Unsupported("sorting is supported where the order of the elements is known here: each comparison has to come out as a known number", node)
+    const signs = this.unchanging("a comparing function of `.sort`", node, () => items.map(a => items.map(b => {
+      const result = compare(a, b)
+      if (!isNumber(result) || result.k !== "scalar") throw refusal()
+      const value = this.settle(result.e, refusal).value as bigint
+      return value < 0n ? -1 : value > 0n ? 1 : 0
+    })))
+    const n = items.length
+    for (let i = 0; i < n; i++) {
+      for (let j = 0; j < n; j++) {
+        if (signs[i]![j]! !== -signs[j]![i]!) throw new Unsupported("this comparing function does not order the elements consistently, so the result of sorting is not defined", node)
+        for (let k = 0; k < n; k++) {
+          if (signs[i]![j]! <= 0 && signs[j]![k]! <= 0 && signs[i]![k]! > 0) throw new Unsupported("this comparing function does not order the elements consistently, so the result of sorting is not defined", node)
+        }
+      }
+    }
+    // Stable: elements that compare equal keep their order.
+    return items.map((_, index) => index).sort((i, j) => signs[i]![j]! || i - j).map(index => items[index]!)
+  }
+
+  /** `Array.from` of a list, a Map or a Set, or of `{ length }` with a function that makes each element. */
+  private arrayFrom(args: Value[], node: N): Value {
+    this.assertBuiltinsIntact(node)
+    const [source, make] = args
+    if (!source || args.length > 2) throw new Unsupported("`Array.from` is supported with a list and an optional function", node)
+    if (make && make.k !== "closure") throw new Unsupported(`\`Array.from\` needs a function, but this is ${describe(make)}`, node)
+    if (make && parametersOf(make.node).length > 2) throw new Unsupported("a function given to `Array.from` takes an element and its position", node)
+    return this.over(source, from => {
+      if (from.k === "bottom") return BOTTOM
+      let items: Value[]
+      if (from.k === "record") {
+        // `{ length: n }` stands for `n` elements that are all undefined.
+        const length = from.fields.get("length")
+        const refusal = () => new Unsupported("`Array.from` of an object is supported for `{ length }` with a length known here", node)
+        if (from.fields.size !== 1 || !length || !isNumber(length) || length.k !== "scalar") throw refusal()
+        const count = Number(this.settle(length.e, refusal).value)
+        if (count > MAX_ITERATIONS) throw new Unsupported(`a list of more than ${MAX_ITERATIONS} elements is too long to build`, node)
+        items = Array.from({ length: Math.max(count, 0) }, () => VOID)
+      } else {
+        const listed = this.listed(from, node)
+        if (listed.k !== "array") throw new Unsupported(`\`Array.from\` of ${describe(from)} is not supported`, node)
+        items = listed.items
+      }
+      if (!make) return this.fresh({ k: "array", items: [...items] })
+      // The source is walked while the function runs, so a list is read as it is then, including what the
+      // function added to it. A Map or a Set was listed on entry, which misses what is added to it.
+      const entered = from.k === "map" || from.k === "set" ? from.log.items.length : undefined
+      const made: Value[] = []
+      for (let index = 0; index < items.length; index++) {
+        if (index >= MAX_ITERATIONS) throw new Unsupported(`a list of more than ${MAX_ITERATIONS} elements is too long to build`, node)
+        made.push(this.call(make, [items[index]!, scalar(ir.lit(BigInt(index)), true)], node))
+        if (entered !== undefined && (from as { log: { items: Value[] } }).log.items.length !== entered) {
+          throw new Unsupported("adding to a Map or a Set inside the function that `Array.from` walks it with is not supported", node)
+        }
+      }
+      return this.fresh({ k: "array", items: made })
+    })
+  }
+
+  // ------------------------------------------------------------ collections
+
+  /** `new Map(...)` and `new Set(...)`, empty or from a list. */
+  private construct(node: N, env: Env): Value {
+    const callee = node.expression
+    const kind = callee.kind === K.Identifier && !env.get(callee.text) && this.isBuiltin(callee) ? (callee.text === "Map" ? "map" : callee.text === "Set" ? "set" : undefined) : undefined
+    if (!kind) throw new Unsupported("`new` is supported for Map and Set only; classes are not modeled", node)
+    this.assertBuiltinsIntact(node)
+    const args = this.arguments({ arguments: node.arguments ?? [] }, env)
+    if (args.length > 1) throw new Unsupported(`\`new ${callee.text}\` takes one list`, node)
+    return this.over(args[0] ?? VOID, given => {
+      if (given.k === "bottom") return BOTTOM
+      const collection: Extract<Value, { k: "map" | "set" }> = { k: kind, log: this.fresh({ k: "array", items: [] }) }
+      if (given.k === "void") return collection
+      const source = this.listed(given, node)
+      if (source.k !== "array") throw new Unsupported(`\`new ${callee.text}\` of ${describe(given)} is not supported`, node)
+      for (const item of source.items) {
+        if (kind === "set") this.add(collection, [item], node)
+        else {
+          const pair = this.settled(item)
+          if (pair.k !== "array" || pair.items.length < 2) throw new Unsupported("`new Map` needs a list of `[key, value]` pairs", node)
+          this.add(collection, [pair.items[0]!, pair.items[1]!], node)
+        }
+      }
+      return collection
+    })
+  }
+
+  /** Add an entry to a Map or a Set. */
+  private add(collection: Extract<Value, { k: "map" | "set" }>, entry: Value[], node: N) {
+    const stored = this.fresh({ k: "array" as const, items: [this.key(entry[0]!, node), ...entry.slice(1)] })
+    this.assertChangeable(collection.log, stored, node)
+    this.write(collection.log, collection.log.items.length, stored)
+    // The entry is only ever read.
+    this.freeze(stored)
+  }
+
+  /** A key of a Map or an element of a Set. Only values that are compared by what they are can be one. */
+  private key(value: Value, node: N): Extract<Value, { k: "scalar" }> {
+    value = this.settled(value)
+    if (value.k !== "scalar") throw new Unsupported(`a Map or a Set is modeled with booleans, numbers, bigints and strings as keys, but this is ${describe(value)}`, node)
+    return value
+  }
+
+  /** Whether two keys are the same key. A number and a bigint never are. */
+  private sameKey(a: Extract<Value, { k: "scalar" }>, b: Extract<Value, { k: "scalar" }>): Expr {
+    return a.e.ty === b.e.ty && !!a.num === !!b.num ? ir.eq(a.e, b.e) : ir.FALSE
+  }
+
+  private entries(collection: Extract<Value, { k: "map" | "set" }>): { key: Extract<Value, { k: "scalar" }>; value: Value }[] {
+    type Entry = { key: Extract<Value, { k: "scalar" }>; value: Value }
+    // An entry added on both sides of a condition is one entry or the other: its key and its value each depend on the condition.
+    const entryOf = (entry: Value): Entry => {
+      if (entry.k === "choice") {
+        const a = entryOf(entry.a)
+        const b = entryOf(entry.b)
+        if (a.key.e.ty !== b.key.e.ty || !!a.key.num !== !!b.key.num) throw new Unsupported("a Map or a Set given keys of different kinds on the two sides of a condition is not supported", undefined)
+        return { key: scalar(ir.ite(entry.cond, a.key.e, b.key.e), a.key.num) as Entry["key"], value: this.mergeHeld(entry.cond, a.value, b.value) }
+      }
+      if (entry.k !== "array") throw new Error("an entry of a Map or a Set is a list")
+      const [key, value] = entry.items
+      return { key: key as Entry["key"], value: value ?? key! }
+    }
+    return collection.log.items.map(entryOf)
+  }
+
+  /**
+   * A copy of a list, or of a Map or a Set as a list, made now: what a spread
+   * takes. The list may be one of several depending on a condition, and each
+   * is copied.
+   */
+  private copied(value: Value, at: N, verb: string, where: string): Value {
+    return this.over(value, given => {
+      if (given.k === "bottom") return BOTTOM
+      const list = this.listed(given, at)
+      if (list.k !== "array") throw new Unsupported(`${verb} ${describe(list)} ${where}`, at)
+      return this.fresh({ k: "array", items: [...list.items] })
+    })
+  }
+
+  /** How many different keys a Map or a Set holds: each entry counts unless an earlier one has its key. */
+  private collectionSize(collection: Extract<Value, { k: "map" | "set" }>, node: N): Value {
+    this.assertBuiltinsIntact(node)
+    const entries = this.entries(collection)
+    return scalar(entries.reduce((size, entry, index) => {
+      const repeated = entries.slice(0, index).map(earlier => this.sameKey(earlier.key, entry.key)).reduce(ir.or, ir.FALSE)
+      return ir.add(size, ir.ite(repeated, ir.lit(0n), ir.lit(1n)))
+    }, ir.lit(0n) as Expr), true)
+  }
+
+  private collectionMethod(collection: Extract<Value, { k: "map" | "set" }>, method: string, args: Value[], node: N): Value {
+    const entries = this.entries(collection)
+    const [first, second] = args
+    if (collection.k === "map" && method === "set" && args.length === 2) {
+      this.add(collection, [first!, second!], node)
+      return collection
+    }
+    if (collection.k === "set" && method === "add" && args.length === 1) {
+      this.add(collection, [first!], node)
+      return collection
+    }
+    if ((method === "has" || (method === "get" && collection.k === "map")) && args.length === 1) {
+      // Looking up a value that cannot be a key finds nothing.
+      const wanted = this.settled(first!)
+      if (wanted.k === "choice" || wanted.k === "bottom") throw new Unsupported(`\`.${method}\` is supported with a key that is one kind of value`, node)
+      const matches = entries.map(entry => (wanted.k === "scalar" ? this.sameKey(entry.key, wanted) : ir.FALSE))
+      if (method === "has") return scalar(matches.reduce(ir.or, ir.FALSE))
+      // The latest entry for the key holds its value.
+      return entries.reduce<Value>((earlier, entry, index) => this.branch(matches[index]!, () => entry.value, () => earlier), VOID)
+    }
+    throw new Unsupported(`calling \`.${method}\` on ${describe(collection)} is not supported`, node)
+  }
+
+  /**
+   * A Map or a Set as the list a loop or a spread goes through: one element
+   * per key, in the order the keys were first added, each key with its latest
+   * value. Which entries share a key has to be known here. Anything else is
+   * returned as it is.
+   */
+  private listed(value: Value, node: N): Value {
+    value = this.settled(value)
+    if (value.k !== "map" && value.k !== "set") return value
+    this.assertBuiltinsIntact(node)
+    const refusal = () => new Unsupported(`going through ${describe(value)} is supported where it is known here which of its keys are equal`, node)
+    const kept: { key: Extract<Value, { k: "scalar" }>; value: Value }[] = []
+    for (const entry of this.entries(value)) {
+      const earlier = kept.find(seen => this.settle(this.sameKey(seen.key, entry.key), refusal).value === true)
+      if (earlier) earlier.value = entry.value
+      else kept.push({ ...entry })
+    }
+    return this.fresh({ k: "array", items: kept.map(entry => (value.k === "set" ? entry.key : this.fresh({ k: "array", items: [entry.key, entry.value] }))) })
   }
 
   // ------------------------------------------------------- module bindings
@@ -1958,7 +2533,12 @@ export class Translator {
       throw new Unsupported(`\`${node.text}\` comes from a declaration file or a library, so its code cannot be read`, node)
     }
     this.reached.add(file.fileName)
-    if (declaration.kind === K.FunctionDeclaration) return { k: "closure", node: declaration, env: new Env() }
+    if (declaration.kind === K.FunctionDeclaration) {
+      // A function declared inside another is found through its scope. Reaching it here means that scope
+      // has not been entered where it is used, as in a default that runs before the body: JavaScript throws.
+      if (declaration.parent.kind !== K.SourceFile) throw new Unsupported(`\`${node.text}\` is a local function that is not in scope here`, node)
+      return { k: "closure", node: declaration, env: new Env() }
+    }
     if (declaration.kind === K.VariableDeclaration) {
       const list = declaration.parent
       const moduleLevel = list.kind === K.VariableDeclarationList && list.parent.kind === K.VariableStatement && list.parent.parent.kind === K.SourceFile
@@ -1973,12 +2553,13 @@ export class Translator {
       const known = this.constants.get(declaration)
       if (known) return known
       // The initializer runs once, in an epoch of its own: it may build its value step by step, and nothing after it may change that value.
-      const saved = { pc: this.pc, stack: this.stack, instance: this.instance, cells: this.cells, assigned: this.assigned, epoch: this.epoch }
+      const saved = { pc: this.pc, stack: this.stack, instance: this.instance, cells: this.cells, frame: this.frame, assigned: this.assigned, epoch: this.epoch }
       this.epoch = ++epochs
       this.pc = []
       this.stack = []
       this.instance = undefined
       this.cells = []
+      this.frame = 0
       this.assigned = []
       this.loading.push({ file: file.fileName, position: declaration.pos })
       try {
@@ -2126,6 +2707,23 @@ export class Translator {
     const inCode = handedOver.find(entry => entry.inFunction)
     if (inCode) refuse("is handed to other code by a function, which may run before the law does,", inCode.at)
     this.mutationChecked.add(key)
+  }
+}
+
+/** Whether a value is an object of some kind, which is never equal to undefined and always counts as true. */
+function isObject(value: Value): boolean {
+  return value.k === "record" || value.k === "array" || value.k === "closure" || value.k === "map" || value.k === "set"
+}
+
+/**
+ * Whether an expression is a link of an optional chain: a `?.`, or a property,
+ * element or call that follows one without parentheses in between.
+ */
+function inOptionalChain(node: N): boolean {
+  for (;;) {
+    if (node.kind !== K.NonNullExpression && node.kind !== K.PropertyAccessExpression && node.kind !== K.ElementAccessExpression && node.kind !== K.CallExpression) return false
+    if (node.kind !== K.NonNullExpression && node.questionDotToken) return true
+    node = node.expression
   }
 }
 

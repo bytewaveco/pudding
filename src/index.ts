@@ -130,6 +130,11 @@ export class ExpectationFailed extends Error {}
 function equal(a: unknown, b: unknown): boolean {
   if (a === b || Object.is(a, b)) return true
   if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) return false
+  // A Map or a Set keeps what it holds out of its own properties, so it is compared by its entries.
+  if (a instanceof Map || b instanceof Map) {
+    return a instanceof Map && b instanceof Map && a.size === b.size && [...a].every(([key, value]) => b.has(key) && equal(value, b.get(key)))
+  }
+  if (a instanceof Set || b instanceof Set) return a instanceof Set && b instanceof Set && a.size === b.size && [...a].every(item => b.has(item))
   if (Array.isArray(a) !== Array.isArray(b)) return false
   const keys = Object.keys(a)
   if (keys.length !== Object.keys(b).length) return false
