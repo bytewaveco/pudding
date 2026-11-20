@@ -5,7 +5,7 @@
 import { execFileSync } from "node:child_process"
 import { createHash } from "node:crypto"
 import { createRequire } from "node:module"
-import { existsSync, globSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs"
+import { appendFileSync, existsSync, globSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { dirname, isAbsolute, join, relative, resolve } from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
@@ -21,7 +21,7 @@ import { checksFor, FALLBACK_HEADER, FAST_HEADER, FULL_HEADER, proofKind, prove,
 import { Translator, type Law, type LawInstance } from "./translate.ts"
 
 export const MINIMUM_LEAN = [4, 36, 0] as const
-const CACHE_VERSION = 2
+const CACHE_VERSION = 3
 const RUNTIME_BUDGET = 4_000
 const RUNTIME_TIMEOUT_MS = 30_000
 
@@ -90,16 +90,13 @@ export interface Report {
 }
 
 /**
- * What is remembered between runs: which Lean binary is which version, and
- * the theorems Lean has accepted. A theorem is identified by its full text
- * and the Lean version, so reusing it cannot be wrong. Whole results are
- * deliberately not reused: knowing that nothing relevant changed would mean
- * second-guessing TypeScript's module resolution.
+ * What a project remembers between runs: which Lean binary is which version.
+ * The theorems Lean has accepted are remembered for the whole machine, in
+ * the proof log.
  */
 interface Cache {
   version: number
   lean: Record<string, string>
-  proved: string[]
 }
 
 /** A path as shown to the user: relative inside the project, absolute outside it. */
@@ -187,7 +184,7 @@ function leanVersion(lean: string, cache: Cache): string {
   return version
 }
 
-/** The most proofs remembered. Only runs over part of the laws can reach it, since a full run forgets what it did not use. */
+/** The most proofs the log keeps when it is rewritten. It is rewritten when it holds twice as many. */
 const CACHE_LIMIT = 50_000
 
 function cachePath(cwd: string): string {
@@ -208,7 +205,53 @@ function loadCache(file: string): Cache {
   } catch {
     // Missing or unreadable: start fresh.
   }
-  return { version: CACHE_VERSION, lean: {}, proved: [] }
+  return { version: CACHE_VERSION, lean: {} }
+}
+
+/**
+ * The theorems Lean has accepted, shared by every project on the machine, so
+ * that a new worktree or a second project does not prove them again. Each
+ * line is a key made from a theorem's full text, the Lean version and this
+ * build of Pudding, so reusing one cannot be wrong: a build that judges Lean's
+ * answers differently, released or not, never trusts another build's keys.
+ * Whole results are deliberately not reused: knowing that nothing relevant
+ * changed would mean second-guessing TypeScript's module resolution. Runs
+ * append to the log, so runs going at once, as Vitest's workers do, keep each
+ * other's proofs. Only rewriting a log grown to twice its limit can drop a
+ * proof, which then costs time again.
+ */
+const proofLog = () => join(cacheDirectory(), "proved")
+const KEY = /^[0-9a-f]{32}$/
+
+/** A digest of the code running now: every module next to this one. */
+function buildDigest(): string {
+  const directory = dirname(fileURLToPath(import.meta.url))
+  const digest = createHash("sha256")
+  for (const file of readdirSync(directory).sort()) {
+    if (/\.(js|ts)$/.test(file) && !file.endsWith(".d.ts")) digest.update(file + "\0").update(readFileSync(join(directory, file)))
+  }
+  return digest.digest("hex")
+}
+
+function loadProofs(): { keys: Set<string>; lines: number } {
+  try {
+    const lines = readFileSync(proofLog(), "utf8").split("\n")
+    return { keys: new Set(lines.filter(line => KEY.test(line))), lines: lines.length }
+  } catch {
+    return { keys: new Set(), lines: 0 }
+  }
+}
+
+/** A cache that cannot be written only costs time, so a failure here is ignored. */
+function saveProofs(known: { keys: Set<string>; lines: number }, added: string[]): void {
+  if (!added.length) return
+  try {
+    mkdirSync(dirname(proofLog()), { recursive: true })
+    if (known.lines + added.length > 2 * CACHE_LIMIT) replaceFile(proofLog(), [...known.keys, ...added].slice(-CACHE_LIMIT).join("\n") + "\n")
+    else appendFileSync(proofLog(), added.map(key => key + "\n").join(""))
+  } catch {
+    // Read-only or missing cache directory.
+  }
 }
 
 /**
@@ -498,8 +541,10 @@ export async function run(options: RunOptions = {}): Promise<Report> {
   })
 
   // Prove what the cache does not already hold.
-  const proved = new Set(cache.proved)
-  const keyOf = (statement: string) => hash(version + "\0" + statement)
+  const known = config.cache === false ? { keys: new Set<string>(), lines: 0 } : loadProofs()
+  const proved = known.keys
+  const build = buildDigest()
+  const keyOf = (statement: string) => hash(build + "\0" + version + "\0" + statement)
   const statements = [...new Set(pending.flatMap(p => p.checks.map(c => c.statement)))]
   const outcomes = new Map<string, { ok: boolean; message: string }>()
   const fresh: string[] = []
@@ -720,13 +765,12 @@ export async function run(options: RunOptions = {}): Promise<Report> {
   finish()
 
   if (config.cache !== false) {
-    // A full run keeps only what it used. A run over part of the laws must not
-    // forget the rest, so it adds to what is there now, which another run may
-    // have written since this one started.
-    const kept = partial ? loadCache(cacheFile).proved.filter(hash => !used.has(hash)) : []
-    const saved: Cache = { version: CACHE_VERSION, lean: cache.lean, proved: [...kept, ...used].slice(-CACHE_LIMIT) }
-    mkdirSync(dirname(cacheFile), { recursive: true })
-    replaceFile(cacheFile, JSON.stringify(saved))
+    saveProofs(known, [...used].filter(key => !proved.has(key)))
+    const saved: Cache = { version: CACHE_VERSION, lean: cache.lean }
+    if (JSON.stringify(saved) !== JSON.stringify(loadCache(cacheFile))) {
+      mkdirSync(dirname(cacheFile), { recursive: true })
+      replaceFile(cacheFile, JSON.stringify(saved))
+    }
   }
   return report
 }
