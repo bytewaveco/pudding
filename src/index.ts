@@ -54,8 +54,32 @@ export interface LawOptions {
 export interface Matchers<T> {
   /** Structural equality. */
   toEqual(expected: NoInfer<T>): void
-  /** Equality of booleans, bigints and strings. */
+  /** Equality of booleans, bigints, numbers, strings, null and undefined. */
   toBe(expected: NoInfer<T>): void
+  /** Strict greater-than comparison on numbers or bigints. */
+  toBeGreaterThan(expected: T extends number | bigint ? NoInfer<T> : number | bigint): void
+  /** Greater-than-or-equal comparison on numbers or bigints. */
+  toBeGreaterThanOrEqual(expected: T extends number | bigint ? NoInfer<T> : number | bigint): void
+  /** Strict less-than comparison on numbers or bigints. */
+  toBeLessThan(expected: T extends number | bigint ? NoInfer<T> : number | bigint): void
+  /** Less-than-or-equal comparison on numbers or bigints. */
+  toBeLessThanOrEqual(expected: T extends number | bigint ? NoInfer<T> : number | bigint): void
+  /** Check that the value is `undefined`. */
+  toBeUndefined(): void
+  /** Check that the value is not `undefined`. */
+  toBeDefined(): void
+  /** Check that the value is `null`. */
+  toBeNull(): void
+  /** Check that the value is truthy. */
+  toBeTruthy(): void
+  /** Check that the value is falsy. */
+  toBeFalsy(): void
+  /** Check the `.length` of an array or string. */
+  toHaveLength(expected: number): void
+  /** Check that an array contains an element (by `===`) or a string contains a substring. */
+  toContain(expected: unknown): void
+  /** Check that calling a function throws an error. */
+  toThrow(): void
   readonly not: Matchers<T>
 }
 
@@ -156,9 +180,34 @@ function matchers<T>(actual: T, negated: boolean): Matchers<T> {
   const check = (pass: boolean) => {
     if (pass === negated) throw new ExpectationFailed("expectation failed")
   }
+  const ordered = (expected: unknown, compare: (a: number | bigint, b: number | bigint) => boolean) => {
+    if (typeof actual !== typeof expected || (typeof actual !== "number" && typeof actual !== "bigint")) return false
+    return compare(actual as number | bigint, expected as number | bigint)
+  }
   return {
     toEqual: expected => check(equal(actual, expected)),
     toBe: expected => check(actual === expected || Object.is(actual, expected)),
+    toBeGreaterThan: expected => check(ordered(expected, (a, b) => a > b)),
+    toBeGreaterThanOrEqual: expected => check(ordered(expected, (a, b) => a >= b)),
+    toBeLessThan: expected => check(ordered(expected, (a, b) => a < b)),
+    toBeLessThanOrEqual: expected => check(ordered(expected, (a, b) => a <= b)),
+    toBeUndefined: () => check(actual === undefined),
+    toBeDefined: () => check(actual !== undefined),
+    toBeNull: () => check(actual === null),
+    toBeTruthy: () => check(Boolean(actual)),
+    toBeFalsy: () => check(!actual),
+    toHaveLength: expected => check((Array.isArray(actual) || typeof actual === "string") && actual.length === expected),
+    toContain: expected => check(Array.isArray(actual) ? actual.includes(expected) : typeof actual === "string" && typeof expected === "string" && actual.includes(expected)),
+    toThrow: () => {
+      if (typeof actual !== "function") throw new ExpectationFailed("expected a function")
+      let threw = false
+      try {
+        ;(actual as () => unknown)()
+      } catch {
+        threw = true
+      }
+      check(threw)
+    },
     get not() {
       return matchers(actual, !negated)
     },
