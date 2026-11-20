@@ -1,0 +1,13 @@
+# What a proof means
+
+A *proved* law is a theorem about a model of your code. These things stand
+between the theorem and the code that runs.
+
+1. **The translation.** Pudding's translator and its constant folding are trusted. To catch mistakes, every law is also executed against the real code and compared with the model, on all inputs of a small finite domain or a sample of a large one that includes the constants the law mentions. A disagreement fails the law. If the law file cannot be executed, the run says so in a warning. With `--no-cross-check` none of this happens, including noticing that a module throws when it loads.
+2. **Inputs are plain data.** An object input has exactly the properties its type declares, held as ordinary values. TypeScript would also accept an object with extra properties, or one whose properties are getters; those are not covered. Inputs are never changed in place by a proved law, so it does not matter whether two of them are the same object.
+3. **Module data.** A table such as `const transitions = {...}` is assumed to hold its initial value when a law runs. Anywhere in its module, a table may only be read in ways known to change nothing; anything else, such as passing it to a function, calling a method it defines, or giving it another name, makes Pudding refuse it. Two things are taken on trust: an installed package given a table declared `as const` does not change it, and no other module changes an exported table.
+4. **Built-ins.** `Math`, `String`, array methods, iteration and the like are modeled as the language defines them. If any file of the project assigns to a built-in, no law is proved; they are executed instead. Pudding does not look inside installed packages.
+5. **The files that run are the files TypeScript read.** Laws are executed against the files TypeScript resolved each import to. Where Node on its own would load a different file, as with some conditional `imports` and `exports`, the run says so in a warning.
+6. **Numbers.** A `number` is modeled as the whole number it holds, and every result must be proved to stay within 2^53 − 1, where that model is exact. Zero and negative zero are one value, as `===` treats them.
+7. **Strings.** `string` inputs range over well-formed Unicode text. JavaScript strings with unpaired surrogates are not covered.
+8. **Lean.** Finite laws are checked by Lean's kernel. Other proofs are found by tactics and checked by the kernel. A theorem counts only when Lean reports no error for it and confirms that it rests on nothing but Lean's standard axioms, so an unfinished proof (`sorry`) is rejected.

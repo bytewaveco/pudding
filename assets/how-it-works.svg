@@ -1,0 +1,95 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 520" width="800" height="520" role="img" aria-labelledby="title desc">
+  <title id="title">How Pudding checks a law</title>
+  <desc id="desc">Your law file and the code it calls go into Pudding. Step 1, read: the TypeScript 7 compiler type-checks the law files and resolves names and types. Step 2, translate: each law becomes obligations, one per expect and one per reachable throw. Step 3, prove: Lean 4 checks every case of finite inputs in its kernel and uses grind for unbounded inputs. Step 5, cross-check: each law is also executed against the real code and compared with the model. When Lean accepts, the law is proved and holds for every input. When Lean rejects, step 4, explain, searches for a counterexample and reports the inputs named the way your law names them.</desc>
+  <style>
+    svg { --card: #ffffff; --stroke: #d1d9e0; --text: #1f2328; --muted: #59636e; --line: #8c959f; --mod1: #fff8e6; --mod2: #fdf0d5; --modstroke: #e9c46a; --green: #1a7f37; --red: #cf222e; --amber: #9a6700; --blue: #0969da; --shadow: 0.07; }
+    @media (prefers-color-scheme: dark) { svg { --card: #161b22; --stroke: #30363d; --text: #e6edf3; --muted: #9198a1; --line: #6e7681; --mod1: #2a2110; --mod2: #2f2210; --modstroke: #7d5a12; --green: #3fb950; --red: #f85149; --amber: #d29922; --blue: #79c0ff; --shadow: 0; } }
+    text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif; fill: var(--text); }
+    .mono { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; }
+    .tag { font-size: 10.5px; font-weight: 600; letter-spacing: 1.2px; }
+    .title { font-size: 16px; font-weight: 600; }
+    .sub { font-size: 12.5px; fill: var(--muted); }
+    .label { font-size: 11.5px; fill: var(--muted); }
+    .card { fill: var(--card); stroke: var(--stroke); stroke-width: 1; }
+    .module { fill: url(#module); stroke: var(--modstroke); stroke-width: 1; }
+    .wire { stroke: var(--line); stroke-width: 1.5; fill: none; }
+    .head { stroke: var(--line); stroke-width: 1.8; fill: none; stroke-linecap: round; stroke-linejoin: round; }
+    .shadow { flood-color: #1f2328; flood-opacity: var(--shadow); }
+    .mod1 { stop-color: var(--mod1); } .mod2 { stop-color: var(--mod2); }
+    text.muted { fill: var(--muted); }
+    text.green { fill: var(--green); }
+    text.red { fill: var(--red); }
+    text.amber { fill: var(--amber); }
+    text.blue { fill: var(--blue); }
+  </style>
+  <defs>
+    <filter id="shadow" x="-5%" y="-10%" width="110%" height="130%">
+      <feDropShadow class="shadow" dx="0" dy="1" stdDeviation="2"/>
+    </filter>
+    <linearGradient id="module" x1="0" y1="0" x2="1" y2="1">
+      <stop class="mod1" offset="0"/><stop class="mod2" offset="1"/>
+    </linearGradient>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path class="head" d="M1,1 L9,5 L1,9"/>
+    </marker>
+  </defs>
+
+  <!-- What you write -->
+  <rect class="card" x="40" y="16" width="350" height="78" rx="12" filter="url(#shadow)"/>
+  <text class="tag blue" x="62" y="42">YOUR LAWS</text>
+  <text class="title mono" x="62" y="64">pages.law.ts</text>
+  <text class="sub" x="62" y="82">written like Vitest tests</text>
+
+  <rect class="card" x="410" y="16" width="350" height="78" rx="12" filter="url(#shadow)"/>
+  <text class="tag blue" x="432" y="42">YOUR CODE</text>
+  <text class="title mono" x="432" y="64">pages.ts</text>
+  <text class="sub" x="432" y="82">not annotated, rewritten or moved</text>
+
+  <path class="wire" d="M215,94 L215,126" marker-end="url(#arrow)"/>
+  <path class="wire" d="M585,94 L585,126" marker-end="url(#arrow)"/>
+
+  <!-- Pudding -->
+  <rect class="module" x="40" y="130" width="720" height="250" rx="16"/>
+
+  <rect class="card" x="64" y="154" width="208" height="118" rx="12" filter="url(#shadow)"/>
+  <text class="tag amber" x="84" y="182">1 · READ</text>
+  <text class="title" x="84" y="206">TypeScript 7</text>
+  <text class="sub" x="84" y="230">type-checks the law files,</text>
+  <text class="sub" x="84" y="248">resolves names and types</text>
+
+  <path class="wire" d="M272,213 L292,213" marker-end="url(#arrow)"/>
+
+  <rect class="card" x="296" y="154" width="208" height="118" rx="12" filter="url(#shadow)"/>
+  <text class="tag amber" x="316" y="182">2 · TRANSLATE</text>
+  <text class="title" x="316" y="206">Obligations</text>
+  <text class="sub" x="316" y="230">one per expect, and one</text>
+  <text class="sub" x="316" y="248">per reachable throw</text>
+
+  <path class="wire" d="M504,213 L524,213" marker-end="url(#arrow)"/>
+
+  <rect class="card" x="528" y="154" width="208" height="118" rx="12" filter="url(#shadow)"/>
+  <text class="tag amber" x="548" y="182">3 · PROVE</text>
+  <text class="title" x="548" y="206">Lean 4</text>
+  <text class="sub" x="548" y="230">finite inputs: every case</text>
+  <text class="sub" x="548" y="248">unbounded inputs: grind</text>
+
+  <rect class="card" x="64" y="292" width="672" height="64" rx="12" filter="url(#shadow)"/>
+  <text class="tag amber" x="84" y="320">5 · CROSS-CHECK</text>
+  <text class="sub" x="84" y="340">Each law is also executed against the real code and compared with the model.</text>
+
+  <!-- Verdicts -->
+  <path class="wire" d="M215,380 L215,422" marker-end="url(#arrow)"/>
+  <text class="label" x="227" y="406">Lean accepts</text>
+  <path class="wire" d="M585,380 L585,422" marker-end="url(#arrow)"/>
+  <text class="label" x="597" y="406">Lean rejects</text>
+
+  <rect class="card" x="40" y="426" width="350" height="78" rx="12" filter="url(#shadow)"/>
+  <text class="tag green" x="62" y="452">PROVED</text>
+  <text class="title" x="62" y="474">Holds for every input</text>
+  <text class="sub" x="62" y="492">the kernel accepted each theorem</text>
+
+  <rect class="card" x="410" y="426" width="350" height="78" rx="12" filter="url(#shadow)"/>
+  <text class="tag red" x="432" y="452">4 · EXPLAIN</text>
+  <text class="title" x="432" y="474">A counterexample</text>
+  <text class="sub" x="432" y="492">inputs named the way your law names them</text>
+</svg>
