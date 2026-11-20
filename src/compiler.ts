@@ -30,12 +30,15 @@ interface Loaded {
 /**
  * Look next to Pudding first, where a package manager links a peer
  * dependency, and then in the project being checked, which covers a linked
- * or globally installed Pudding.
+ * or globally installed Pudding and `--cwd <other-project>`.
  */
-async function load(names: Name[]): Promise<Loaded | undefined> {
-  const bases = [import.meta.url, pathToFileURL(join(process.cwd(), "package.json")).href]
+async function load(names: Name[], cwd?: string): Promise<Loaded | undefined> {
+  const roots = [import.meta.url]
+  if (cwd) roots.push(pathToFileURL(join(cwd, "package.json")).href)
+  const current = pathToFileURL(join(process.cwd(), "package.json")).href
+  if (!roots.includes(current)) roots.push(current)
   for (const name of names) {
-    for (const base of bases) {
+    for (const base of roots) {
       const require = createRequire(base)
       for (const entry of PROVIDERS[name]) {
         try {
@@ -58,35 +61,62 @@ async function load(names: Name[]): Promise<Loaded | undefined> {
   return undefined
 }
 
-const requested = process.env["PUDDING_COMPILER"]
 const names = Object.keys(PROVIDERS) as Name[]
-const loaded = requested === undefined || requested === ""
-  ? await load(names)
-  : names.includes(requested as Name) ? await load([requested as Name]) : undefined
+const missing = {} as never
+
+function apply(found: Loaded | undefined, requested: string | undefined) {
+  compiler = found ? `${found.name === "typescript" ? "TypeScript" : found.name} ${found.version}` : ""
+  compilerProblem = found
+    ? undefined
+    : requested === undefined || requested === ""
+      ? "no TypeScript 7 compiler was found: install `typescript` 7 or `tsrs` in this project"
+      : names.includes(requested as Name)
+        ? `PUDDING_COMPILER names \`${requested}\`, which is not installed in this project, or is older than TypeScript 7`
+        : `PUDDING_COMPILER must be one of ${names.map(name => `\`${name}\``).join(" or ")}, not \`${requested}\``
+  const sync = found?.sync
+  const ast = found?.ast
+  API = sync?.API ?? missing
+  DiagnosticCategory = sync?.DiagnosticCategory ?? missing
+  ElementFlags = sync?.ElementFlags ?? missing
+  SignatureKind = sync?.SignatureKind ?? missing
+  SymbolFlags = sync?.SymbolFlags ?? missing
+  TypeFlags = sync?.TypeFlags ?? missing
+  NodeFlags = ast?.NodeFlags ?? missing
+  SyntaxKind = ast?.SyntaxKind ?? missing
+}
 
 /** Which compiler was loaded, as reports name it. */
-export const compiler = loaded ? `${loaded.name === "typescript" ? "TypeScript" : loaded.name} ${loaded.version}` : ""
+export let compiler = ""
 
 /** Why no compiler could be loaded; `run` reports it instead of checking anything. */
-export const compilerProblem = loaded
-  ? undefined
-  : requested === undefined || requested === ""
-    ? "no TypeScript 7 compiler was found: install `typescript` 7 or `tsrs` in this project"
-    : names.includes(requested as Name)
-      ? `PUDDING_COMPILER names \`${requested}\`, which is not installed in this project, or is older than TypeScript 7`
-      : `PUDDING_COMPILER must be one of ${names.map(name => `\`${name}\``).join(" or ")}, not \`${requested}\``
+export let compilerProblem: string | undefined
 
 // Without a compiler these are empty, so that modules building tables from
 // them still load; `run` stops at `compilerProblem` before any of it is used.
-const missing = {} as never
-const sync = loaded?.sync
-const ast = loaded?.ast
+export let API: Sync["API"] = missing
+export let DiagnosticCategory: Sync["DiagnosticCategory"] = missing
+export let ElementFlags: Sync["ElementFlags"] = missing
+export let SignatureKind: Sync["SignatureKind"] = missing
+export let SymbolFlags: Sync["SymbolFlags"] = missing
+export let TypeFlags: Sync["TypeFlags"] = missing
+export let NodeFlags: Ast["NodeFlags"] = missing
+export let SyntaxKind: Ast["SyntaxKind"] = missing
 
-export const API = sync?.API ?? missing
-export const DiagnosticCategory = sync?.DiagnosticCategory ?? missing
-export const ElementFlags = sync?.ElementFlags ?? missing
-export const SignatureKind = sync?.SignatureKind ?? missing
-export const SymbolFlags = sync?.SymbolFlags ?? missing
-export const TypeFlags = sync?.TypeFlags ?? missing
-export const NodeFlags = ast?.NodeFlags ?? missing
-export const SyntaxKind = ast?.SyntaxKind ?? missing
+const initialRequested = process.env["PUDDING_COMPILER"]
+const initialLoaded = initialRequested === undefined || initialRequested === ""
+  ? await load(names)
+  : names.includes(initialRequested as Name) ? await load([initialRequested as Name]) : undefined
+apply(initialLoaded, initialRequested)
+
+/**
+ * Ensure a TypeScript 7 compiler is loaded, also searching `cwd` when the
+ * project being checked is not `process.cwd()` (for example with `--cwd`).
+ */
+export async function ensureCompiler(cwd?: string): Promise<void> {
+  if (!compilerProblem) return
+  const requested = process.env["PUDDING_COMPILER"]
+  const found = requested === undefined || requested === ""
+    ? await load(names, cwd)
+    : names.includes(requested as Name) ? await load([requested as Name], cwd) : undefined
+  if (found) apply(found, requested)
+}

@@ -54,7 +54,15 @@ export function format(report: Report, options: { cwd: string; color: boolean; r
   const version = /version ([\d.]+[^\s,]*)/.exec(report.lean)?.[1] ?? "unknown"
   lines.push(`  Laws    ${counts.join(dim(", ")) || "none"}`)
   lines.push(`  Proofs  ${report.obligations} ${report.obligations === 1 ? "theorem" : "theorems"}${report.cachedObligations ? ` (${report.cachedObligations} cached)` : ""}, ${report.cases.toLocaleString("en-US")} finite ${report.cases === 1 ? "case" : "cases"}, Lean ${version}${report.compiler ? `, ${report.compiler}` : ""}`)
-  lines.push(`  Time    ${report.durationMs} ms`)
+  const timingParts = verbose
+    ? [
+        `ts ${report.timings.typescript} ms`,
+        ...(report.timings.prove ? [`prove ${report.timings.prove} ms`] : []),
+        ...(report.timings.retry ? [`retry ${report.timings.retry} ms`] : []),
+        ...(report.timings.crossCheck ? [`cross-check ${report.timings.crossCheck} ms`] : []),
+      ]
+    : []
+  lines.push(`  Time    ${report.durationMs} ms${timingParts.length ? dim(` (${timingParts.join(", ")})`) : ""}`)
 
   if (options.reporter === "github") {
     // Workflow commands turn into annotations on the lines concerned.
