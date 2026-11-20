@@ -142,9 +142,13 @@ function equal(a: unknown, b: unknown): boolean {
   }
   if (a instanceof Map || b instanceof Map) return a instanceof Map && b instanceof Map && paired([...a], [...b])
   if (a instanceof Set || b instanceof Set) return a instanceof Set && b instanceof Set && paired([...a], [...b])
+  if (a instanceof Date || b instanceof Date) return a instanceof Date && b instanceof Date && a.getTime() === b.getTime()
   if (Array.isArray(a) !== Array.isArray(b)) return false
   const keys = Object.keys(a)
   if (keys.length !== Object.keys(b).length) return false
+  // Something that keeps what it holds out of its own properties, such as a RegExp, shows nothing to compare: it only equals itself.
+  const plain = (value: object) => Array.isArray(value) || Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null
+  if (keys.length === 0 && (!plain(a) || !plain(b))) return false
   return keys.every(key => Object.hasOwn(b, key) && equal((a as Record<string, unknown>)[key], (b as Record<string, unknown>)[key]))
 }
 

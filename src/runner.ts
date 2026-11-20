@@ -680,7 +680,8 @@ export async function run(options: RunOptions = {}): Promise<Report> {
               : `the running code ${actual ? "satisfies" : "violates"} the law for this input, but the model Pudding proved things about ${expected ? "satisfies" : "violates"} it; the proof cannot be trusted`,
           })
         }
-        if (law.problem && result.executed) executedOnly.set(law, result.exhaustive)
+        // Inputs that leave out part of the declared domain are never every input, however few there are.
+        if (law.problem && result.executed) executedOnly.set(law, result.exhaustive && !law.narrowed)
         // Lean accepted every theorem of this law, yet the model those theorems describe fails here.
         if (!law.problem && !entry.findings.length && result.modelFails) {
           entry.findings.push({

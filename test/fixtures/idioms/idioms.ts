@@ -179,6 +179,21 @@ export function copyOf(list: bigint[]): bigint[] {
   return Array.from(list, undefined as never)
 }
 
+/** A callback that ends without returning gives undefined, which counts as false. */
+export function hasTwo(): boolean {
+  return [1, 2, 3].some(item => {
+    if (item === 2) return true
+  })
+}
+
+export function grownWhileFiltered(): number[] {
+  const list = [1, 2]
+  return list.filter(item => {
+    if (item < 3) list.push(item + 2)
+    return true
+  })
+}
+
 /** The only callback throws, so the call never gives an answer. */
 export function someThrows(a: bigint): boolean {
   return [a].some(() => {
