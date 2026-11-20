@@ -130,11 +130,18 @@ export class ExpectationFailed extends Error {}
 function equal(a: unknown, b: unknown): boolean {
   if (a === b || Object.is(a, b)) return true
   if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) return false
-  // A Map or a Set keeps what it holds out of its own properties, so it is compared by its entries.
-  if (a instanceof Map || b instanceof Map) {
-    return a instanceof Map && b instanceof Map && a.size === b.size && [...a].every(([key, value]) => b.has(key) && equal(value, b.get(key)))
+  // A Map or a Set keeps what it holds out of its own properties, so it is compared by its entries:
+  // each one has to pair up with one of the other side that equals it, whatever the order.
+  const paired = (left: unknown[], right: unknown[]) => {
+    const free = [...right]
+    return left.length === right.length && left.every(item => {
+      const match = free.findIndex(other => equal(item, other))
+      if (match >= 0) free.splice(match, 1)
+      return match >= 0
+    })
   }
-  if (a instanceof Set || b instanceof Set) return a instanceof Set && b instanceof Set && a.size === b.size && [...a].every(item => b.has(item))
+  if (a instanceof Map || b instanceof Map) return a instanceof Map && b instanceof Map && paired([...a], [...b])
+  if (a instanceof Set || b instanceof Set) return a instanceof Set && b instanceof Set && paired([...a], [...b])
   if (Array.isArray(a) !== Array.isArray(b)) return false
   const keys = Object.keys(a)
   if (keys.length !== Object.keys(b).length) return false

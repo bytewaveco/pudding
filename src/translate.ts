@@ -229,6 +229,7 @@ const MAX_INSTANCES = 256
 const NUMBER_HELP = "`number` covers fractions, NaN and infinities, which are not modeled; use `Integer` from pudding for whole numbers, or bigint"
 const MAX_ALTERNATIVES = 64
 const MAX_TYPE_DEPTH = 24
+const MAX_SORTED = 64
 /** How many elements of one `.filter` or `.flatMap` may depend on a condition; the lists there could be double with each. */
 const MAX_UNDECIDED = 8
 const MODULE_DECLARATIONS = new Set<number>([
@@ -289,6 +290,8 @@ export class Translator {
   private cells: Cell[] = []
   /** Where in `cells` the variables of the function being evaluated start; those before it belong to its callers. */
   private frame = 0
+  /** Every variable assigned to since code that JavaScript may skip started running, while there is such code. */
+  private assignedTo: Set<Cell> | undefined
   /** For each function being evaluated, the names it assigns to anywhere in its body. */
   private assigned: Set<string>[] = []
   private steps = 0
@@ -922,13 +925,25 @@ export class Translator {
   private unchanging<T>(what: string, at: N, run: () => T): T {
     const written = this.writes.length
     const objects = objectsCreated
-    const held = this.cells.map(cell => cell.value)
-    const result = run()
+    const existing = new Set(this.cells)
+    const outer = this.assignedTo
+    const assigned = this.assignedTo = new Set()
+    let result: T
+    try {
+      result = run()
+    } finally {
+      this.assignedTo = outer
+      // Code around this that may be skipped as well sees the same assignments.
+      if (outer) for (const cell of assigned) outer.add(cell)
+    }
     for (let i = written; i < this.writes.length; i++) {
       if (this.writes[i]!.target.own!.born < objects) throw new Unsupported(`${what} changes an object in place, which is not modeled there; make the change in a statement of its own`, at)
     }
-    // The same goes for a variable that a function called there assigns to.
-    if (held.some((value, i) => this.cells[i]!.value !== value)) throw new Unsupported(`${what} assigns to a variable outside it, which is not modeled there; make the change in a statement of its own`, at)
+    // The same goes for a variable that a function called there assigns to. Every assignment counts, not
+    // only a value that ends up different: a callback JavaScript never reaches may put back what an earlier one changed.
+    for (const cell of assigned) {
+      if (existing.has(cell)) throw new Unsupported(`${what} assigns to a variable outside it, which is not modeled there; make the change in a statement of its own`, at)
+    }
     return result
   }
 
@@ -1473,6 +1488,7 @@ export class Translator {
       const old = cell.value
       const right = this.evalExpr(node.right, env)
       cell.value = base === undefined ? right : this.arithmetic(base, old, right, node)
+      this.assignedTo?.add(cell)
       return
     }
     if ((node.kind === K.PrefixUnaryExpression || node.kind === K.PostfixUnaryExpression) &&
@@ -1486,6 +1502,7 @@ export class Translator {
       const cell = this.assignable(node.operand, env)
       const one = scalar(ir.lit(1n), isNumber(cell.value))
       cell.value = this.arithmetic(node.operator === K.PlusPlusToken ? K.PlusToken : K.MinusToken, cell.value, one, node)
+      this.assignedTo?.add(cell)
       return
     }
     if (node.kind === K.CallExpression) {
@@ -1897,6 +1914,14 @@ export class Translator {
     return object.fields.get(name) ?? this.absent(name, node)
   }
 
+  /** Whether the type of an expression includes undefined, or says nothing at all. */
+  private allowsUndefined(node: N): boolean {
+    const allows = (type: Type): boolean =>
+      (type.flags & (TypeFlags.Undefined | TypeFlags.Any | TypeFlags.Unknown)) !== 0 || (type.isUnionType() && type.getTypes().some(allows))
+    const type = this.checker.getTypeAtLocation(node)
+    return !!type && allows(type)
+  }
+
   /** `object[index]`, for one object. */
   private element(object: Value, node: N, env: Env): Value {
     const index = node.argumentExpression
@@ -1912,15 +1937,23 @@ export class Translator {
     if (object.k !== "record") throw new Unsupported(`indexing ${describe(object)} is not supported`, node)
     const key = this.scalarOf(this.evalExpr(index, env), index, "str")
     if (key.t === "lit") return object.fields.get(key.value as string) ?? this.absent(key.value as string, node)
-    // The key is compared with every property name. A key that matches none
-    // would read `undefined`, which is not modeled, so that case must be
-    // proved impossible. The key's declared type is not trusted for this: a
-    // cast can make it claim anything.
+    // The key is compared with every property name, and a key that matches
+    // none reads undefined. Where the type of the read says it never is
+    // undefined, as for a table whose keys are all listed, the code around it
+    // does not expect that, so a miss must be proved impossible; the key's
+    // declared type is not trusted for that, since a cast can make it claim
+    // anything. Where the type allows undefined, the miss gives it, unless the
+    // key names something every object inherits, which is not modeled.
     const names = [...object.fields.keys()]
     const pick = (i: number): Value => {
       if (i === names.length) {
-        this.emit("missing", ir.FALSE, node)
-        return BOTTOM
+        if (!this.allowsUndefined(node)) {
+          this.emit("missing", ir.FALSE, node)
+          return BOTTOM
+        }
+        const inherited = Object.getOwnPropertyNames(Object.prototype).filter(name => !object.fields.has(name))
+        this.emit("inherited", ir.not(inherited.map(name => ir.eq(key, ir.lit(name))).reduce(ir.or, ir.FALSE)), node)
+        return this.absent(undefined, node)
       }
       return this.branch(ir.eq(key, ir.lit(names[i]!)), () => object.fields.get(names[i]!)!, () => pick(i + 1))
     }
@@ -2014,7 +2047,8 @@ export class Translator {
       this.assertBuiltinsIntact(node)
       return this.collectionMethod(receiver, method, args(), node)
     }
-    if (receiver.k === "record" && receiver.fields.has(method)) return this.call(receiver.fields.get(method)!, args(), node)
+    // A method the object does not have is undefined, and calling that throws once the arguments have run.
+    if (receiver.k === "record") return this.call(receiver.fields.get(method) ?? this.absent(method, node), args(), node)
     throw new Unsupported(`calling \`.${method}\` on ${describe(receiver)} is not supported`, node)
   }
 
@@ -2086,7 +2120,14 @@ export class Translator {
         }
         // A pattern can take the prototype out of a built-in under another name: `const { prototype } = Object`.
         const taken = node.kind === K.BindingElement ? node.propertyName ?? node.name : undefined
-        if ((taken?.kind === K.Identifier || taken?.kind === K.StringLiteral) && (taken.text === "prototype" || taken.text === "__proto__")) escapes = true
+        if ((taken?.kind === K.Identifier || taken?.kind === K.StringLiteral) && (taken.text === "prototype" || taken.text === "__proto__")) {
+          // `__proto__` of any object is a prototype. `prototype` is one when the pattern takes a built-in apart.
+          let declaration = node.parent
+          while (declaration.kind === K.ObjectBindingPattern || declaration.kind === K.ArrayBindingPattern || declaration.kind === K.BindingElement) declaration = declaration.parent
+          let source = declaration.initializer
+          while (source && (source.kind === K.ParenthesizedExpression || source.kind === K.AsExpression || source.kind === K.NonNullExpression || source.kind === K.SatisfiesExpression)) source = source.expression
+          if (taken.text === "__proto__" || (source?.kind === K.Identifier && this.isBuiltin(source))) escapes = true
+        }
         if (escapes || (target && target.kind !== K.Identifier && throughPrototype(target)) ||
           (writes && (node.arguments as N[]).slice(0, 1).some(throughPrototype))) {
           const at = locate(node)
@@ -2266,15 +2307,26 @@ export class Translator {
           .reduce(ir.or, ir.FALSE))
       }
       case "some":
-      case "every": {
-        // JavaScript stops at the first element that settles the answer; the model asks every element.
-        const results = this.unchanging(`a callback of \`.${method}\``, node, () => items.map((item, index) => this.truthy(invoke(first, [item, position(index)]), node)))
-        return scalar(method === "some" ? results.reduce(ir.or, ir.FALSE) : results.reduce(ir.and, ir.TRUE))
-      }
+      case "every":
       case "find": {
-        // As with `.some`, JavaScript stops asking at the first match. The result is the first element that passed.
-        const passes = this.unchanging("a callback of `.find`", node, () => items.map((item, index) => this.truthy(invoke(first, [item, position(index)]), node)))
-        return items.reduceRight<Value>((later, item, index) => this.branch(passes[index]!, () => item, () => later), VOID)
+        // JavaScript stops at the first element that settles the answer. Each callback is asked on the
+        // path where the ones before it did not settle it, so a throw in one that is never reached does
+        // not count; one that could not be reached at all is not asked. What the callbacks change cannot
+        // be followed this way, so they may change nothing.
+        const settles = method === "every" ? ir.not : (pass: Expr) => pass
+        const asked = this.unchanging(`a callback of \`.${method}\``, node, () => {
+          let reached: Expr = ir.TRUE
+          return items.map((item, index) => {
+            if (reached.t === "lit" && !reached.value) return { item, pass: method === "every" ? ir.TRUE : ir.FALSE }
+            const pass = this.under(reached, () => this.truthy(invoke(first, [item, position(index)]), node))
+            reached = ir.and(reached, ir.not(settles(pass)))
+            return { item, pass }
+          })
+        })
+        if (method === "some") return scalar(asked.map(({ pass }) => pass).reduce(ir.or, ir.FALSE))
+        if (method === "every") return scalar(asked.map(({ pass }) => pass).reduce(ir.and, ir.TRUE))
+        // The first element that passed.
+        return asked.reduceRight<Value>((later, { item, pass }) => this.branch(pass, () => item, () => later), VOID)
       }
       case "map":
         return this.fresh({ k: "array", items: items.map((item, index) => invoke(first, [item, position(index)])) })
@@ -2321,6 +2373,8 @@ export class Translator {
    */
   private sorted(items: Value[], compare: (a: Value, b: Value) => Value, node: N): Value[] {
     if (items.some(item => item.k === "void" || item.k === "choice" || item.k === "bottom")) throw new Unsupported("sorting a list that may hold undefined is not supported", node)
+    // Every pair is compared and every three are checked against each other.
+    if (items.length > MAX_SORTED) throw new Unsupported(`sorting more than ${MAX_SORTED} elements is not supported`, node)
     const refusal = () => new Unsupported("sorting is supported where the order of the elements is known here: each comparison has to come out as a known number", node)
     const signs = this.unchanging("a comparing function of `.sort`", node, () => items.map(a => items.map(b => {
       const result = compare(a, b)

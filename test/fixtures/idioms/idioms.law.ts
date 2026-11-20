@@ -1,5 +1,6 @@
 import { describe, domain, expect, law, type Integer } from "@bytewaveco/pudding"
 import {
+  allOrThrow, anyOrThrow, firstOrThrow, ownPrototype, priceOf,
   addIf, allocate, area, bothOr, byStart, countDown, countUntilNegative, describeNode, distinct, end, expand, firstNegative, firstProblem, half, headAndRest,
   isSet, knows, labelOr, last, lookup, middle, orElse, orTruthy, overlap, positives, roundTo, scale, second, secondUnsafe, setEither, setOf, smallest, stepOr,
   sumOfDays, sumOfPositives, sumOfRounds, tally, third, third3, throughNext, twice, without, type Step,
@@ -42,6 +43,15 @@ describe("values that may be undefined", () => {
 
   law("FALSE: there is always a second node", domain<{ a: bigint; linked: boolean }>(), ({ a, linked }) => {
     expect(secondUnsafe(linked ? { value: a, next: { value: a } } : { value: a })).toBe(a)
+  })
+
+  law("a key the object does not have reads as undefined", domain<{ key: "a" | "b" | "c"; a: bigint }>(), ({ key, a }) => {
+    expect(priceOf(key)).toBe(key === "a" ? 1n : 0n)
+    expect(ownPrototype(a)).toBe(a)
+  })
+
+  law("FALSE: any key at all reads as undefined", domain<string>(), key => {
+    expect(priceOf(key)).toBe(key === "a" ? 1n : 0n)
   })
 
   law("an object is never undefined, and counts as true", domain<{ a: bigint; links: 0 | 1 | 2 }>(), ({ a, links }) => {
@@ -167,6 +177,12 @@ describe("lists", () => {
     if (a > 0n && b <= 0n) expect(expand([a, b])).toEqual([a, a])
   })
 
+  law("find, some and every stop asking once the answer is settled", domain<bigint>(), a => {
+    expect(firstOrThrow(a)).toBe(a)
+    expect(anyOrThrow(a)).toBe(true)
+    expect(allOrThrow(a)).toBe(false)
+  })
+
   law("at and slice count from either end", domain<[bigint, bigint, bigint]>(), ([a, b, c]) => {
     expect(last([a, b, c])).toBe(c)
     expect(last([])).toBe(undefined)
@@ -231,6 +247,12 @@ describe("Map and Set", () => {
   law("CHECKED: Sets are compared by what they hold when a law is executed", domain<{ a: 1n | 2n; b: 1n | 2n }>(), ({ a, b }) => {
     expect(setOf(a, b)).toEqual(setOf(b, a))
     expect(setOf(a, b)).not.toEqual(new Set([3n]))
+  })
+
+  law("CHECKED: Sets and Maps of objects are compared by what the objects hold", domain<{ a: 1n | 2n; b: 1n | 2n }>(), ({ a, b }) => {
+    expect(new Set([{ v: a }, { v: b }])).toEqual(new Set([{ v: b }, { v: a }]))
+    expect(new Map([[{ k: a }, [b]]])).toEqual(new Map([[{ k: a }, [b]]]))
+    expect(new Set<{ v: bigint }>([{ v: a }, { v: a }])).not.toEqual(new Set([{ v: a }, { v: 3n }]))
   })
 
   law("FALSE when executed: two Sets are equal whatever they hold", domain<{ a: 1n | 2n; b: 1n | 2n }>(), ({ a, b }) => {
