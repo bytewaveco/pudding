@@ -487,7 +487,7 @@ export async function run(options: RunOptions = {}): Promise<Report> {
         unproved: law.problem !== undefined,
         mentioned: law.mentioned,
         instances: law.instances.map(instance => ({
-          binders: instance.binders, arg: instance.arg, obligations: instance.obligations.map(o => ({ guard: o.guard, claim: o.claim, inexact: o.kind === "overflow" || o.kind === "nan" || o.kind === "round" })),
+          binders: instance.binders, arg: instance.arg, obligations: instance.obligations.map(o => ({ guard: o.guard, claim: o.claim, inexact: o.kind === "overflow" || o.kind === "nan" || o.kind === "round" || o.kind === "inherited" })),
         })),
       })),
     })),
@@ -580,9 +580,11 @@ export async function run(options: RunOptions = {}): Promise<Report> {
           ...(sides ? { detail: `actual:   ${showValue(sides.actual, found, sides.num)}\nexpected: ${sides.negated ? "anything but " : ""}${showValue(sides.expected, found, sides.num)}` } : {}),
         })
       } else {
-        entry.findings.push(obligation.kind === "overflow" || obligation.kind === "nan" || obligation.kind === "round" ? {
+        // Outside what the model describes, which is not the same as throwing: the code may well return something.
+        entry.findings.push(obligation.kind === "overflow" || obligation.kind === "nan" || obligation.kind === "round" || obligation.kind === "inherited" ? {
           kind: "inexact", ...at, inputs,
           message: obligation.kind === "nan" ? "this divides a number by zero, which does not give a whole number"
+            : obligation.kind === "inherited" ? "this reads a property that every object inherits, which is not modeled"
             : obligation.kind === "round" ? "this number is too large for Math.round to round its quotient exactly (2^52 or beyond)"
             : "this result is too large for a number to hold exactly (beyond 2^53 - 1)",
         } : {
@@ -590,7 +592,6 @@ export async function run(options: RunOptions = {}): Promise<Report> {
           message: obligation.kind === "nothrow" ? "this divides by zero"
             : obligation.kind === "falloff" ? "this function reaches its end without returning a value"
             : obligation.kind === "missing" ? "this reads a property the object does not have"
-            : obligation.kind === "inherited" ? "this reads a property that every object inherits, which is not modeled"
             : obligation.kind === "undefined" ? "this reads a property of undefined, or calls it" : "this throw is reached",
         })
       }

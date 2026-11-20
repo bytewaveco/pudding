@@ -296,6 +296,16 @@ describe("constructs that once produced a wrong proof", () => {
     }
   })
 
+  test("without strictNullChecks a domain is not trusted to list undefined, so nothing over it is proved", async () => {
+    const report = await run({ cwd: join(fixtures, "loose"), cache: false, crossCheck: false })
+    assert.deepEqual(report.errors, [])
+    for (const entry of report.laws) {
+      assert.equal(entry.status, "failed", entry.name)
+      assert.match(entry.findings[0]?.message ?? "", /without `strictNullChecks`/)
+    }
+    assert.equal(report.laws.length, 2)
+  })
+
   test("an input type that refers to itself is refused without stopping the run", async () => {
     const report = await run({ cwd: join(fixtures, "recursive"), cache: false })
     assert.deepEqual(report.errors, [])
@@ -523,7 +533,10 @@ describe("everyday idioms: undefined, defaults, rounding, lists, Maps and runnin
         assert.equal(entry.status, crossCheck || expected === "proved" ? expected : "failed", `${entry.name}: ${JSON.stringify(entry.findings)}`)
         // A false law has to be refuted by the model, not just refused by it, unless its name says it is only caught when executed.
         const own = entry.name.split(" > ").at(-1)!
-        if (!crossCheck && own.startsWith("FALSE:")) assert.ok(entry.findings.length > 0 && entry.findings.every(f => f.kind !== "unsupported"), `${entry.name}: ${JSON.stringify(entry.findings)}`)
+        // A refutation names an input: a counterexample, a throw that is reached, or a number or lookup the model does not cover.
+        if (!crossCheck && own.startsWith("FALSE:")) {
+          assert.ok(entry.findings.length > 0 && entry.findings.every(f => f.kind === "counterexample" || f.kind === "throws" || f.kind === "inexact"), `${entry.name}: ${JSON.stringify(entry.findings)}`)
+        }
       }
       assert.deepEqual(report.laws.flatMap(entry => entry.findings).filter(f => f.kind === "mismatch"), [])
     })
@@ -542,6 +555,8 @@ describe("everyday idioms: undefined, defaults, rounding, lists, Maps and runnin
     assert.match(finding("values that may be undefined > FALSE: what follows a ?. never throws")?.message ?? "", /reads a property of undefined/)
     assert.deepEqual(finding("rounding > FALSE: a half rounds away from zero")?.inputs, { n: "-1" })
     assert.equal(finding("rounding > FALSE: any whole number rounds exactly")?.kind, "inexact")
+    assert.equal(finding("lists > FALSE: a callback that throws gives an answer")?.kind, "throws")
+    assert.match(JSON.stringify(law(report, "values that may be undefined > FALSE: any key at all reads as undefined").findings), /every object inherits/)
   })
 })
 

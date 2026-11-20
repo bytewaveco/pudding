@@ -39,7 +39,11 @@ export function secondUnsafe(node: Node): bigint {
   return node.next!.value
 }
 
-/** A key the object does not have reads as undefined, whether or not the key is known where it is used. */
+/**
+ * A key that neither the object nor `Object.prototype` has reads as undefined,
+ * whether or not the key is known where it is used. A key such as `"toString"`
+ * finds what every object inherits instead, so no fallback applies.
+ */
 export function priceOf(key: string): bigint {
   return ({ a: 1n } as Record<string, bigint | undefined>)[key] ?? 0n
 }
@@ -168,6 +172,18 @@ export function byStart(entries: { id: string; startAt: number }[]): string[] {
 
 export function countDown(length: number): number[] {
   return Array.from({ length }, (_, index) => length - index)
+}
+
+/** An explicit `undefined` in place of the function copies the list, as leaving it out does. */
+export function copyOf(list: bigint[]): bigint[] {
+  return Array.from(list, undefined as never)
+}
+
+/** The only callback throws, so the call never gives an answer. */
+export function someThrows(a: bigint): boolean {
+  return [a].some(() => {
+    throw new Error("asked")
+  })
 }
 
 /** Sorts the caller's list in place and returns the smallest. */

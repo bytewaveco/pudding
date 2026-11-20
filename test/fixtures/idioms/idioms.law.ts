@@ -1,6 +1,6 @@
 import { describe, domain, expect, law, type Integer } from "@bytewaveco/pudding"
 import {
-  allOrThrow, anyOrThrow, firstOrThrow, ownPrototype, priceOf,
+  allOrThrow, anyOrThrow, copyOf, firstOrThrow, ownPrototype, priceOf, someThrows,
   addIf, allocate, area, bothOr, byStart, countDown, countUntilNegative, describeNode, distinct, end, expand, firstNegative, firstProblem, half, headAndRest,
   isSet, knows, labelOr, last, lookup, middle, orElse, orTruthy, overlap, positives, roundTo, scale, second, secondUnsafe, setEither, setOf, smallest, stepOr,
   sumOfDays, sumOfPositives, sumOfRounds, tally, third, third3, throughNext, twice, without, type Step,
@@ -211,6 +211,11 @@ describe("lists", () => {
   law("Array.from builds a list of a known length", () => {
     expect(countDown(3)).toEqual([3, 2, 1])
     expect(countDown(0)).toEqual([])
+    expect(copyOf([1n, 2n])).toEqual([1n, 2n])
+  })
+
+  law("FALSE: a callback that throws gives an answer", domain<bigint>(), a => {
+    expect(someThrows(a)).toBe(false)
   })
 })
 

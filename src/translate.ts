@@ -230,6 +230,7 @@ const NUMBER_HELP = "`number` covers fractions, NaN and infinities, which are no
 const MAX_ALTERNATIVES = 64
 const MAX_TYPE_DEPTH = 24
 const MAX_SORTED = 64
+const MAX_SHAPES = 10_000
 /** How many elements of one `.filter` or `.flatMap` may depend on a condition; the lists there could be double with each. */
 const MAX_UNDECIDED = 8
 const MODULE_DECLARATIONS = new Set<number>([
@@ -288,6 +289,8 @@ export class Translator {
   private pc: Expr[] = []
   /** Every reassignable variable that is live, so their values can be saved and merged around branches. */
   private cells: Cell[] = []
+  /** How many parts of the input type being read have been looked at. */
+  private shapes = 0
   /** Where in `cells` the variables of the function being evaluated start; those before it belong to its callers. */
   private frame = 0
   /** Every variable assigned to since code that JavaScript may skip started running, while there is such code. */
@@ -481,6 +484,7 @@ export class Translator {
         if (!typeNode) return invalid("domain<T>() needs a type argument", args[1])
         const type = this.checker.getTypeFromTypeNode(typeNode)
         if (!type) return invalid("the domain type could not be resolved", typeNode)
+        this.shapes = 0
         alternatives = this.expand(this.shapeOf(type, typeNode), typeNode)
       }
       for (const alternative of alternatives) {
@@ -488,6 +492,12 @@ export class Translator {
         this.instance = instance
         if (hasDomain) instance.arg = this.instantiate(alternative, instance)
         law.instances.push(instance)
+      }
+      // Without strictNullChecks the compiler drops `undefined` from every type, so a domain that names
+      // it would be covered without it. The instances are kept, so the law can still be executed.
+      const options = this.program.getCompilerOptions()
+      if (hasDomain && !(options.strictNullChecks ?? options.strict ?? false)) {
+        throw new Unsupported("inputs are listed from their types, and without `strictNullChecks` a type does not say whether it holds undefined; turn it on in the tsconfig the laws are read with", args[1])
       }
       const waiting = law.instances
       law.instances = []
@@ -596,6 +606,7 @@ export class Translator {
   private shapeOf(type: Type, at: Node, depth = 0): Shape {
     // A type that refers to itself, as a list node does, has no end to list.
     if (depth > MAX_TYPE_DEPTH) throw new Unsupported("this input type is nested too deeply to list its values, or refers to itself", at)
+    if (++this.shapes > MAX_SHAPES) throw new Unsupported(`this input type has more than ${MAX_SHAPES} parts, which is too many to list its values`, at)
     const flags = type.flags
     const name = () => this.checker.typeToString(type)
     if (flags & TypeFlags.Boolean) return { k: "scalar", ty: "bool", values: [true, false] }
@@ -684,7 +695,11 @@ export class Translator {
       case "scalar":
       case "void":
       case "absent": return [shape]
-      case "union": return shape.alts.flatMap(alt => this.expand(alt, at))
+      case "union": {
+        const alternatives = shape.alts.flatMap(alt => this.expand(alt, at))
+        if (alternatives.length > MAX_ALTERNATIVES) throw new Unsupported(`the input type has more than ${MAX_ALTERNATIVES} union alternatives`, at)
+        return alternatives
+      }
       case "tuple": return product(shape.items.map(item => this.expand(item, at))).map(items => ({ k: "tuple", items }))
       case "record": return product(shape.fields.map(([, field]) => this.expand(field, at)))
         .map(row => ({ k: "record", fields: row.map((field, i) => [shape.fields[i]![0], field] as [string, Shape]).filter(([, field]) => field.k !== "absent") }))
@@ -2066,7 +2081,7 @@ export class Translator {
       const prototype = (node: N): boolean =>
         (node.kind === K.PropertyAccessExpression && (node.name.text === "__proto__" ||
           (node.name.text === "prototype" && node.expression.kind === K.Identifier && this.isBuiltin(node.expression)))) ||
-        (node.kind === K.CallExpression && /^(Object|Reflect)\.getPrototypeOf$/.test(node.expression.getText(node.getSourceFile())))
+        (node.kind === K.CallExpression && /^(Object|Reflect)\.getPrototypeOf$/.test(node.expression.getText(node.getSourceFile())) && this.isBuiltin(node.expression.expression))
       const throughPrototype = (node: N): boolean => {
         for (;;) {
           if (prototype(node)) return true
@@ -2318,8 +2333,10 @@ export class Translator {
           let reached: Expr = ir.TRUE
           return items.map((item, index) => {
             if (reached.t === "lit" && !reached.value) return { item, pass: method === "every" ? ir.TRUE : ir.FALSE }
-            const pass = this.under(reached, () => this.truthy(invoke(first, [item, position(index)]), node))
-            reached = ir.and(reached, ir.not(settles(pass)))
+            const answer = this.under(reached, () => invoke(first, [item, position(index)]))
+            // A callback that throws wherever it is reached ends everything there: nothing later is asked.
+            const pass = answer.k === "bottom" ? (method === "every" ? ir.TRUE : ir.FALSE) : this.truthy(answer, node)
+            reached = answer.k === "bottom" ? ir.FALSE : ir.and(reached, ir.not(settles(pass)))
             return { item, pass }
           })
         })
@@ -2334,7 +2351,13 @@ export class Translator {
         // Every element is asked, in order. Each one that may or may not pass doubles the lists there
         // could be, so only a few may be undecided.
         // What is kept is the element as it was read, before its callback ran: a callback may change the list.
-        const asked = items.map((item, index) => ({ item, pass: this.truthy(invoke(first, [item, position(index)]), node) }))
+        const asked: { item: Value; pass: Expr }[] = []
+        for (const [index, item] of items.entries()) {
+          const answer = invoke(first, [item, position(index)])
+          // A callback that always throws ends the call there.
+          if (answer.k === "bottom") return BOTTOM
+          asked.push({ item, pass: this.truthy(answer, node) })
+        }
         if (asked.filter(({ pass }) => pass.t !== "lit").length > MAX_UNDECIDED) throw new Unsupported(`\`.filter\` over more than ${MAX_UNDECIDED} elements that may or may not pass is not supported`, node)
         const keep = (index: number, kept: Value[]): Value => (index === asked.length ? this.fresh({ k: "array", items: kept })
           : this.branch(asked[index]!.pass, () => keep(index + 1, [...kept, asked[index]!.item]), () => keep(index + 1, kept)))
@@ -2398,7 +2421,9 @@ export class Translator {
   /** `Array.from` of a list, a Map or a Set, or of `{ length }` with a function that makes each element. */
   private arrayFrom(args: Value[], node: N): Value {
     this.assertBuiltinsIntact(node)
-    const [source, make] = args
+    const [source, given] = args
+    // An explicit `undefined` for the function is the same as none.
+    const make = given?.k === "void" ? undefined : given
     if (!source || args.length > 2) throw new Unsupported("`Array.from` is supported with a list and an optional function", node)
     if (make && make.k !== "closure") throw new Unsupported(`\`Array.from\` needs a function, but this is ${describe(make)}`, node)
     if (make && parametersOf(make.node).length > 2) throw new Unsupported("a function given to `Array.from` takes an element and its position", node)
