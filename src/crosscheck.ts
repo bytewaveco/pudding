@@ -25,14 +25,14 @@ interface Instance {
 
 export interface Job {
   map: RuntimeMap
-  /** The most inputs to try per law instance. */
+  /** Default max inputs to try per law instance. */
   budget: number
   files: {
     file: string
     /** How many laws the translator saw; a different count at run time means the two cannot be paired up. */
     registered: number
     /** `mentioned` holds the constants of a law that could not be translated, so sampling can still aim at them. */
-    laws: { index: number; unproved: boolean; instances: Instance[]; mentioned: Expr[] }[]
+    laws: { index: number; unproved: boolean; budget?: number; instances: Instance[]; mentioned: Expr[] }[]
   }[]
 }
 
@@ -65,14 +65,24 @@ interface Registered {
 
 const pathOf = (url: string) => fileURLToPath(url.split("?")[0]!)
 
-function buildArgument(shape: ArgShape, env: Map<string, Scalar>, numbers: Set<string>): unknown {
-  switch (shape.k) {
-    case "binder": return numbers.has(shape.name) ? Number(env.get(shape.name)) : env.get(shape.name)
-    case "const": return shape.num ? Number(shape.value) : shape.value
-    case "undefined": return undefined
-    case "array": return shape.items.map(item => buildArgument(item, env, numbers))
-    case "record": return Object.fromEntries(shape.fields.map(([key, field]) => [key, buildArgument(field, env, numbers)]))
+function compileArgument(shape: ArgShape, numbers: Set<string>): (env: Map<string, Scalar>) => unknown {
+  const emit = (s: ArgShape): string => {
+    switch (s.k) {
+      case "binder": return numbers.has(s.name) ? `Number(env.get(${JSON.stringify(s.name)}))` : `env.get(${JSON.stringify(s.name)})`
+      case "const": return s.num ? String(Number(s.value)) : typeof s.value === "bigint" ? `${s.value}n` : JSON.stringify(s.value)
+      case "undefined": return "undefined"
+      case "null": return "null"
+      case "array": return `[${s.items.map(emit).join(",")}]`
+      case "record": return `({${s.fields.map(([key, field]) => `${key === "__proto__" ? '["__proto__"]' : JSON.stringify(key)}:${emit(field)}`).join(",")}})`
+    }
   }
+  return new Function("env", `return ${emit(shape)}`) as (env: Map<string, Scalar>) => unknown
+}
+
+interface CompiledObligation {
+  guard: (env: ReadonlyMap<string, Scalar>) => Scalar
+  claim: (env: ReadonlyMap<string, Scalar>) => Scalar
+  inexact: boolean
 }
 
 /**
@@ -81,11 +91,11 @@ function buildArgument(shape: ArgShape, env: Map<string, Scalar>, numbers: Set<s
  * range of exact whole numbers; the real code then computes something the
  * model has no counterpart for, and that is already reported on its own.
  */
-function modelHolds(instance: Instance, env: Map<string, Scalar>): boolean | "outside" {
+function modelHolds(obligations: readonly CompiledObligation[], env: Map<string, Scalar>): boolean | "outside" {
   try {
     let holds = true
-    for (const obligation of instance.obligations) {
-      if (ir.evaluate(obligation.guard, env) !== true || ir.evaluate(obligation.claim, env) === true) continue
+    for (const obligation of obligations) {
+      if (obligation.guard(env) !== true || obligation.claim(env) === true) continue
       if (obligation.inexact) return "outside"
       holds = false
     }
@@ -120,7 +130,7 @@ async function register(file: string): Promise<Registered[] | { message: string;
     // Node. An error raised while the project's own code was running has a
     // frame in a project file, and means the module really does not load.
     const stack = error instanceof Error ? error.stack ?? "" : ""
-    const throws = !(error instanceof Error) || /\n\s+at [^\n]*file:\/\/(?![^\n]*\/node_modules\/)/.test(stack)
+    const throws = !(error instanceof Error) || /\n\s+at [^\n]*file:\/\/(?![^\n]*[\\/]node_modules[\\/])/.test(stack)
     const text = error instanceof Error ? `${error.name}: ${error.message.split("\n")[0]!}` : String(error)
     return { message: text, throws }
   } finally {
@@ -170,14 +180,16 @@ async function execute(job: Job, report: (outcome: FileOutcome) => void) {
         const result: LawOutcome = { index: law.index, executed: 0, exhaustive: true }
         for (const instance of law.instances) {
           const numbers = new Set(instance.binders.filter(b => b.num).map(b => b.name))
-          const space = assignments(instance.binders, valuePool([...instance.obligations.flatMap(o => [o.guard, o.claim]), ...law.mentioned]), job.budget)
+          const buildArg = instance.arg ? compileArgument(instance.arg, numbers) : undefined
+          const compiled = law.unproved ? [] : instance.obligations.map(o => ({ guard: ir.compile(o.guard), claim: ir.compile(o.claim), inexact: o.inexact }))
+          const space = assignments(instance.binders, valuePool([...instance.obligations.flatMap(o => [o.guard, o.claim]), ...law.mentioned]), law.budget ?? job.budget)
           result.exhaustive &&= space.exhaustive
           space.each(env => {
-            const expected = law.unproved ? true : modelHolds(instance, env)
+            const expected = law.unproved ? true : modelHolds(compiled, env)
             if (expected === "outside") return false
             if (expected === false) result.modelFails ??= showInputs(instance.binders, env)
             result.executed++
-            const actual = runtimeHolds(callback, instance.arg ? buildArgument(instance.arg, env, numbers) : undefined)
+            const actual = runtimeHolds(callback, buildArg ? buildArg(env) : undefined)
             if (actual === expected) return false
             result.failure = { kind: law.unproved ? "counterexample" : "mismatch", inputs: showInputs(instance.binders, env), actual, expected }
             return true
