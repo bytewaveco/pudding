@@ -139,12 +139,14 @@ peerDependencyRules:
 
 Lean arrives as an optional dependency: a package of about 110 MB holding the
 part of Lean that Pudding uses. Where it did not arrive, because optional
-dependencies are switched off or the package manager skipped it, `pudding`
-offers to download Lean the first time, and `npx pudding install-lean` does
-the same without asking. That fetches the official Lean release, checks it
-against a recorded SHA-256, and keeps the same part of it in a cache shared by
-all your projects. To use a Lean you already have, set `PUDDING_LEAN` to the
-binary; a Lean installed with elan is found on its own.
+dependencies are switched off (for example `npm install --omit=optional` when
+sharing one cached Lean across multiple worktrees or CI jobs) or the package
+manager skipped it, `pudding` offers to download Lean the first time, and
+`npx pudding install-lean` does the same without asking. That fetches the
+official Lean release, checks it against a recorded SHA-256, trims and strips
+it, and keeps the same part of it in a cache shared by all your projects. To
+use a Lean you already have, set `PUDDING_LEAN` to the binary; a Lean
+installed with elan is found on its own.
 
 </details>
 
@@ -195,15 +197,17 @@ theorem c0 (x0 : Int) : (decide ((0 : Int) ≤ (if (decide (x0 < (0 : Int))) the
 ```
 
 You do not write Lean or read it. The theorems are generated, and
-`pudding --emit laws.lean` writes them out when you want to look.
+`pudding --emit laws.lean` writes them out when you want to look, annotated
+with each law's name, location and input names.
 
-Laws over finite inputs, such as booleans, unions and bounded integers, are
-decided by evaluating every case in the kernel, and never need help. Laws over
-unbounded inputs, such as `bigint` and `string`, go to Lean's `grind`, which
-handles linear arithmetic, case splits, and division and remainder by
-constants. A theorem counts only when Lean reports no error for it and
-confirms that it rests on nothing but Lean's standard axioms, so an unfinished
-proof (`sorry`) is rejected.
+Laws over small finite inputs, such as booleans, unions and small bounded
+integers, are decided by evaluating every case in the kernel, and never need
+help. Large consecutive linear `Integer<Min, Max>` ranges and unbounded inputs
+(`bigint`, `string`) go to Lean's `grind`, which handles linear arithmetic,
+case splits, and division and remainder by constants, with repeated
+subexpressions shared via `let`-bindings. A theorem counts only when Lean
+reports no error for it and confirms that it rests on nothing but Lean's
+standard axioms, so an unfinished proof (`sorry`) is rejected.
 
 ### Supplying a proof
 
@@ -243,8 +247,7 @@ describe(name, () => { ... })               // also describe.skip, describe.only
 | `Integer<Min, Max>` | every whole number from `Min` to `Max` |
 | an object type | every plain object with exactly its properties, in every combination of their values |
 | a tuple | every combination of its elements |
-| a union of object types | every alternative |
-| any of these, or `undefined` | every value, and `undefined` |
+| a union of types (objects, mixed scalars, `null`, `undefined`) | every alternative |
 | an optional property | the property with every value, and the object without it |
 
 A plain `number` cannot be an input, because it also covers fractions, NaN and
@@ -257,8 +260,11 @@ only `law()` and `describe()` calls and declarations at its top level, so that
 every law that would be registered is also read.
 
 Inside a law you can declare values, loop, guard with `if`, leave early with
-`return`, call helpers that assert, and assert with `expect(a).toEqual(b)`,
-`expect(a).toBe(b)` and their `.not` forms.
+`return`, call helpers that assert, and assert with `expect(a)` matchers:
+`toEqual`, `toBe`, `toBeGreaterThan`, `toBeGreaterThanOrEqual`, `toBeLessThan`,
+`toBeLessThanOrEqual`, `toBeUndefined`, `toBeDefined`, `toBeNull`,
+`toBeTruthy`, `toBeFalsy`, `toHaveLength`, `toContain`, `toThrow`, and their
+`.not` forms.
 
 ## What it can prove
 
@@ -268,11 +274,18 @@ are made of. The [examples](examples) cover money, orders, stock, ballots, job
 queues and leave requests.
 
 - **Proved:** booleans, bigints, strings and whole numbers; objects, arrays
-  and tuples; values that may be `undefined`, with `??`, `?.` and defaults;
-  `if`, `switch` and loops of known length; local changes in place;
-  functions in any module, and callbacks that keep a running total; `const`
-  tables; `Map` and `Set`; `Math` rounding; `.map`, `.filter`, `.find`,
-  `.reduce`, `.some`, `.every`, `.includes` and `.sort`.
+  and tuples; `null` and `undefined`, with `??`, `?.`, defaults, `typeof` and
+  `in`; `if`, `switch` and loops of known length; local changes in place;
+  functions in any module, with rest/spread arguments and callbacks that keep
+  a running total; `const` tables; `Object.keys`/`values`/`entries`/`hasOwn`/
+  `fromEntries`; `Map` and `Set` (including `.delete`, `.clear`, `.keys`,
+  `.values`, `.entries`); `Math` rounding and `Number`/`Boolean`/`Array.isArray`
+  helpers; array methods (`.map`, `.filter`, `.flatMap`, `.flat`, `.find`,
+  `.findIndex`, `.findLast`, `.findLastIndex`, `.reduce`, `.reduceRight`,
+  `.forEach`, `.some`, `.every`, `.includes`, `.indexOf`, `.lastIndexOf`,
+  `.concat`, `.join`, `.at`, `.slice`, `.reverse`, `.toReversed`, `.push`,
+  `.pop`, `.shift`, `.unshift`, `.sort`, `.toSorted`); and string methods on
+  known strings and static affixes.
 - **Refused:** fractions, loops whose length depends on an input, recursion,
   classes, async code, regular expressions and library calls.
 
@@ -294,12 +307,12 @@ $ npx pudding --reporter verbose
       with x = 0n, lo = 0n, hi = -1n
       actual:   0n
       expected: -1n
-   ~ cents survive a round trip  executed on sampled inputs, not proved
-      note: not proved: calling `.split` on a string is not supported (money.ts:12:28)
+   ~ dollars survive a round trip  executed on sampled inputs, not proved
+      note: not proved: calling `.split` on a string whose value is not known here is not supported (money.ts:7:17)
 
   Laws    1 proved, 1 sampled only, 1 failed
   Proofs  3 theorems, 0 finite cases, Lean 4.36.0, TypeScript 7.0.2
-  Time    546 ms
+  Time    353 ms (ts 48 ms, prove 266 ms, cross-check 33 ms)
 ```
 
 | State | Meaning |
@@ -312,8 +325,8 @@ $ npx pudding --reporter verbose
 
 A failed law says why:
 
-- **A counterexample.** The inputs are named as the law names them, with both sides of the failed equality.
-- **A throw that can be reached**, including division by zero, a lookup with a key the table does not have, reading a property of `undefined`, and a function that ends without returning. A law holds only if the code it calls cannot throw for the inputs it covers.
+- **A counterexample.** The inputs are named as the law names them, shrunk toward minimal values, with both sides of the failed equality.
+- **A throw that can be reached**, including division by zero, a lookup with a key the table does not have, reading a property of `null` or `undefined`, and a function that ends without returning. A law holds only if the code it calls cannot throw for the inputs it covers (unless asserted with `expect(() => ...).toThrow()`).
 - **A law file that throws when it is loaded.** Nothing in it holds at run time, whatever was proved.
 - **A number that stops being exact.** A result beyond 2^53 − 1, a remainder by zero, or a `Math.round` of a quotient whose dividend reaches 2^52 either way.
 - **A lookup that could find something every object inherits.** `table[key]` with a key that may be `"toString"` reads a function, which is not modeled.
@@ -371,11 +384,11 @@ export default defineConfig({
   <img alt="Your law file and your code go into Pudding. The TypeScript 7 compiler reads them, each law is translated into obligations, and Lean 4 proves them, while each law is also executed against the real code. When Lean accepts, the law holds for every input. When Lean rejects, Pudding reports a counterexample." src="assets/how-it-works.svg" width="760">
 </p>
 
-1. **Read.** The TypeScript 7 compiler API type-checks the law files and resolves every name and type. Type errors stop the run.
+1. **Read.** The TypeScript 7 compiler API type-checks the law files and resolves every name and type. Type errors stop the run. In `watch` mode Pudding tracks each law file's transitive imports and re-checks only the law files affected by an edit.
 2. **Translate.** Each law is evaluated symbolically. Functions are inlined, objects, arrays and loops are resolved, and what remains is a set of obligations over booleans, integers and strings: one per `expect`, plus one per reachable `throw`, division, or number that could stop being exact.
-3. **Prove.** Obligations over finite inputs become one Lean theorem each, decided by evaluating every case in the kernel. Obligations with unbounded inputs are handed to `grind`, with a slower fallback under the full library before a rejection is reported.
-4. **Explain.** For a rejected obligation Pudding searches for a counterexample by evaluating the model in JavaScript.
-5. **Cross-check.** In a worker thread, each law is executed against the real code and compared with the model.
+3. **Prove.** Obligations over small finite inputs become one Lean theorem each, decided by evaluating every case in the kernel. Large consecutive linear integer ranges and unbounded inputs are handed to `grind` (with shared subexpressions bound via `let` and cached Lean header snapshots speeding up startup), with a slower fallback before a rejection is reported.
+4. **Explain.** For a rejected obligation Pudding searches for a counterexample by evaluating the compiled model in JavaScript and shrinks unbounded counterexamples toward minimal values.
+5. **Cross-check.** In a worker thread, each law is executed against the real code and compared with the compiled model.
 
 Proved theorems are remembered by their full text and the Lean version, so
 Lean is only asked about what changed. They are remembered once for the
