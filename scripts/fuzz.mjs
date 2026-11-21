@@ -526,6 +526,39 @@ class Generator {
         return [`if (${this.expr("bool", scope, 2)}) {`, `  for (const ${target.name} of [call((): ${TS[target.type]} => ${target.name})]) { }`, "}"]
       })
     }
+    // Escaping closure over a reassigned variable (counter factory, shared cells, conditional factory).
+    add(1.1, () => {
+      const [mk, fn, res] = [`mk${this.counter++}`, `cf${this.counter++}`, `v${this.counter++}`]
+      const init = this.expr("big", scope, 1)
+      const step = this.expr("big", scope, 1)
+      const flag = this.expr("bool", scope, 1)
+      const lines = r.chance(0.5)
+        ? [
+            `const ${mk} = (start: bigint): (() => bigint) => { let n = start; if (${flag}) { n += ${step}; return () => { n += 1n; return n } } return () => { n -= 1n; return n } }`,
+            `const ${fn} = ${mk}(${init})`,
+            `const ${res}: bigint = ${fn}() + (${flag} ? ${fn}() : 0n) + ${fn}()`,
+          ]
+        : [
+            `const ${mk} = (start: bigint): [() => bigint, () => bigint] => { let n = start; return [() => { n += ${step}; return n }, () => n] }`,
+            `const [${fn}a, ${fn}b] = ${mk}(${init})`,
+            `if (${flag}) ${fn}a()`,
+            `const ${res}: bigint = ${fn}a() + ${fn}b()`,
+          ]
+      scope.names.set(res, { kind: "var", type: "big", mutable: false })
+      return lines
+    })
+    // Closures capturing a `for (let i = ...)` loop variable, invoked after the loop.
+    add(0.9, () => {
+      const [fns, iVar, res] = [`fs${this.counter++}`, `i${this.counter++}`, `v${this.counter++}`]
+      const limit = 2 + r.int(3)
+      const lines = [
+        `const ${fns}: (() => number)[] = []`,
+        `for (let ${iVar} = 0; ${iVar} < ${limit}; ${iVar}++) { ${fns}.push(() => ${iVar}) }`,
+        `const ${res}: number = ${fns}.reduce((s, f) => s + f(), 0)`,
+      ]
+      scope.names.set(res, { kind: "var", type: "num", mutable: false })
+      return lines
+    })
     // A running value changed inside a switch that falls through, or by a loop over a list
     // that depends on a condition, itself inside an `if` that nothing leaves early.
     add(1.5, () => {

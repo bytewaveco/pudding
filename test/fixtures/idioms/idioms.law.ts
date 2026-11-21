@@ -287,7 +287,7 @@ describe("Map and Set", () => {
     expect(setOf(a, b)).toEqual(new Set([1n, 2n]))
   })
 
-  law("SAMPLED: a callback that uses the variable of a for loop around it", domain<[bigint, bigint]>(), ([a, b]) => {
+  law("a callback that uses the variable of a for loop around it", domain<[bigint, bigint]>(), ([a, b]) => {
     expect(sumOfRounds([a, b])).toBe(a + b)
   })
 
@@ -335,7 +335,7 @@ describe("callbacks with a running total", () => {
     expect(countUntilNegative(a, b)).toBe(a < 0n ? 1n : 2n)
   })
 
-  law("SAMPLED: a closure that outlives the variable it updates", domain<bigint>(), start => {
+  law("a closure that outlives the variable it updates", domain<bigint>(), start => {
     expect(twice(start)).toBe(start + 2n)
   })
 

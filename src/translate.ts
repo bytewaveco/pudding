@@ -216,6 +216,7 @@ interface Saved {
   written: number
   frozen: number
   objects: number
+  closures: number
 }
 
 /** Where control goes when a statement list ends, breaks out of, or continues a loop. */
@@ -367,6 +368,8 @@ export class Translator {
   private readonly activeIterators = new Set<Stored>()
   /** Nesting depth inside `.toThrow()` callback evaluation, where throw operands must be evaluated for side effects. */
   private inThrowCheck = 0
+  /** Count of closures created in the current law instance, used to keep escaping mutable cells live. */
+  private closuresCreated = 0
   private readonly facts = new Map<Node, { assigned: Set<string>; mentioned: Set<string>; returnsValue: boolean; usesVar: Node | undefined }>()
   private instance: LawInstance | undefined
 
@@ -575,6 +578,7 @@ export class Translator {
         bindingLog.length = 0
         this.writes = []
         this.freezes = []
+        this.closuresCreated = 0
         this.epoch = ++epochs
         this.steps = 0
         const facts = this.factsOf(callback)
@@ -871,7 +875,7 @@ export class Translator {
         }
         if (fn.k !== "closure") throw new Unsupported("toThrow expects a function", node)
         if (!this.instance) throw new Unsupported("toThrow is only supported inside a law", node)
-        const THROWING = new Set<ObligationKind>(["unreachable", "nothrow", "undefined", "null"])
+        const THROWING = new Set<ObligationKind>(["unreachable", "nothrow", "undefined", "null", "tdz"])
         const start = this.instance.obligations.length
         this.inThrowCheck++
         try {
@@ -1019,7 +1023,12 @@ export class Translator {
   }
 
   private save(): Saved {
-    return { values: this.cells.map(cell => cell.value), logged: bindingLog.length, scopes: scopesCreated, written: this.writes.length, frozen: this.freezes.length, objects: objectsCreated }
+    return { values: this.cells.map(cell => cell.value), logged: bindingLog.length, scopes: scopesCreated, written: this.writes.length, frozen: this.freezes.length, objects: objectsCreated, closures: this.closuresCreated }
+  }
+
+  private makeClosure(node: N, env: Env): Value {
+    this.closuresCreated++
+    return { k: "closure", node, env }
   }
 
   /** Mark an object as created here and now, which is what allows changing it in place. */
@@ -1217,19 +1226,20 @@ export class Translator {
     // instead; this is the net under that.
     if (control && this.merging > 0) throw new Unsupported("this combination of branches and assignments is not supported", undefined)
     const before = this.save()
-    // A function called on either side may have assigned to a variable that
-    // outlives the side: any variable for an expression, and for statements,
-    // which run to the end of their function, a variable of one of its callers.
-    const outlives = control ? this.frame : before.values.length
+    // Merge every cell live before the branch (including cells captured by
+    // closures that may outlive the current function frame).
+    const outlives = before.values.length
     const a = this.under(cond, whenTrue)
     const changedA = this.changesSince(before)
     const frozenA = this.freezesSince(before)
     const heldA = this.cells.slice(0, outlives).map(cell => cell.value)
+    const bornA = a.k !== "bottom" && this.closuresCreated > before.closures ? this.cells.slice(outlives) : []
     this.restore(before)
     const b = this.under(ir.not(cond), whenFalse)
     const changedB = this.changesSince(before)
     const frozenB = this.freezesSince(before)
     const heldB = this.cells.slice(0, outlives).map(cell => cell.value)
+    const bornB = b.k !== "bottom" && this.closuresCreated > before.closures ? this.cells.slice(outlives) : []
     this.restore(before)
     this.mergeChanges(cond, changedA, changedB, a.k === "bottom" ? "true" : b.k === "bottom" ? "false" : undefined)
     if (a.k !== "bottom" && frozenA.length) this.freeze(...frozenA)
@@ -1240,6 +1250,8 @@ export class Translator {
       const onFalse = b.k === "bottom" ? heldA[i]! : heldB[i]!
       if (onTrue !== before.values[i] || onFalse !== before.values[i]) this.cells[i]!.value = onTrue === onFalse ? onTrue : this.merge(cond, onTrue, onFalse)
     }
+    if (bornA.length) this.cells.push(...bornA)
+    if (bornB.length) this.cells.push(...bornB)
     return this.merge(cond, a, b)
   }
 
@@ -1255,6 +1267,8 @@ export class Translator {
     this.merging++
     let afterTrue: Value[]
     let afterFalse: Value[]
+    let bornTrue: Cell[] = []
+    let bornFalse: Cell[] = []
     let changedTrue: Changes | undefined
     let changedFalse: Changes | undefined
     let frozenTrue: Stored[] = []
@@ -1262,11 +1276,13 @@ export class Translator {
     try {
       this.under(cond, whenTrue)
       afterTrue = this.cells.slice(0, kept).map(cell => cell.value)
+      if (this.closuresCreated > before.closures) bornTrue = this.cells.slice(kept)
       changedTrue = this.changesSince(before)
       frozenTrue = this.freezesSince(before)
       this.restore(before)
       this.under(ir.not(cond), whenFalse)
       afterFalse = this.cells.slice(0, kept).map(cell => cell.value)
+      if (this.closuresCreated > before.closures) bornFalse = this.cells.slice(kept)
       changedFalse = this.changesSince(before)
       frozenFalse = this.freezesSince(before)
       this.restore(before)
@@ -1281,6 +1297,8 @@ export class Translator {
       const b = afterFalse[i]!
       cell.value = a === b ? a : this.merge(cond, a, b)
     })
+    if (bornTrue.length) this.cells.push(...bornTrue)
+    if (bornFalse.length) this.cells.push(...bornFalse)
   }
 
   /**
@@ -1472,18 +1490,9 @@ export class Translator {
     const facts = this.factsOf(node)
     if (facts.usesVar) throw new Unsupported("`var` is not supported; use `const` or `let`", facts.usesVar)
     this.noteExpectations(node)
-    // A function may read and assign a variable declared outside it while the
-    // function that declared the variable is still running: the variable then
-    // holds its value on the path being followed, and every branch merges it.
-    // Once that function has returned, nothing keeps the variable in step any
-    // more, so a function that outlived it is refused.
-    for (const [name, cell] of fn.env.mutableCells()) {
-      if (cell && facts.mentioned.has(name) && !this.cells.includes(cell)) {
-        throw new Unsupported(`this function uses \`${name}\`, a variable that is reassigned, after the function that declared it has returned; that is not modeled`, at)
-      }
-    }
     const env = fn.env.child()
     const live = this.cells.length
+    const beforeClosures = this.closuresCreated
     const frame = this.frame
     this.frame = live
     // A call runs to its own end, whatever its caller is in the middle of.
@@ -1521,7 +1530,8 @@ export class Translator {
     } finally {
       this.stack.pop()
       this.assigned.pop()
-      this.cells.length = live
+      // Keep cells created in this call live if any closure was created that may outlive the frame.
+      if (this.closuresCreated === beforeClosures) this.cells.length = live
       this.frame = frame
       this.merging = merging
     }
@@ -1540,7 +1550,7 @@ export class Translator {
 
   private enter(statements: readonly N[], scope: Env) {
     for (const statement of statements) {
-      if (statement.kind === K.FunctionDeclaration && statement.name) scope.set(statement.name.text, { k: "closure", node: statement, env: scope })
+      if (statement.kind === K.FunctionDeclaration && statement.name) scope.set(statement.name.text, this.makeClosure(statement, scope))
       else if (statement.kind === K.VariableStatement) {
         for (const declaration of statement.declarationList.declarations as N[]) {
           for (const name of boundNames(declaration.name)) scope.set(name, UNINITIALIZED)
@@ -1727,60 +1737,67 @@ export class Translator {
         // only depends on a counter and on lengths known here.
         const scope = env.child()
         const initializer = statement.kind === K.ForStatement ? statement.initializer : undefined
-        if (initializer?.kind === K.VariableDeclarationList && initializer.flags & NodeFlags.Let) {
-          // JavaScript gives each round of the loop its own copy of these variables, so a function made in
-          // one round keeps that round's value. Here the rounds share one, which only shows to such a function.
-          const names = new Set((initializer.declarations as N[]).flatMap(declaration => boundNames(declaration.name)))
-          const captured = (node: N, inside: boolean): N | undefined => {
-            if (inside && node.kind === K.Identifier && names.has(node.text)) return node
-            const deeper = inside || node.kind === K.ArrowFunction || node.kind === K.FunctionExpression || node.kind === K.FunctionDeclaration
-            return node.forEachChild((child: N) => captured(child, deeper))
-          }
-          const use = captured(statement, false)
-          if (use) throw new Unsupported(`a function that uses \`${use.text}\`, the variable of a \`for\` loop around it, is not supported; copy it into a \`const\` inside the loop`, use)
-        }
+        // ECMAScript gives each round of `for (let …)` its own per-iteration environment so closures
+        // created inside one iteration keep that iteration's binding.
+        const letNames = statement.kind === K.ForStatement && initializer?.kind === K.VariableDeclarationList && (initializer.flags & NodeFlags.Let)
+          ? (initializer.declarations as N[]).flatMap(declaration => boundNames(declaration.name))
+          : []
         if (initializer?.kind === K.VariableDeclarationList) {
           for (const declaration of initializer.declarations as N[]) for (const name of boundNames(declaration.name)) scope.set(name, UNINITIALIZED)
           this.declare(initializer, scope)
         } else if (initializer) this.effect(initializer, scope)
+        const perIteration = (prev: Env): Env => {
+          if (!letNames.length) return prev
+          const next = env.child()
+          for (const name of letNames) {
+            const old = prev.cell(name)!
+            const cell = next.set(name, old.value, old.mutable)
+            if (cell.mutable) this.cells.push(cell)
+          }
+          return next
+        }
+        const firstEnv = perIteration(scope)
         const condition = statement.kind === K.ForStatement ? statement.condition : statement.expression
         const body = statement.statement
         let rounds = 0
         if (!canExit(body)) {
           // A loop without break/continue/return/throw can unroll iteratively without growing the JS call stack.
           const stop: Flow = { next: () => VOID }
+          let cur = firstEnv
           const check = () => {
-            const cond = condition ? this.bool(condition, scope) : ir.TRUE
+            const cond = condition ? this.bool(condition, cur) : ir.TRUE
             return this.settle(cond, () => new Unsupported("how many times this loop runs depends on a value that is not known here", condition)).value as boolean
           }
           const runRound = () => {
             if (++rounds > MAX_ITERATIONS) throw new Unsupported(`this loop runs more than ${MAX_ITERATIONS} times, which is too many to unroll`, statement)
-            this.block(body.kind === K.Block ? body.statements : [body], scope.child(), stop)
+            this.block(body.kind === K.Block ? body.statements : [body], cur.child(), stop)
           }
           if (statement.kind === K.DoStatement) {
             do { runRound() } while (check())
           } else {
             while (check()) {
               runRound()
-              if (statement.kind === K.ForStatement && statement.incrementor) this.effect(statement.incrementor, scope)
+              cur = perIteration(cur)
+              if (statement.kind === K.ForStatement && statement.incrementor) this.effect(statement.incrementor, cur)
             }
           }
           return rest()
         }
-        const test = (): Value => {
-          const cond = condition ? this.bool(condition, scope) : ir.TRUE
+        const test = (cur: Env): Value => {
+          const cond = condition ? this.bool(condition, cur) : ir.TRUE
           const goes = this.settle(cond, () => new Unsupported("how many times this loop runs depends on a value that is not known here", condition))
-          return goes.value ? round() : rest()
+          return goes.value ? round(cur) : rest()
         }
-        const step = (): Value => {
-          if (statement.kind === K.ForStatement && statement.incrementor) this.effect(statement.incrementor, scope)
-          return test()
+        const step = (cur: Env): Value => {
+          const next = perIteration(cur)
+          if (statement.kind === K.ForStatement && statement.incrementor) this.effect(statement.incrementor, next)
+          return test(next)
         }
-        const round = (): Value => {
+        const round = (cur: Env): Value => {
           if (++rounds > MAX_ITERATIONS) throw new Unsupported(`this loop runs more than ${MAX_ITERATIONS} times, which is too many to unroll`, statement)
-          return this.block(body.kind === K.Block ? body.statements : [body], scope.child(), { next: step, cont: step, brk: rest })
+          return this.block(body.kind === K.Block ? body.statements : [body], cur.child(), { next: () => step(cur), cont: () => step(cur), brk: rest })
         }
-        return statement.kind === K.DoStatement ? round() : test()
+        return statement.kind === K.DoStatement ? round(firstEnv) : test(firstEnv)
       }
       case K.ForInStatement:
         throw new Unsupported("for...in loops are not supported", statement)
@@ -1810,7 +1827,7 @@ export class Translator {
         if (hasKind(statement.tryBlock, new Set([K.BreakStatement, K.ContinueStatement]))) {
           throw new Unsupported("`break` or `continue` inside `try` is not supported", statement.tryBlock)
         }
-        const THROWING = new Set<ObligationKind>(["unreachable", "nothrow", "undefined", "null"])
+        const THROWING = new Set<ObligationKind>(["unreachable", "nothrow", "undefined", "null", "tdz"])
         const start = this.instance.obligations.length
         let fellThrough = false
         let tryVal: Value
@@ -2073,7 +2090,7 @@ export class Translator {
       case K.Identifier: return this.read(node, env)
       case K.ArrowFunction:
       case K.FunctionExpression:
-        return { k: "closure", node, env }
+        return this.makeClosure(node, env)
       case K.TypeOfExpression:
         return this.typeofValue(this.evalExpr(node.expression, env), node)
       case K.PrefixUnaryExpression: {
@@ -2237,7 +2254,10 @@ export class Translator {
   /** The value a name stands for: a local binding, or else a module-level declaration. */
   private read(node: N, env: Env, shorthand = false): Value {
     const local = env.get(node.text)
-    if (local?.k === "uninitialized") throw new Unsupported(`\`${node.text}\` is read before its declaration has run, which throws`, node)
+    if (local?.k === "uninitialized") {
+      this.emit("tdz", ir.FALSE, node)
+      return BOTTOM
+    }
     if (local) return this.settled(local)
     if (node.text === "undefined") {
       const symbol = shorthand ? undefined : this.checker.getSymbolAtLocation(node)
@@ -4050,7 +4070,7 @@ export class Translator {
       // A function declared inside another is found through its scope. Reaching it here means that scope
       // has not been entered where it is used, as in a default that runs before the body: JavaScript throws.
       if (declaration.parent.kind !== K.SourceFile) throw new Unsupported(`\`${node.text}\` is a local function that is not in scope here`, node)
-      return { k: "closure", node: declaration, env: new Env() }
+      return this.makeClosure(declaration, new Env())
     }
     if (declaration.kind === K.VariableDeclaration) {
       const list = declaration.parent
