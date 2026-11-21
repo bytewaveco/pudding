@@ -63,8 +63,14 @@ describe("the suite project", () => {
   })
 
   test("a true law beyond the automation is unproved, and proved once a proof is supplied", () => {
-    assert.deepEqual(law(report, "UNPROVED: a product of positives is positive").findings.map(f => f.kind), ["unproved"])
-    assert.equal(law(report, "a product of positives is positive, with a supplied proof").status, "proved")
+    const unproved = law(report, "UNPROVED: a product of integers above one is at least their sum")
+    assert.deepEqual(unproved.findings.map(f => f.kind), ["unproved"])
+    assert.match(unproved.findings[0]?.detail ?? "", /stopped by: product of unknowns `a \* b`/)
+    assert.equal(law(report, "a product of integers above one is at least their sum, with a supplied proof").status, "proved")
+    assert.equal(law(report, "a product of positives is positive").status, "proved")
+    assert.equal(law(report, "a square is never negative").status, "proved")
+    assert.equal(law(report, "division and remainder by an unknown rebuild the dividend").status, "proved")
+    assert.equal(law(report, "remainder by an unknown stays strictly smaller in magnitude than the divisor").status, "proved")
   })
 
   test("every alternative of a union input is covered", () => {
@@ -808,8 +814,8 @@ describe("extended subset, shrinking, emit annotations and watch session", () =>
     const report = await run({ cwd: join(fixtures, "suite"), cache: false, emit: emitFile })
     const leanText = readFileSync(emitFile, "utf8")
     assert.match(leanText, /^-- .+ ".*" \(/m)
-    const unproved = law(report, "UNPROVED: a product of positives is positive")
-    assert.match(unproved.findings[0]?.detail ?? "", /^where x0 = a, x1 = b\n/)
+    const unproved = law(report, "UNPROVED: a product of integers above one is at least their sum")
+    assert.match(unproved.findings[0]?.detail ?? "", /^where x0 = a, x1 = b\nstopped by: product of unknowns `a \* b`/)
 
     const multiline = mkdtempSync(join(fixtures, ".tmp-"))
     try {

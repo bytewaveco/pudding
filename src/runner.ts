@@ -17,7 +17,7 @@ import * as ir from "./ir.ts"
 import type { Obligation } from "./ir.ts"
 import type { FileOutcome, Job, RuntimeMap } from "./crosscheck.ts"
 import { findInput, showInputs, showValue } from "./search.ts"
-import { checksFor, FALLBACK_HEADER, FAST_HEADER, FULL_HEADER, proofKind, prove, render, scriptProblem, TooLarge, withFallback, type Check } from "./lean.ts"
+import { checksFor, describeNonLinearOps, FALLBACK_HEADER, FAST_HEADER, FULL_HEADER, proofKind, prove, render, scriptProblem, TooLarge, withFallback, withNonLinear, type Check } from "./lean.ts"
 import { Translator, type Law, type LawInstance } from "./translate.ts"
 
 export const MINIMUM_LEAN = [4, 36, 0] as const
@@ -785,6 +785,24 @@ export async function run(options: RunOptions = {}): Promise<Report> {
   retry.forEach((statement, i) => {
     if (second[i]!.ok) outcomes.set(statement, second[i]!)
   })
+  // Third attempt for nonlinear arithmetic (products of unknowns, division/remainder by an unknown).
+  const obligationByStatement = new Map<string, Obligation>()
+  for (const { obligation, checks } of pending) {
+    for (const check of checks) if (!obligationByStatement.has(check.statement)) obligationByStatement.set(check.statement, obligation)
+  }
+  const nonLinear: { statement: string; attempt: string }[] = []
+  for (const statement of retry) {
+    if (outcomes.get(statement)!.ok) continue
+    const obligation = obligationByStatement.get(statement)
+    const attempt = obligation ? withNonLinear(statement, obligation.guard, obligation.claim) : undefined
+    if (attempt) nonLinear.push({ statement, attempt })
+  }
+  if (nonLinear.length) {
+    const third = await prove(lean, FALLBACK_HEADER, nonLinear.map(entry => entry.attempt))
+    nonLinear.forEach(({ statement }, i) => {
+      if (third[i]!.ok) outcomes.set(statement, third[i]!)
+    })
+  }
   report.timings.retry = Math.round(performance.now() - retrying)
   report.retried = retry.length
   const used = new Set<string>()
@@ -842,8 +860,13 @@ export async function run(options: RunOptions = {}): Promise<Report> {
         : obligation.kind === "inherited" ? "Lean could not prove that this key never names a property every object inherits"
         : "Lean could not prove that this throw is never reached"
       const mapping = instance.binders.filter(b => b.label !== b.name).map(b => `${b.name} = ${b.label}`).join(", ")
+      const stopped = describeNonLinearOps(obligation.guard, obligation.claim, instance.binders)
       const leanDetail = rejected.message.split("\n").slice(0, 8).join("\n")
-      entry.findings.push({ kind: "unproved", message, ...at, detail: mapping ? `where ${mapping}\n${leanDetail}` : leanDetail })
+      const hints = [
+        mapping ? `where ${mapping}` : "",
+        stopped ? `stopped by: ${stopped} (bound an input with Integer<Min, Max> or pass { proof })` : "",
+      ].filter(Boolean).join("\n")
+      entry.findings.push({ kind: "unproved", message, ...at, detail: hints ? `${hints}\n${leanDetail}` : leanDetail })
     }
   }
 

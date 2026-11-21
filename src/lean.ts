@@ -253,6 +253,149 @@ export function withFallback(statement: string): string {
   return statement.slice(0, -DEFAULT_TACTIC.length) + FALLBACK_TACTIC
 }
 
+/** Collect nonlinear operations (products of two unknowns, divisions/remainders by an unknown) from an expression DAG. */
+function collectNonLinear(root: Expr): { divs: [Expr, Expr][]; muls: [Expr, Expr][]; strs: Expr[] } {
+  const visited = new Set<Expr>()
+  const divs: [Expr, Expr][] = []
+  const muls: [Expr, Expr][] = []
+  const strs: Expr[] = []
+  const stack: Expr[] = [root]
+  while (stack.length) {
+    const e = stack.pop()!
+    if (e.t !== "op" || visited.has(e)) continue
+    visited.add(e)
+    const [a, b] = e.args as [Expr, Expr]
+    if ((e.op === "div" || e.op === "mod" || e.op === "fdiv") && b.t !== "lit") divs.push([a, b])
+    else if (e.op === "mul" && a.t !== "lit" && b.t !== "lit") muls.push([a, b])
+    else if (e.op === "str" && a.t !== "lit") strs.push(a)
+    for (const arg of e.args) stack.push(arg)
+  }
+  return { divs, muls, strs }
+}
+
+/** Format a small IR expression using the law's input names for diagnostics. */
+function describeExpr(e: Expr, labels: ReadonlyMap<string, string>, depth = 0): string {
+  if (e.t === "var") return labels.get(e.name) ?? e.name
+  if (e.t === "lit") return typeof e.value === "bigint" ? `${e.value}n` : JSON.stringify(e.value)
+  if (depth >= 2) return "…"
+  const sub = (x: Expr) => describeExpr(x, labels, depth + 1)
+  const [a, b] = e.args as [Expr, Expr]
+  switch (e.op) {
+    case "add": return `(${sub(a)} + ${sub(b)})`
+    case "sub": return `(${sub(a)} - ${sub(b)})`
+    case "mul": return `(${sub(a)} * ${sub(b)})`
+    case "neg": return `(-${sub(a)})`
+    case "div": case "fdiv": return `(${sub(a)} / ${sub(b)})`
+    case "mod": return `(${sub(a)} % ${sub(b)})`
+    default: return "…"
+  }
+}
+
+/** Human-readable list of nonlinear operations in an obligation that likely stopped linear automation. */
+export function describeNonLinearOps(guard: Expr, claim: Expr, binders: readonly Binder[]): string | undefined {
+  const labels = new Map(binders.map(b => [b.name, b.label]))
+  const { divs, muls, strs } = collectNonLinear(implication(guard, claim))
+  const notes = new Set<string>()
+  for (const [, d] of divs) notes.add(`division/remainder by unknown \`${describeExpr(d, labels)}\``)
+  for (const [a, b] of muls) notes.add(`product of unknowns \`${describeExpr(a, labels)} * ${describeExpr(b, labels)}\``)
+  for (const a of strs) notes.add(`converting unknown \`${describeExpr(a, labels)}\` to text`)
+  if (!notes.size) return undefined
+  return [...notes].slice(0, 3).join(", ")
+}
+
+/**
+ * Third-attempt tactic for statements that contain nonlinear multiplication or
+ * division/remainder by an unknown: tries algebraic div/mod identities,
+ * sign-aware product lemmas (including square splits), monotonicity lemmas, and
+ * automatic sign splitting on unknown divisors and dividends — all within the
+ * existing bundled `FALLBACK_IMPORTS`.
+ */
+export function withNonLinear(statement: string, guard: Expr, claim: Expr): string | undefined {
+  if (!statement.endsWith(` := by ${DEFAULT_TACTIC}`)) return undefined
+  // Extract the theorem's bound Int variables from the parameter prefix so we never reference specialized-away vars.
+  const params = /^(?: \([a-zA-Z_]\w* : (?:Bool|Int|String)\))*/.exec(statement)?.[0] ?? ""
+  const bound = new Set<string>()
+  for (const match of params.matchAll(/\(([a-zA-Z_]\w*) : Int\)/g)) bound.add(match[1]!)
+  if (!bound.size) return undefined
+
+  const { divs, muls } = collectNonLinear(implication(guard, claim))
+  const printable = (e: Expr): string | undefined => {
+    for (const v of ir.freeVariables(e)) if (!bound.has(v)) return undefined
+    try {
+      const s = printExpr(e)
+      return s.length <= 40 && !s.includes("let ") ? s : undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  const divPairs: [string, string][] = []
+  const seenDiv = new Set<string>()
+  for (const [a, d] of divs) {
+    const sa = printable(a), sd = printable(d)
+    if (!sa || !sd) continue
+    const key = `${sa}\0${sd}`
+    if (seenDiv.has(key)) continue
+    seenDiv.add(key)
+    divPairs.push([sa, sd])
+    if (divPairs.length >= 2) break
+  }
+
+  const mulPairs: [string, string][] = []
+  const seenMul = new Set<string>()
+  for (const [a, b] of muls) {
+    const sa = printable(a), sb = printable(b)
+    if (!sa || !sb) continue
+    const key = `${sa}\0${sb}`
+    if (seenMul.has(key)) continue
+    seenMul.add(key)
+    mulPairs.push([sa, sb])
+    if (mulPairs.length >= 3) break
+  }
+
+  if (!divPairs.length && !mulPairs.length) return undefined
+
+  const branches: string[] = []
+  // 1. Algebraic div/mod & ring identities.
+  branches.push(`(intros; simp_all [Int.mul_tdiv_add_tmod, Int.mul_ediv_add_emod, Int.mul_fdiv_add_fmod, Int.mul_tdiv_cancel_left, Int.mul_comm]; (first | done | omega | grind))`)
+
+  // 2. Sign-aware product bounds and monotonicity.
+  if (mulPairs.length) {
+    const steps: string[] = ["intros", "simp_all"]
+    mulPairs.forEach(([a, b], idx) => {
+      if (a === b) {
+        steps.push(`(have _sq${idx} : (${a}) < 0 ∨ 0 ≤ (${a}) := by omega)`)
+        steps.push(`rcases _sq${idx} with _ | _`)
+        steps.push(`all_goals ((try have _mp${idx} := Int.mul_pos_of_neg_of_neg (a := ${a}) (b := ${a}) (by omega) (by omega)); (try have _mn${idx} := Int.mul_nonneg (a := ${a}) (b := ${a}) (by omega) (by omega)))`)
+      } else {
+        steps.push(`(try have _mp${idx} := Int.mul_pos (a := ${a}) (b := ${b}) (by omega) (by omega))`)
+        steps.push(`(try have _mn${idx} := Int.mul_nonneg (a := ${a}) (b := ${b}) (by omega) (by omega))`)
+        steps.push(`(try have _mnn${idx} := Int.mul_pos_of_neg_of_neg (a := ${a}) (b := ${b}) (by omega) (by omega))`)
+        steps.push(`(try have _mpn${idx} := Int.mul_neg_of_pos_of_neg (a := ${a}) (b := ${b}) (by omega) (by omega))`)
+        steps.push(`(try have _mnp${idx} := Int.mul_neg_of_neg_of_pos (a := ${a}) (b := ${b}) (by omega) (by omega))`)
+      }
+    })
+    steps.push(`all_goals (first | assumption | omega | grind | (apply Int.mul_le_mul_of_nonneg_left <;> omega) | (apply Int.mul_le_mul_of_nonneg_right <;> omega) | (apply Int.mul_lt_mul_of_pos_left <;> omega) | (apply Int.mul_lt_mul_of_pos_right <;> omega))`)
+    branches.push(`(${steps.join("; ")})`)
+  }
+
+  // 3. Automatic divisor and dividend sign splits for truncated & floored division/remainder.
+  if (divPairs.length) {
+    const [a, d] = divPairs[0]!
+    const divTactic = [
+      "intros",
+      "simp_all",
+      `(have _sd : (${d}) < 0 ∨ (${d}) = 0 ∨ 0 < (${d}) := by omega)`,
+      "rcases _sd with _ | _ | _",
+      `all_goals ((try omega); (try ((have _sa : (${a}) < 0 ∨ 0 ≤ (${a}) := by omega); rcases _sa with _ | _)))`,
+      `all_goals ((try have _d0 := Int.tdiv_nonneg (a := ${a}) (b := ${d}) (by omega) (by omega)); (try have _d1 := Int.tdiv_nonneg (a := -(${a})) (b := ${d}) (by omega) (by omega)); (try have _d2 := Int.tdiv_nonneg (a := ${a}) (b := -(${d})) (by omega) (by omega)); (try have _d3 := Int.tdiv_nonneg (a := -(${a})) (b := -(${d})) (by omega) (by omega)); (try have _m0 := Int.tmod_nonneg (${d}) (a := ${a}) (by omega)); (try have _m1 := Int.tmod_nonneg (${d}) (a := -(${a})) (by omega)); (try have _m2 := Int.tmod_nonneg (-(${d})) (a := ${a}) (by omega)); (try have _m3 := Int.tmod_nonneg (-(${d})) (a := -(${a})) (by omega)); (try have _l0 := Int.tmod_lt_of_pos (${a}) (b := ${d}) (by omega)); (try have _l1 := Int.tmod_lt_of_pos (-(${a})) (b := ${d}) (by omega)); (try have _l2 := Int.tmod_lt_of_pos (${a}) (b := -(${d})) (by omega)); (try have _l3 := Int.tmod_lt_of_pos (-(${a})) (b := -(${d})) (by omega)); (try have _s0 := Int.tdiv_le_self (${d}) (a := ${a}) (by omega)); (try have _e0 := Int.ediv_nonneg (a := ${a}) (b := ${d}) (by omega) (by omega)); (try have _e1 := Int.emod_nonneg (${a}) (b := ${d}) (by omega)); (try have _e2 := Int.emod_lt_of_pos (${a}) (b := ${d}) (by omega)); simp_all [Int.neg_tdiv, Int.tdiv_neg, Int.neg_tmod, Int.tmod_neg, Int.tdiv_eq_ediv_of_nonneg, Int.tmod_eq_emod_of_nonneg, Int.fdiv_eq_ediv_of_nonneg, Int.mul_tdiv_add_tmod, Int.mul_ediv_add_emod, Int.mul_fdiv_add_fmod, Int.mul_comm]; (first | done | assumption | omega | grind))`,
+    ].join("; ")
+    branches.push(`(${divTactic})`)
+  }
+
+  return statement.slice(0, -DEFAULT_TACTIC.length) + `(first | ${branches.join(" | ")})`
+}
+
 export class TooLarge extends Error {}
 
 function leanString(text: string): string {

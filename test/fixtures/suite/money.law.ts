@@ -55,13 +55,29 @@ law("dividing by a non-zero number of parts is safe", domain<[bigint, bigint]>()
   if (parts !== 0n) expect(perPart(total - total, parts)).toEqual(0n)
 })
 
-law("UNPROVED: a product of positives is positive", domain<[bigint, bigint]>(), ([a, b]) => {
+law("a product of positives is positive", domain<[bigint, bigint]>(), ([a, b]) => {
   if (a > 0n && b > 0n) expect(a * b > 0n).toBe(true)
 })
 
-law("a product of positives is positive, with a supplied proof", domain<[bigint, bigint]>(), ([a, b]) => {
-  if (a > 0n && b > 0n) expect(a * b > 0n).toBe(true)
-}, { proof: "intro h; simp_all; exact Int.mul_pos h.1 h.2" })
+law("a square is never negative", domain<bigint>(), x => {
+  expect(x * x >= 0n).toBe(true)
+})
+
+law("division and remainder by an unknown rebuild the dividend", domain<[bigint, bigint]>(), ([x, d]) => {
+  if (d !== 0n) expect((x / d) * d + (x % d)).toEqual(x)
+})
+
+law("remainder by an unknown stays strictly smaller in magnitude than the divisor", domain<[bigint, bigint]>(), ([x, d]) => {
+  if (d !== 0n) expect(abs(x % d) < abs(d)).toBe(true)
+})
+
+law("UNPROVED: a product of integers above one is at least their sum", domain<[bigint, bigint]>(), ([a, b]) => {
+  if (a > 1n && b > 1n) expect(a * b >= a + b).toBe(true)
+})
+
+law("a product of integers above one is at least their sum, with a supplied proof", domain<[bigint, bigint]>(), ([a, b]) => {
+  if (a > 1n && b > 1n) expect(a * b >= a + b).toBe(true)
+}, { proof: "intro h; simp_all; have := Int.mul_pos (a := x0 - 1) (b := x1 - 1) (by omega) (by omega); grind" })
 
 law("a fixed example", () => {
   expect(applyBasisPoints(200n, 250n)).toEqual(5n)
