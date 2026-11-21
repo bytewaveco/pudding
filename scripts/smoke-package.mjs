@@ -66,6 +66,18 @@ law("FALSE: quantity is ignored", domain<Item>(), item => {
     if (report.errors.length || report.warnings.length) fail(`errors ${JSON.stringify(report.errors)}, warnings ${JSON.stringify(report.warnings)}`)
     if (!compiler.test(report.compiler)) fail(`the compiler was ${JSON.stringify(report.compiler)}`)
     if (result.status !== 1) fail(`exit code was ${result.status}, expected 1 because one law is false`)
+    // Verify published declarations (including `./runner`) typecheck strictly with skipLibCheck: false.
+    if (name === "typescript") {
+      writeFileSync(join(project, "src", "types-check.ts"), `import type { Config, Integer } from "@bytewaveco/pudding"
+import { createWatchSession, run, type WatchSession } from "@bytewaveco/pudding/runner"
+export const session: WatchSession = createWatchSession()
+export const cfg: Config = { strict: true }
+export type Small = Integer<0, 10>
+export const runFn: typeof run = run
+`)
+      const check = spawnSync("npx", ["tsc", "--noEmit", "--strict", "--module", "nodenext", "--moduleResolution", "nodenext", "--target", "esnext", "src/types-check.ts"], { cwd: project, encoding: "utf8" })
+      if (check.status !== 0) fail(`published .d.ts failed strict tsc check:\n${check.stdout}\n${check.stderr}`)
+    }
   }
   if (problems.length) {
     console.error("package smoke test failed:\n  " + problems.join("\n  "))

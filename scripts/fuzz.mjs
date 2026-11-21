@@ -298,7 +298,7 @@ class Generator {
       add(2, () => `Math.${r.pick(["floor", "trunc", "ceil"])}(${sub("num")} / ${literal(r.pick(NUMS.filter(v => v !== 0)))})`)
       add(1.5, () => `Math.${r.pick(["abs", "sign"])}(${sub("num")})`)
       add(1.5, () => `Math.${r.pick(["min", "max"])}(${sub("num")}, ${sub("num")})`)
-      add(0.6, () => `Math.${r.pick(["min", "max"])}(${sub("num")}, ${r.pick(["Infinity", "-Infinity"])}) === Infinity ? 1 : Math.${r.pick(["min", "max"])}(${sub("num")}, ${sub("num")})`)
+      add(0.6, () => `(Math.${r.pick(["min", "max"])}(${sub("num")}, ${r.pick(["Infinity", "-Infinity"])}) === Infinity ? 1 : Math.${r.pick(["min", "max"])}(${sub("num")}, ${sub("num")}))`)
       add(0.8, () => {
         const t = r.pick(TYPES)
         return `[${sub(t)}, ${sub(t)}, ${sub(t)}].${r.pick(["indexOf", "lastIndexOf"])}(${sub(t)}${r.chance(0.5) ? `, ${r.pick([-2, 0, 1, 2, "undefined"])}` : ""})`

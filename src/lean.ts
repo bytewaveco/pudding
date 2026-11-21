@@ -302,38 +302,29 @@ function consecutive(binder: Binder): [bigint, bigint] | undefined {
   return sorted.every((value, i) => i === 0 || value === sorted[i - 1]! + 1n) ? [sorted[0]!, sorted.at(-1)!] : undefined
 }
 
-/** Variables divided by, multiplied nonlinearly, or formatted as text (which tactics cannot decide), in one O(|DAG|) pass. */
+/** Variables divided by, multiplied nonlinearly, or formatted as text (which tactics cannot decide), in O(|DAG|) time and memory. */
 function nonLinearVars(root: Expr): Set<string> {
-  const postorder: Expr[] = []
   const visited = new Set<Expr>()
-  const stack: [Expr, boolean][] = [[root, false]]
+  const roots: Expr[] = []
+  const stack: Expr[] = [root]
   while (stack.length) {
-    const [e, expanded] = stack.pop()!
-    if (e.t !== "op") continue
-    if (expanded) { postorder.push(e); continue }
-    if (visited.has(e)) continue
+    const e = stack.pop()!
+    if (e.t !== "op" || visited.has(e)) continue
     visited.add(e)
-    stack.push([e, true])
-    for (let i = e.args.length - 1; i >= 0; i--) stack.push([e.args[i]!, false])
-  }
-  const vars = new Map<Expr, Set<string>>()
-  const bad = new Set<string>()
-  const mark = (part: Expr) => {
-    if (part.t === "var") bad.add(part.name)
-    else if (part.t === "op") for (const v of vars.get(part)!) bad.add(v)
-  }
-  for (const e of postorder) {
-    if (e.t !== "op") continue
-    const own = new Set<string>()
-    for (const arg of e.args) {
-      if (arg.t === "var") own.add(arg.name)
-      else if (arg.t === "op") for (const v of vars.get(arg)!) own.add(v)
-    }
-    vars.set(e, own)
     const [a, b] = e.args as [Expr, Expr]
-    if (e.op === "str") mark(a)
-    else if (e.op === "div" || e.op === "mod" || e.op === "fdiv") mark(b)
-    else if (e.op === "mul" && a.t !== "lit" && b.t !== "lit") for (const v of own) bad.add(v)
+    if (e.op === "str") roots.push(a)
+    else if (e.op === "div" || e.op === "mod" || e.op === "fdiv") roots.push(b)
+    else if (e.op === "mul" && a.t !== "lit" && b.t !== "lit") roots.push(a, b)
+    for (const arg of e.args) stack.push(arg)
+  }
+  const bad = new Set<string>()
+  const marked = new Set<Expr>()
+  while (roots.length) {
+    const e = roots.pop()!
+    if (e.t === "var") { bad.add(e.name); continue }
+    if (e.t !== "op" || marked.has(e)) continue
+    marked.add(e)
+    for (const arg of e.args) roots.push(arg)
   }
   return bad
 }
