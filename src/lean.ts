@@ -13,6 +13,14 @@ import * as ir from "./ir.ts"
 import type { Binder, Expr, Scalar } from "./ir.ts"
 
 /**
+ * Minimal modules for finite laws checked purely by kernel reduction (`decide +kernel`),
+ * without loading `Init.Grind` or `Init.Omega`.
+ */
+export const KERNEL_IMPORTS = [
+  "Init.Core", "Init.Data.List.Basic", "Init.Data.String.Basic", "Init.Data.Int.DivMod", "Init.Data.Int.OfNat",
+]
+
+/**
  * The modules the generated theorems need. Importing only these starts Lean
  * several times faster than `import Init`, and they are what a trimmed Lean
  * runtime ships.
@@ -29,22 +37,41 @@ export const FAST_IMPORTS = [
 export const FALLBACK_IMPORTS = [...FAST_IMPORTS, "Init.Data.String.Lemmas.Basic", "Init.Data.String.Length"]
 
 const header = (imports: readonly string[]) => ["prelude", ...imports.map(name => `import ${name}`)].join("\n")
+export const KERNEL_HEADER = header(KERNEL_IMPORTS)
 export const FAST_HEADER = header(FAST_IMPORTS)
 export const FALLBACK_HEADER = header(FALLBACK_IMPORTS)
 /** The whole core library, for proofs an author wrote. A trimmed runtime does not have it. */
 export const FULL_HEADER = "import Init"
+
+/** Pure kernel-reducible UTF-16 string definitions (no `grind`, `omega`, or `String.Lemmas`). */
+const KERNEL_STRING_DEFS = `
+def _p_utf16Units : List Char → Nat
+  | [] => 0
+  | c :: cs => (if c.val.toNat < 0x10000 then 1 else 2) + _p_utf16Units cs
+
+noncomputable def _p_strLen (s : String) : Int := (_p_utf16Units s.toList : Int)
+
+def _p_isPrefixOf : List Char → List Char → Bool
+  | [], _ => true
+  | _ :: _, [] => false
+  | x :: xs, y :: ys => x == y && _p_isPrefixOf xs ys
+
+noncomputable def _p_startsWith (s pre : String) : Bool := _p_isPrefixOf pre.toList s.toList
+noncomputable def _p_endsWith (s suf : String) : Bool := _p_isPrefixOf suf.toList.reverse s.toList.reverse
+
+def _p_containsList : List Char → List Char → Bool
+  | [], _ => true
+  | _ :: _, [] => false
+  | pat@(_ :: _), c :: cs => _p_isPrefixOf pat (c :: cs) || _p_containsList pat cs
+
+noncomputable def _p_includes (s sub : String) : Bool := _p_containsList sub.toList s.toList`.trim()
 
 /**
  * Exact UTF-16 string helpers and `@[grind]` lemmas, emitted only when a
  * theorem uses symbolic string length or affix operations. Uses only modules
  * already shipped in `FALLBACK_IMPORTS` (no new runtime `.olean` packages).
  */
-const STRING_PRELUDE = `
-def _p_utf16Units : List Char → Nat
-  | [] => 0
-  | c :: cs => (if c.val.toNat < 0x10000 then 1 else 2) + _p_utf16Units cs
-
-noncomputable def _p_strLen (s : String) : Int := (_p_utf16Units s.toList : Int)
+const STRING_PRELUDE = `${KERNEL_STRING_DEFS}
 
 theorem _p_utf16Units_append (a b : List Char) : _p_utf16Units (a ++ b) = _p_utf16Units a + _p_utf16Units b := by
   induction a with
@@ -74,21 +101,6 @@ theorem _p_strLen_zero_iff (s : String) : _p_strLen s = 0 ↔ s = "" := by
     exact String.toList_inj.mp (by simpa using hl)
   · intro h; subst h; decide +kernel
 grind_pattern _p_strLen_zero_iff => _p_strLen s
-
-def _p_isPrefixOf : List Char → List Char → Bool
-  | [], _ => true
-  | _ :: _, [] => false
-  | x :: xs, y :: ys => x == y && _p_isPrefixOf xs ys
-
-noncomputable def _p_startsWith (s pre : String) : Bool := _p_isPrefixOf pre.toList s.toList
-noncomputable def _p_endsWith (s suf : String) : Bool := _p_isPrefixOf suf.toList.reverse s.toList.reverse
-
-def _p_containsList : List Char → List Char → Bool
-  | [], _ => true
-  | _ :: _, [] => false
-  | pat@(_ :: _), c :: cs => _p_isPrefixOf pat (c :: cs) || _p_containsList pat cs
-
-noncomputable def _p_includes (s sub : String) : Bool := _p_containsList sub.toList s.toList
 
 theorem _p_isPrefixOf_append (a b : List Char) : _p_isPrefixOf a (a ++ b) = true := by
   induction a with
@@ -200,12 +212,14 @@ grind_pattern _p_endsWith_concat => _p_endsWith (s ++ t) suf`.trim()
 
 const usesStringPrelude = (statement: string) => /_p_(?:strLen|startsWith|endsWith|includes)\b/.test(statement)
 
+/** Pure kernel-reducible list length definition (no `grind` or `omega`). */
+const KERNEL_LIST_DEFS = `def _p_listLen {α : Type} (xs : List α) : Int := (xs.length : Int)`
+
 /**
  * List length helpers and `@[grind]` lemmas, emitted only when a theorem uses
  * arbitrary-length `List` operations or recursive `def`s. Uses only `FAST_IMPORTS`.
  */
-const LIST_PRELUDE = `
-def _p_listLen {α : Type} (xs : List α) : Int := (xs.length : Int)
+const LIST_PRELUDE = `${KERNEL_LIST_DEFS}
 
 theorem _p_listLen_nonneg {α : Type} (xs : List α) : 0 ≤ _p_listLen xs := Int.natCast_nonneg _
 grind_pattern _p_listLen_nonneg => _p_listLen xs
@@ -1215,9 +1229,14 @@ async function runChunk(lean: string, header: string, statements: string[], dire
   // rest on? A theorem counts as proved only when Lean reports no error for
   // it *and* answers that question acceptably. Silence is never taken for
   // success, and neither is an unfinished proof, which Lean only warns about.
+  const kernelOnly = header === KERNEL_HEADER
   const lines = header.split("\n")
-  if (statements.some(usesStringPrelude) || (defs && usesStringPrelude(defs))) lines.push("", ...STRING_PRELUDE.split("\n"))
-  if (defs || statements.some(usesListPrelude)) lines.push("", ...LIST_PRELUDE.split("\n"))
+  if (statements.some(usesStringPrelude) || (defs && usesStringPrelude(defs))) {
+    lines.push("", ...(kernelOnly ? KERNEL_STRING_DEFS : STRING_PRELUDE).split("\n"))
+  }
+  if (defs || statements.some(usesListPrelude)) {
+    lines.push("", ...(kernelOnly ? KERNEL_LIST_DEFS : LIST_PRELUDE).split("\n"))
+  }
   const defsStart = defs ? lines.length + 1 : 0
   if (defs) lines.push("", ...defs.split("\n"))
   const firstLine: number[] = []
@@ -1278,7 +1297,10 @@ async function runChunk(lean: string, header: string, statements: string[], dire
 
 export async function prove(lean: string, header: string, statements: string[], processes = availableParallelism(), alone = false, defs?: string): Promise<LeanOutcome[]> {
   if (!statements.length) return []
-  const effectiveHeader = header === FAST_HEADER && (statements.some(usesStringPrelude) || (defs && usesStringPrelude(defs))) ? FALLBACK_HEADER : header
+  const allFinite = !defs && statements.every(s => proofKind(s) === "finite")
+  const effectiveHeader = header === FAST_HEADER
+    ? (allFinite ? KERNEL_HEADER : (statements.some(usesStringPrelude) || (defs && usesStringPrelude(defs))) ? FALLBACK_HEADER : header)
+    : header
   const directory = await mkdtemp(join(tmpdir(), "pudding-"))
   try {
     const chunks: string[][] = []
@@ -1340,10 +1362,18 @@ export async function prove(lean: string, header: string, statements: string[], 
 export function render(header: string, statements: string[], comments?: ReadonlyMap<string, string>, defs?: readonly string[]): string {
   const uniqueDefs = defs ? [...new Set(defs.filter(Boolean))] : []
   const defsBlock = uniqueDefs.join("\n\n")
+  const allFinite = !defsBlock && statements.length > 0 && statements.every(s => proofKind(s) === "finite")
   const needsStrings = statements.some(usesStringPrelude) || usesStringPrelude(defsBlock)
   const needsLists = Boolean(defsBlock) || statements.some(usesListPrelude)
-  const effectiveHeader = header === FAST_HEADER && needsStrings ? FALLBACK_HEADER : header
-  const prelude = [needsStrings ? STRING_PRELUDE : "", needsLists ? LIST_PRELUDE : "", defsBlock].filter(Boolean).join("\n\n")
+  const effectiveHeader = header === FAST_HEADER
+    ? (allFinite ? KERNEL_HEADER : needsStrings ? FALLBACK_HEADER : header)
+    : header
+  const kernelOnly = effectiveHeader === KERNEL_HEADER
+  const prelude = [
+    needsStrings ? (kernelOnly ? KERNEL_STRING_DEFS : STRING_PRELUDE) : "",
+    needsLists ? (kernelOnly ? KERNEL_LIST_DEFS : LIST_PRELUDE) : "",
+    defsBlock,
+  ].filter(Boolean).join("\n\n")
   return effectiveHeader + (prelude ? `\n\n${prelude}` : "") + "\n\n" + statements.map((statement, i) => {
     const note = comments?.get(statement)
     const comment = note ? note.split(/\r?\n/).map(line => `-- ${line}`).join("\n") + "\n" : ""

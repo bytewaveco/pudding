@@ -5,7 +5,7 @@ import { tmpdir } from "node:os"
 import { isAbsolute, join } from "node:path"
 import { after, before, describe, test } from "node:test"
 import * as ir from "../src/ir.ts"
-import { checksFor, FAST_HEADER, prove } from "../dist/lean.js"
+import { checksFor, FAST_HEADER, KERNEL_HEADER, prove, render } from "../dist/lean.js"
 import { createWatchSession, locateLean, run, type Report } from "../dist/runner.js"
 import { findInput, showInputs } from "../dist/search.js"
 
@@ -1070,5 +1070,24 @@ law("optional tuple refused", domain<[bigint, bigint?]>(), items => {
     assert.deepEqual(law(report, "arbitrary-length arrays and folds > FALSE: reversing a list leaves it unchanged").findings[0]?.inputs, { xs: "[0n, 1n]" })
     assert.deepEqual(law(report, "recursive functions > FALSE: sumToRec is always strictly less than 10").findings[0]?.inputs, { n: "4n" })
     assert.match(law(report, "recursive functions > SAMPLED: non-terminating recursion is refused by Lean termination checker").notes[0] ?? "", /terminates/)
+  })
+
+  test("finite-only laws check under KERNEL_HEADER without loading grind or omega", async () => {
+    const s = ir.variable("s", "str")
+    const checks = checksFor(
+      [{ name: "s", label: "s", ty: "str", domain: ["", "hi", "😀"] }],
+      ir.TRUE,
+      ir.and(
+        ir.le(ir.lit(0n), ir.strLen(s)),
+        ir.startsWith(ir.concat(s, ir.lit("!")), s),
+      ),
+      undefined,
+    )
+    const rendered = render(FAST_HEADER, checks.map(c => c.statement))
+    assert.ok(rendered.startsWith(KERNEL_HEADER), rendered.slice(0, 200))
+    assert.ok(!rendered.includes("Init.Grind"))
+    assert.ok(!rendered.includes("Init.Omega"))
+    const [outcome] = await prove(lean, KERNEL_HEADER, checks.map(c => c.statement))
+    assert.equal(outcome?.ok, true, outcome?.message ?? "")
   })
 })
