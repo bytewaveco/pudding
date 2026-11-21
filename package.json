@@ -1,6 +1,6 @@
 {
   "name": "@bytewaveco/pudding",
-  "version": "0.1.0-beta.6",
+  "version": "0.1.0-beta.7",
   "description": "Prove laws about existing TypeScript functions, with Lean doing the checking",
   "license": "MIT",
   "repository": {
