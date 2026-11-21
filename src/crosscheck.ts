@@ -13,8 +13,8 @@ import type { ArgShape } from "./translate.ts"
 export interface RuntimeMap {
   /** For each source file, where each of its import specifiers resolves. */
   resolutions: Map<string, Map<string, string>>
-  /** For each source file, the text ranges of imported or exported names that are types only. */
-  elided: Map<string, [number, number][]>
+  /** For each source file, text edits `[start, end, replacement]` (empty string blanks the range while keeping newlines). */
+  edits: Map<string, [number, number, string][]>
 }
 
 interface Instance {
@@ -158,11 +158,19 @@ async function execute(job: Job, report: (outcome: FileOutcome) => void) {
     },
     load(url, context, nextLoad) {
       const result = nextLoad(url, context)
-      const ranges = url.startsWith("file:") ? job.map.elided.get(pathOf(url)) : undefined
-      if (!ranges || result.source === undefined || result.source === null) return result
-      // Blank the names rather than cut them, so positions in error messages stay true.
+      const edits = url.startsWith("file:") ? job.map.edits.get(pathOf(url)) : undefined
+      if (!edits || result.source === undefined || result.source === null) return result
+      // Apply edits right-to-left while preserving line counts so stack-trace line numbers stay true.
       let text = typeof result.source === "string" ? result.source : Buffer.from(result.source as Uint8Array).toString("utf8")
-      for (const [start, end] of ranges) text = text.slice(0, start) + text.slice(start, end).replace(/[^\n]/g, " ") + text.slice(end)
+      const ordered = [...edits].sort((a, b) => b[0] - a[0])
+      for (const [start, end, replacement] of ordered) {
+        const original = text.slice(start, end)
+        if (!replacement) text = text.slice(0, start) + original.replace(/[^\n]/g, " ") + text.slice(end)
+        else {
+          const newlines = (original.match(/\n/g)?.length ?? 0) - (replacement.match(/\n/g)?.length ?? 0)
+          text = text.slice(0, start) + replacement + (newlines > 0 ? "\n".repeat(newlines) : "") + text.slice(end)
+        }
+      }
       return { ...result, source: text }
     },
   })

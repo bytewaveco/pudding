@@ -26,14 +26,18 @@ const PROVED_RUNTIME_BUDGET = 1_000
 const FALLBACK_RUNTIME_BUDGET = 4_000
 const RUNTIME_TIMEOUT_MS = 30_000
 
-/** Dependency-tracking session for watch mode so edits re-check only affected law files. */
+/** Dependency-tracking and compiler session for watch mode so edits incrementally re-check affected law files. */
 export interface WatchSession {
-  /** Clear tracked dependency state. */
+  /** Clear tracked dependency state and close any open compiler instance. */
   close(): void
   /** Law files affected by a change to `changedFile`, or `undefined` when a full run is needed. */
   affected(changedFile: string): string[] | undefined
-  /** Internal dependency graph mapping each law file to every file it transitively imports or reaches. */
-  readonly _internal: { dependencies: Map<string, Set<string>> }
+  /** Internal state mapping each law file to its transitive dependencies and an optional open compiler API. */
+  readonly _internal: {
+    dependencies: Map<string, Set<string>>
+    api?: InstanceType<typeof API>
+    apiCwd?: string
+  }
 }
 
 export function createWatchSession(): WatchSession {
@@ -42,6 +46,9 @@ export function createWatchSession(): WatchSession {
     _internal: state,
     close() {
       state.dependencies.clear()
+      state.api?.close()
+      delete state.api
+      delete state.apiCwd
     },
     affected(changedFile: string) {
       if (!state.dependencies.size) return undefined
@@ -118,8 +125,10 @@ export interface RunOptions extends Config {
   name?: string
   /** Write the generated Lean source to this file. */
   emit?: string
-  /** Optional persistent watch session that reuses the TypeScript 7 compiler API across edits. */
+  /** Optional watch session that tracks file dependencies and reuses the compiler across edits. */
   session?: WatchSession
+  /** Files known to have changed on disk since the last run in `session`, enabling incremental snapshot updates. */
+  changedFiles?: string[]
 }
 
 export type Status = "proved" | "checked" | "sampled" | "failed" | "skipped" | "todo"
@@ -221,7 +230,7 @@ export function locateLean(config: Config, cwd: string): string {
   const name = toolchainName()
   // What `install-lean` left behind: in the project, next to Pudding itself, or in the shared cache.
   const installed = [
-    ...[cwd, packageRoot].flatMap(root => globSync(".toolchain/lean-*/bin/lean" + suffix, { cwd: root }).sort().slice(-1).map(found => join(root, found))),
+    ...[cwd, packageRoot].flatMap(root => existsSync(join(root, ".toolchain")) ? globSync(".toolchain/lean-*/bin/lean" + suffix, { cwd: root }).sort().slice(-1).map(found => join(root, found)) : []),
     ...(name ? [join(cacheDirectory(), name, "bin", "lean" + suffix)] : []),
   ].filter(candidate => existsSync(candidate))
   // A whole Lean is only there because someone asked for one, so that a proof
@@ -240,6 +249,8 @@ export function locateLean(config: Config, cwd: string): string {
   return installed[0] ?? (existsSync(elan) ? elan : "lean")
 }
 
+const leanVersionCache = new Map<string, string>()
+
 function leanVersion(lean: string, cache: Cache): string {
   let key = lean
   try {
@@ -248,8 +259,8 @@ function leanVersion(lean: string, cache: Cache): string {
   } catch {
     // Resolved through PATH; ask the binary every time.
   }
-  let version = cache.lean[key]
-  if (!version || key === lean) {
+  let version = key === lean ? undefined : (cache.lean[key] ?? leanVersionCache.get(key))
+  if (!version) {
     try {
       version = execFileSync(lean, ["--version"], { encoding: "utf8" }).trim()
     } catch {
@@ -257,6 +268,7 @@ function leanVersion(lean: string, cache: Cache): string {
         ? `Lean is not installed. Run \`npx pudding install-lean\`, or set PUDDING_LEAN to a Lean ${MINIMUM_LEAN.join(".")} binary.`
         : `Lean could not be run at \`${lean}\`. Run \`npx pudding install-lean\`, or set PUDDING_LEAN to a Lean ${MINIMUM_LEAN.join(".")} binary.`)
     }
+    if (key !== lean) leanVersionCache.set(key, version)
     cache.lean = { [key]: version }
   }
   const match = /version (\d+)\.(\d+)\.(\d+)/.exec(version)
@@ -307,14 +319,17 @@ function loadCache(file: string): Cache {
 const proofLog = () => join(cacheDirectory(), "proved")
 const KEY = /^[0-9a-f]{32}$/
 
+let cachedBuildDigest: string | undefined
+
 /** A digest of the code running now: every module next to this one. */
 function buildDigest(): string {
+  if (cachedBuildDigest !== undefined) return cachedBuildDigest
   const directory = dirname(fileURLToPath(import.meta.url))
   const digest = createHash("sha256")
   for (const file of readdirSync(directory).sort()) {
     if (/\.(js|ts)$/.test(file) && !file.endsWith(".d.ts")) digest.update(file + "\0").update(readFileSync(join(directory, file)))
   }
-  return digest.digest("hex")
+  return (cachedBuildDigest = digest.digest("hex"))
 }
 
 function loadProofs(): { keys: Set<string>; lines: number } {
@@ -377,7 +392,7 @@ function writeProject(directory: string, base: string | undefined, lawFiles: str
  * nor drops an imported interface, and bundler-style code relies on both.
  */
 function runtimeMap(program: Program, checker: Checker, ambiguous: (message: string) => void): RuntimeMap {
-  const map: RuntimeMap = { resolutions: new Map(), elided: new Map() }
+  const map: RuntimeMap = { resolutions: new Map(), edits: new Map() }
   // The compiler's nodes are handled untyped, as in the translator.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   type N = any
@@ -387,9 +402,9 @@ function runtimeMap(program: Program, checker: Checker, ambiguous: (message: str
     if (!source || source.isDeclarationFile) continue
     const text = source.text
     const resolutions = new Map<string, string>()
-    const ranges: [number, number][] = []
+    const edits: [number, number, string][] = []
     /** The range of a binding, widened over one neighbouring comma. */
-    const withComma = (node: N): [number, number] => {
+    const withComma = (node: N): [number, number, string] => {
       let start = node.getStart(source) as number
       let end = node.end as number
       const after = /^\s*,/.exec(text.slice(end))
@@ -398,9 +413,27 @@ function runtimeMap(program: Program, checker: Checker, ambiguous: (message: str
         const before = /,\s*$/.exec(text.slice(0, start))
         if (before) start -= before[0].length
       }
-      return [start, end]
+      return [start, end, ""]
     }
     for (const statement of source.statements as readonly N[]) {
+      if (statement.kind === K.EnumDeclaration && statement.name?.kind === K.Identifier) {
+        if (statement.modifiers?.some((m: N) => m.kind === K.DeclareKeyword)) continue
+        const isConst = statement.modifiers?.some((m: N) => m.kind === K.ConstKeyword) === true
+        const isExport = statement.modifiers?.some((m: N) => m.kind === K.ExportKeyword) === true
+        const entries: string[] = []
+        let ok = true
+        for (const member of statement.members as readonly N[]) {
+          if (member.name.kind !== K.Identifier && member.name.kind !== K.StringLiteral) { ok = false; break }
+          const val = checker.getConstantValue(member)
+          if (typeof val !== "string" && (typeof val !== "number" || !Number.isSafeInteger(val))) { ok = false; break }
+          const key = member.name.text as string
+          if (key === "__proto__") { ok = false; break }
+          entries.push(`${JSON.stringify(key)}:${JSON.stringify(val)}`)
+          if (!isConst && typeof val === "number") entries.push(`${JSON.stringify(String(val))}:${JSON.stringify(key)}`)
+        }
+        if (ok) edits.push([statement.getStart(source), statement.end, `${isExport ? "export " : ""}const ${statement.name.text} = {${entries.join(",")}};`])
+        continue
+      }
       const isImport = statement.kind === K.ImportDeclaration
       if (!isImport && statement.kind !== K.ExportDeclaration) continue
       const specifier = statement.moduleSpecifier
@@ -418,22 +451,30 @@ function runtimeMap(program: Program, checker: Checker, ambiguous: (message: str
         }
       }
       if (isImport ? statement.importClause?.phaseModifier === K.TypeKeyword : statement.isTypeOnly) continue
+      const isTypeSymbol = (nameNode: N): boolean => {
+        let symbol = checker.getSymbolAtLocation(nameNode)
+        if (symbol && symbol.flags & SymbolFlags.Alias) symbol = checker.getAliasedSymbol(symbol)
+        return !!symbol && !checker.isUnknownSymbol(symbol) && (symbol.flags & SymbolFlags.Value) === 0
+      }
+      const defaultName = isImport ? statement.importClause?.name : undefined
+      const defaultIsType = !!defaultName && isTypeSymbol(defaultName)
       const bindings: N[] = isImport
         ? statement.importClause?.namedBindings?.kind === K.NamedImports ? [...statement.importClause.namedBindings.elements] : []
         : statement.exportClause?.kind === K.NamedExports ? [...statement.exportClause.elements] : []
-      const typeOnly = bindings.filter(binding => {
-        if (binding.isTypeOnly) return false
-        let symbol = checker.getSymbolAtLocation(binding.name)
-        if (symbol && symbol.flags & SymbolFlags.Alias) symbol = checker.getAliasedSymbol(symbol)
-        return !!symbol && !checker.isUnknownSymbol(symbol) && (symbol.flags & SymbolFlags.Value) === 0
-      })
+      const hasNamespace = isImport && statement.importClause?.namedBindings?.kind === K.NamespaceImport
+      const typeOnly = bindings.filter(binding => !binding.isTypeOnly && isTypeSymbol(binding.name))
+      const typeOnlySet = new Set(typeOnly)
+      const allNamedType = bindings.every(binding => binding.isTypeOnly || typeOnlySet.has(binding))
       // TypeScript drops an import whose names are all types; so must we, or Node would load a module for nothing.
-      const whole = isImport && typeOnly.length > 0 && typeOnly.length === bindings.length && !statement.importClause.name
-      if (whole) ranges.push([statement.getStart(source), statement.end])
-      else for (const binding of typeOnly) ranges.push(withComma(binding))
+      const whole = isImport && !hasNamespace && (typeOnly.length > 0 || defaultIsType) && allNamedType && (!defaultName || defaultIsType)
+      if (whole) edits.push([statement.getStart(source), statement.end, ""])
+      else {
+        if (defaultIsType) edits.push(withComma(defaultName))
+        for (const binding of typeOnly) edits.push(withComma(binding))
+      }
     }
     if (resolutions.size) map.resolutions.set(name, resolutions)
-    if (ranges.length) map.elided.set(name, ranges)
+    if (edits.length) map.edits.set(name, edits)
   }
   return map
 }
@@ -442,25 +483,29 @@ function runtimeMap(program: Program, checker: Checker, ambiguous: (message: str
  * Execute the laws in a worker thread: fresh module state on every run, no
  * way for the project's code to disturb this process, and a time limit.
  */
-function executeLaws(job: Job): Promise<{ outcomes: Map<string, FileOutcome>; timedOut: boolean }> {
+function executeLaws(job: Job): Promise<{ outcomes: Map<string, FileOutcome>; timedOut: boolean; workerError?: string }> {
   return new Promise(resolve => {
     const outcomes = new Map<string, FileOutcome>()
     const entry = new URL(import.meta.url.replace(/runner\.(ts|js)$/, "crosscheck.$1"))
     const worker = new Worker(entry, { workerData: job, stdout: true, stderr: true })
     let settled = false
+    let workerError: string | undefined
     const finish = (timedOut: boolean) => {
       if (settled) return
       settled = true
       clearTimeout(timer)
       void worker.terminate()
-      resolve({ outcomes, timedOut })
+      resolve({ outcomes, timedOut, ...(workerError ? { workerError } : {}) })
     }
     const timer = setTimeout(() => finish(true), RUNTIME_TIMEOUT_MS)
     worker.on("message", (message: FileOutcome | "done") => {
       if (message === "done") finish(false)
       else outcomes.set(message.file, message)
     })
-    worker.on("error", () => finish(false))
+    worker.on("error", error => {
+      workerError = error instanceof Error ? `${error.name}: ${error.message}` : String(error)
+      finish(false)
+    })
     worker.on("exit", () => finish(false))
   })
 }
@@ -534,12 +579,25 @@ export async function run(options: RunOptions = {}): Promise<Report> {
   // Read and translate the laws.
   const reading = performance.now()
   const session = options.session?._internal
-  const api = new API({ cwd })
+  const changed = config.changedFiles?.map(file => resolve(cwd, file))
+  const reuseApi = !!(session && changed?.length && session.api && session.apiCwd === cwd)
+  let api: InstanceType<typeof API>
+  if (reuseApi) {
+    api = session!.api!
+    api.clearSourceFileCache?.()
+  } else {
+    session?.api?.close()
+    api = new API({ cwd })
+    if (session) {
+      session.api = api
+      session.apiCwd = cwd
+    }
+  }
   let laws: Law[] = []
   let executable: RuntimeMap | undefined
   try {
     // TypeScript 7.1 and tsrs open projects with `createSnapshot`; 7.0 uses `updateSnapshot`.
-    const open = { openProjects: [tsconfig] }
+    const open = { openProjects: [tsconfig], ...(reuseApi && changed?.length ? { fileChanges: { changed } } : {}) }
     const snapshot = "createSnapshot" in api && typeof api.createSnapshot === "function"
       ? api.createSnapshot(open)
       : api.updateSnapshot(open)
@@ -589,7 +647,7 @@ export async function run(options: RunOptions = {}): Promise<Report> {
     }
     if (config.crossCheck !== false) executable = map
   } finally {
-    api.close()
+    if (!session) api.close()
     report.timings.typescript = Math.round(performance.now() - reading)
   }
 
@@ -734,9 +792,11 @@ export async function run(options: RunOptions = {}): Promise<Report> {
       const inputs = showInputs(instance.binders, found)
       if (obligation.kind === "expect") {
         const sides = obligation.sides
+        const flip: Record<string, string> = { ">": "<=", ">=": "<", "<": ">=", "<=": ">" }
+        const prefix = sides?.relation ? `${sides.negated ? flip[sides.relation]! : sides.relation} ` : sides?.negated ? "anything but " : ""
         entry.findings.push({
           kind: "counterexample", message: "the expectation does not hold", ...at, inputs,
-          ...(sides ? { detail: `actual:   ${showValue(sides.actual, found, sides.num)}\nexpected: ${sides.negated ? "anything but " : ""}${showValue(sides.expected, found, sides.num)}` } : {}),
+          ...(sides ? { detail: `actual:   ${showValue(sides.actual, found, sides.num)}\nexpected: ${prefix}${showValue(sides.expected, found, sides.num)}` } : {}),
         })
       } else {
         // Outside what the model describes, which is not the same as throwing: the code may well return something.
@@ -795,16 +855,36 @@ export async function run(options: RunOptions = {}): Promise<Report> {
       if (searches.some(s => s.found)) continue
       if (searches.every(s => s.exhaustive)) vacuous()
       else {
-        const checks = reaching.flatMap(({ instance, obligation }) => checksFor(instance.binders, obligation.guard, ir.FALSE, undefined))
-        vacuityChecks.push({ entry, site, law, checks })
+        try {
+          const checks = reaching.flatMap(({ instance, obligation }) => checksFor(instance.binders, obligation.guard, ir.FALSE, undefined))
+          vacuityChecks.push({ entry, site, law, checks })
+        } catch (error) {
+          if (!(error instanceof TooLarge)) throw error
+          entry.notes.push(`line ${site.line}: no input satisfying the condition was found by sampling`)
+        }
       }
     }
   }
   if (vacuityChecks.length) {
     const all = [...new Set(vacuityChecks.flatMap(v => v.checks.map(c => c.statement)))]
-    const results = await prove(lean, FAST_HEADER, all)
-    const neverTrue = new Set(all.filter((_, i) => results[i]!.ok))
-    for (const { entry, site, law, checks } of vacuityChecks) {
+    const neverTrue = new Set<string>()
+    const freshVacuity: string[] = []
+    for (const statement of all) {
+      if (proved.has(keyOf(statement))) neverTrue.add(statement)
+      else freshVacuity.push(statement)
+    }
+    if (freshVacuity.length) {
+      const vacuityStart = performance.now()
+      const results = await prove(lean, FAST_HEADER, freshVacuity)
+      report.timings.prove += Math.round(performance.now() - vacuityStart)
+      for (const [i, statement] of freshVacuity.entries()) {
+        if (results[i]!.ok) {
+          neverTrue.add(statement)
+          used.add(keyOf(statement))
+        }
+      }
+    }
+    for (const { entry, site, checks } of vacuityChecks) {
       if (checks.every(c => neverTrue.has(c.statement))) {
         entry.findings.push({ kind: "vacuous", message: "the condition guarding this expectation is never true, so it proves nothing", ...site })
       } else entry.notes.push(`line ${site.line}: no input satisfying the condition was found by sampling`)
@@ -814,13 +894,13 @@ export async function run(options: RunOptions = {}): Promise<Report> {
   // Compare the model that was proved with what the real code did.
   const executedOnly = new Map<Law, boolean>()
   if (job && execution) {
-    const { outcomes, timedOut } = await execution
+    const { outcomes, timedOut, workerError } = await execution
     for (const { file } of job.files) {
       const outcome = outcomes.get(file)
       for (const note of outcome?.rerouted ?? []) {
         report.warnings.push(`the laws ran against the files TypeScript read, which are not the ones Node would load: ${note.replaceAll(cwd + "/", "").replaceAll(cwd + "\\", "")}`)
       }
-      const reason = outcome?.error ?? (outcome ? undefined : timedOut ? `executing the laws took longer than ${RUNTIME_TIMEOUT_MS / 1000} s` : "the worker that executes laws stopped unexpectedly")
+      const reason = outcome?.error ?? (outcome ? undefined : timedOut ? `executing the laws took longer than ${RUNTIME_TIMEOUT_MS / 1000} s` : workerError ?? "the worker that executes laws stopped unexpectedly")
       if (outcome?.throws) {
         // The file itself fails when it is loaded, so nothing in it holds at run time, whatever was proved about the model.
         for (const law of candidates.filter(candidate => candidate.file === file && candidate.mode === "run")) {

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { readFileSync, watch as watchFiles } from "node:fs"
+import { existsSync, readFileSync, watch as watchFiles } from "node:fs"
 import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { parseArgs } from "node:util"
@@ -109,7 +109,7 @@ async function watch(cwd: string, once: (override?: Partial<RunOptions>) => Prom
       if (interactive) process.stdout.write("\x1b[2J\x1b[3J\x1b[H")
       if (!lawFiles) session.close()
       try {
-        await once({ session, ...(lawFiles ? { lawFiles } : {}) })
+        await once({ session, ...(lawFiles ? { lawFiles, ...(target !== "all" ? { changedFiles: [...target] } : {}) } : {}) })
       } catch (error) {
         process.stderr.write(`pudding: ${error instanceof Error ? error.message : String(error)}\n`)
       }
@@ -118,22 +118,27 @@ async function watch(cwd: string, once: (override?: Partial<RunOptions>) => Prom
     running = false
   }
   watchFiles(cwd, { recursive: true }, (event, file) => {
-    if (!file || IGNORED.test(file) || !/\.(m?ts|cts|json)$/.test(file)) return
+    if (!file || IGNORED.test(file) || !/\.(m?[jt]sx?|c[jt]s|json)$/.test(file)) return
     const full = resolve(cwd, file)
-    if (event === "rename" || file.endsWith(".json") || /pudding\.config\./.test(file) || (file.endsWith(".law.ts") && !session.affected(full)?.length)) pendingFiles = "all"
-    else if (pendingFiles !== "all") pendingFiles.add(full)
+    const tracked = (session.affected(full)?.length ?? 0) > 0
+    if (file.endsWith(".json") || /pudding\.config\./.test(file) || (event === "rename" && (!existsSync(full) || !tracked)) || (/\.law\.[mc]?[jt]sx?$/.test(file) && !tracked)) {
+      pendingFiles = "all"
+    } else if (pendingFiles !== "all") pendingFiles.add(full)
     clearTimeout(timer)
     timer = setTimeout(() => void cycle(), 60)
   })
+  const shutdown = () => {
+    session.close()
+    process.exit(0)
+  }
+  process.on("SIGINT", shutdown)
+  process.on("SIGTERM", shutdown)
   if (process.stdin.isTTY) {
     process.stdin.setRawMode(true)
     process.stdin.resume()
     process.stdin.on("data", data => {
       const key = data.toString()
-      if (key === "q" || key === "\x03") {
-        session.close()
-        process.exit(0)
-      }
+      if (key === "q" || key === "\x03") shutdown()
       if (key === "\r" || key === "\n") {
         pendingFiles = "all"
         void cycle()
