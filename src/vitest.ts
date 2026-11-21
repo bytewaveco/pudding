@@ -2,9 +2,11 @@
 // becomes a test whose result is the law's proof. Pudding runs once per file,
 // when the file's first test starts.
 
+import { readFileSync } from "node:fs"
 import { resolve } from "node:path"
-import { describe as suite, expect as vitestExpect, test } from "vitest"
+import { describe as suite, expect as vitestExpect, inject, test } from "vitest"
 import type { LawReport, Report } from "./runner.ts"
+import type { PrecomputedReport } from "./vitest-plugin.ts"
 
 export type Modifier = "run" | "skip" | "only" | "todo"
 
@@ -30,10 +32,44 @@ function root(): string {
   return worker?.config?.root ?? process.cwd()
 }
 
+function precomputed(filepath: string): Report | undefined {
+  let reportFile: string | undefined
+  try {
+    reportFile = inject("puddingReportFile" as never) as string | undefined
+  } catch {
+    return undefined
+  }
+  if (!reportFile) return undefined
+  try {
+    const data = JSON.parse(readFileSync(reportFile, "utf8")) as PrecomputedReport
+    const key = resolve(filepath)
+    const laws = data.lawsByFile[key]
+    if (!laws && !data.errors.length) return undefined
+    return {
+      ok: !data.errors.length && (laws ?? []).every(l => l.status !== "failed"),
+      laws: laws ?? [],
+      errors: data.errors,
+      warnings: [],
+      counts: { proved: 0, checked: 0, sampled: 0, failed: 0, skipped: 0, todo: 0 },
+      obligations: 0,
+      cachedObligations: 0,
+      cases: 0,
+      durationMs: 0,
+      retried: 0,
+      timings: { typescript: 0, prove: 0, retry: 0, crossCheck: 0 },
+      lean: "",
+      compiler: "",
+    }
+  } catch {
+    return undefined
+  }
+}
+
 function proofs(file: Task["file"]): Promise<Report> {
   let pending = runs.get(file)
   if (!pending) {
-    pending = import("./runner.ts").then(({ run }) => run({ cwd: root(), lawFiles: [file.filepath] }))
+    const ready = precomputed(file.filepath)
+    pending = ready ? Promise.resolve(ready) : import("./runner.ts").then(({ run }) => run({ cwd: root(), lawFiles: [file.filepath] }))
     runs.set(file, pending)
   }
   return pending
@@ -90,6 +126,11 @@ export function defineLaw(modifier: Modifier, name: string): void {
       if (entry.status === "checked") await annotate.call(context, "executed for every input, not proved")
       if (entry.status === "sampled") await annotate.call(context, "executed on sampled inputs, not proved")
       for (const note of entry.notes) await annotate.call(context, note)
+    }
+    if (entry.status === "checked" || entry.status === "sampled") {
+      const summary = entry.status === "checked" ? "executed for every input, not proved" : "executed on sampled inputs, not proved"
+      const reason = entry.notes[0] ? ` (${entry.notes[0]})` : ""
+      console.warn(`[pudding] ~ ${full}: ${summary}${reason}`)
     }
   }, TIMEOUT_MS)
 }
