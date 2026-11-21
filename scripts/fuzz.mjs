@@ -75,7 +75,15 @@ const BIGS = [-7n, -3n, -1n, 0n, 1n, 2n, 5n, 10n]
 const NUMS = [-4, -1, 0, 1, 2, 3, 7]
 const STRS = ["", "a", "b", "ab", "x:y", "é", "😀", "A b", "0"]
 
-const show = value => (typeof value === "bigint" ? `${value}n` : typeof value === "string" ? JSON.stringify(value) : String(value))
+const show = value => {
+  if (typeof value === "bigint") return `${value}n`
+  if (typeof value === "string") return JSON.stringify(value)
+  if (Array.isArray(value)) return `[${value.map(show).join(", ")}]`
+  if (value && typeof value === "object") {
+    return `{ ${Object.entries(value).filter(([, v]) => v !== undefined).map(([k, v]) => `${k}: ${show(v)}`).join(", ")} }`
+  }
+  return String(value)
+}
 /** A literal as an expression, parenthesized so a leading minus cannot bind to what comes before. */
 const literal = value => (typeof value === "bigint" || typeof value === "number" ? (value < 0 ? `(${show(value)})` : show(value)) : show(value))
 
@@ -829,32 +837,203 @@ class Generator {
     return []
   }
 
-  /** A whole program: an exported function over a small finite domain, and what it needs at module level. */
+  /** Build one scalar field/param spec (domain + optional unbounded type/range). */
+  scalarSpec(type, unbounded, maxValues = 3) {
+    const r = this.random
+    const domain = type === "bool" ? [true, false]
+      : r.sample(type === "big" ? BIGS : type === "num" ? NUMS : STRS, Math.min(maxValues, type === "str" ? 2 + r.int(2) : 2 + r.int(3)))
+    const spec = { kind: "scalar", type, domain }
+    if (unbounded && type === "big") Object.assign(spec, { written: "bigint", input: "bigint", range: [-60n, 60n] })
+    if (unbounded && type === "num") Object.assign(spec, r.chance(0.7) ? { written: "number", input: "Integer<-1000, 1000>", range: [-1000, 1000] } : { written: "number", input: "Integer<0, 9>", range: [0, 9] })
+    return spec
+  }
+
+  /** A whole program: an exported function over scalar, record, tuple, array, or tagged-union inputs. */
   program(unbounded = false) {
     const r = this.random
     const name = `f${this.index}`
-    const count = 1 + r.int(3)
     const params = []
-    for (let i = 0; i < count; i++) {
-      const type = unbounded && i === 0 ? r.pick(["big", "num"]) : r.pick(TYPES)
-      const domain = type === "bool" ? [true, false]
-        : r.sample(type === "big" ? BIGS : type === "num" ? NUMS : STRS, type === "str" ? 2 + r.int(2) : 2 + r.int(3))
-      const param = { name: `p${i}`, local: `w${i}`, type, domain }
-      if (unbounded && type === "big") Object.assign(param, { written: "bigint", input: "bigint", range: [-60n, 60n] })
-      // A range too wide to list is stated as bounds; a narrow one is listed, and stated as bounds where that is enough.
-      if (unbounded && type === "num") Object.assign(param, r.chance(0.7) ? { written: "number", input: "Integer<-1000, 1000>", range: [-1000, 1000] } : { written: "number", input: "Integer<0, 9>", range: [0, 9] })
-      params.push(param)
-    }
     const scope = new Scope(undefined, true)
     const header = []
-    for (const p of params) {
-      // The parameter keeps its literal type for table lookups; a widened copy is what the body computes with.
-      scope.names.set(p.name, { kind: "param", type: p.type })
-      scope.names.set(p.local, { kind: "var", type: p.type, mutable: false, domain: p.domain })
-      header.push(`const ${p.local}: ${TS[p.type]} = ${p.name}`)
-    }
     const module = []
-    const keyed = params.find(p => p.type === "str")
+    const structured = r.chance(0.55)
+    let paramIndex = 0
+    const nextParam = () => `p${paramIndex++}`
+
+    if (structured) {
+      const shape = r.pick(["record", "tuple", "union", "array"])
+      if (shape === "record") {
+        const tA = unbounded ? r.pick(["big", "num"]) : r.pick(TYPES)
+        const tB = r.pick(TYPES)
+        const hasOpt = r.chance(0.5)
+        const tOpt = r.pick(["big", "num", "str"])
+        const fA = this.scalarSpec(tA, unbounded, 2)
+        const fB = this.scalarSpec(tB, false, 2)
+        const fOpt = hasOpt ? this.scalarSpec(tOpt, false, 2) : undefined
+        const domain = []
+        for (const a of fA.domain) for (const b of fB.domain) {
+          if (fOpt) {
+            domain.push({ a, b })
+            for (const opt of fOpt.domain) domain.push({ a, b, opt })
+          } else domain.push({ a, b })
+        }
+        const pName = nextParam()
+        const tsType = (forInput) => {
+          const part = (f) => (forInput ? f.input : f.written) ?? f.domain.map(show).join(" | ")
+          return `{ a: ${part(fA)}; b: ${part(fB)}${fOpt ? `; opt?: ${part(fOpt)}` : ""} }`
+        }
+        const param = {
+          kind: "record", name: pName, domain,
+          written: tsType(false), input: tsType(true),
+          fields: { a: fA, b: fB, ...(fOpt ? { opt: fOpt } : {}) },
+          optional: hasOpt ? ["opt"] : [],
+        }
+        params.push(param)
+        const [va, vb] = [`w${this.counter++}`, `w${this.counter++}`]
+        if (r.chance(0.55)) {
+          const [da, db] = [`d${this.counter++}`, `d${this.counter++}`]
+          if (fOpt) {
+            const [dOpt, vOpt] = [`d${this.counter++}`, `w${this.counter++}`]
+            header.push(
+              `const { a: ${da}, b: ${db}, opt: ${dOpt} = ${literal(this.value(tOpt))} } = ${pName}`,
+              `const ${va}: ${TS[tA]} = ${da}`,
+              `const ${vb}: ${TS[tB]} = ${db}`,
+              `const ${vOpt}: ${TS[tOpt]} = ${dOpt}`,
+            )
+            scope.names.set(vOpt, { kind: "var", type: tOpt, mutable: false })
+          } else {
+            header.push(
+              `const { a: ${da}, b: ${db} } = ${pName}`,
+              `const ${va}: ${TS[tA]} = ${da}`,
+              `const ${vb}: ${TS[tB]} = ${db}`,
+            )
+          }
+        } else {
+          header.push(`const ${va}: ${TS[tA]} = ${pName}.a`, `const ${vb}: ${TS[tB]} = ${pName}.b`)
+          if (fOpt) {
+            const vOpt = `w${this.counter++}`
+            header.push(`const ${vOpt}: ${TS[tOpt]} = ${pName}.opt ?? ${literal(this.value(tOpt))}`)
+            scope.names.set(vOpt, { kind: "var", type: tOpt, mutable: false })
+          }
+        }
+        scope.names.set(va, { kind: "var", type: tA, mutable: false, domain: fA.domain })
+        scope.names.set(vb, { kind: "var", type: tB, mutable: false, domain: fB.domain })
+        // Lookup table indexed by a record string field.
+        if (tB === "str" && r.chance(0.7)) {
+          const valType = r.pick(TYPES)
+          const entries = fB.domain.map(key => `${JSON.stringify(key)}: ${show(this.value(valType))}`)
+          module.push(`const TR${this.index}: Record<${fB.domain.map(k => JSON.stringify(k)).join(" | ")}, ${TS[valType]}> = { ${entries.join(", ")} }`)
+          const vt = `w${this.counter++}`
+          header.push(`const ${vt}: ${TS[valType]} = TR${this.index}[${pName}.b]`)
+          scope.names.set(vt, { kind: "var", type: valType, mutable: false })
+        }
+      } else if (shape === "tuple") {
+        const t0 = unbounded ? r.pick(["big", "num"]) : r.pick(TYPES)
+        const t1 = r.pick(TYPES)
+        const s0 = this.scalarSpec(t0, unbounded, 2)
+        const s1 = this.scalarSpec(t1, false, 2)
+        const domain = []
+        for (const v0 of s0.domain) for (const v1 of s1.domain) domain.push([v0, v1])
+        const pName = nextParam()
+        const tsType = (forInput) => `[${(forInput ? s0.input : s0.written) ?? s0.domain.map(show).join(" | ")}, ${(forInput ? s1.input : s1.written) ?? s1.domain.map(show).join(" | ")}]`
+        params.push({ kind: "tuple", name: pName, domain, written: tsType(false), input: tsType(true), items: [s0, s1] })
+        const [v0, v1] = [`w${this.counter++}`, `w${this.counter++}`]
+        if (r.chance(0.6)) {
+          const [d0, d1] = [`d${this.counter++}`, `d${this.counter++}`]
+          header.push(`const [${d0}, ${d1}] = ${pName}`, `const ${v0}: ${TS[t0]} = ${d0}`, `const ${v1}: ${TS[t1]} = ${d1}`)
+        } else header.push(`const ${v0}: ${TS[t0]} = ${pName}[0]`, `const ${v1}: ${TS[t1]} = ${pName}[1]`)
+        scope.names.set(v0, { kind: "var", type: t0, mutable: false, domain: s0.domain })
+        scope.names.set(v1, { kind: "var", type: t1, mutable: false, domain: s1.domain })
+      } else if (shape === "array") {
+        const elemType = unbounded ? r.pick(["big", "num"]) : r.pick(["big", "num", "str"])
+        const s = this.scalarSpec(elemType, unbounded, 2)
+        const len = 2 + r.int(2)
+        const items = Array.from({ length: len }, (_, k) => (k === 0 ? s : this.scalarSpec(elemType, unbounded && r.chance(0.5), 2)))
+        const domain = items.reduce((rows, item) => rows.flatMap(row => item.domain.map(v => [...row, v])), [[]])
+        const pName = nextParam()
+        const tsType = (forInput) => `[${items.map(it => (forInput ? it.input : it.written) ?? it.domain.map(show).join(" | ")).join(", ")}]`
+        params.push({ kind: "tuple", name: pName, domain, written: tsType(false), input: tsType(true), items })
+        // Exercise array callback methods (map, filter, some, every, reduce) directly on the input array.
+        const pivot = literal(r.pick(items[0].domain))
+        if (elemType === "big" || elemType === "num") {
+          const zero = elemType === "big" ? "0n" : "0"
+          const one = elemType === "big" ? "1n" : "1"
+          const [vMap, vFilt, vAny, vAll] = [`w${this.counter++}`, `w${this.counter++}`, `w${this.counter++}`, `w${this.counter++}`]
+          header.push(
+            `const ${vMap}: ${TS[elemType]} = ${pName}.map(x => x + ${one}).reduce((acc, x) => acc + x, ${zero})`,
+            `const ${vFilt}: number = ${pName}.filter(x => (x as ${TS[elemType]}) >= ${pivot}).length`,
+            `const ${vAny}: boolean = ${pName}.some(x => (x as ${TS[elemType]}) === ${pivot})`,
+            `const ${vAll}: boolean = ${pName}.every(x => (x as ${TS[elemType]}) !== ${pivot})`,
+          )
+          scope.names.set(vMap, { kind: "var", type: elemType, mutable: false })
+          scope.names.set(vFilt, { kind: "var", type: "num", mutable: false })
+          scope.names.set(vAny, { kind: "var", type: "bool", mutable: false })
+          scope.names.set(vAll, { kind: "var", type: "bool", mutable: false })
+        } else {
+          const [vMap, vFilt, vAny, vAll] = [`w${this.counter++}`, `w${this.counter++}`, `w${this.counter++}`, `w${this.counter++}`]
+          header.push(
+            `const ${vMap}: string = ${pName}.map(x => x + ":").reduce((acc, x) => acc + x, "")`,
+            `const ${vFilt}: number = ${pName}.filter(x => (x as string) !== ${pivot}).length`,
+            `const ${vAny}: boolean = ${pName}.some(x => (x as string) === ${pivot})`,
+            `const ${vAll}: boolean = ${pName}.every(x => (x as string) !== ${pivot})`,
+          )
+          scope.names.set(vMap, { kind: "var", type: "str", mutable: false })
+          scope.names.set(vFilt, { kind: "var", type: "num", mutable: false })
+          scope.names.set(vAny, { kind: "var", type: "bool", mutable: false })
+          scope.names.set(vAll, { kind: "var", type: "bool", mutable: false })
+        }
+      } else {
+        // Tagged union with `switch` on the tag.
+        const tVal = unbounded ? r.pick(["big", "num"]) : r.pick(["big", "num"])
+        const sA = this.scalarSpec(tVal, unbounded, 2)
+        const sB = this.scalarSpec(tVal, unbounded, 2)
+        const sC = this.scalarSpec("bool", false, 2)
+        const domain = [
+          ...sA.domain.map(x => ({ tag: "one", x })),
+          ...sA.domain.flatMap(x => sB.domain.map(y => ({ tag: "pair", x, y }))),
+          ...sC.domain.map(flag => ({ tag: "flag", flag })),
+        ]
+        const pName = nextParam()
+        const part = (s, forInput) => (forInput ? s.input : s.written) ?? s.domain.map(show).join(" | ")
+        const tsType = (forInput) =>
+          `{ tag: "one"; x: ${part(sA, forInput)} } | { tag: "pair"; x: ${part(sA, forInput)}; y: ${part(sB, forInput)} } | { tag: "flag"; flag: boolean }`
+        params.push({
+          kind: "union", name: pName, domain,
+          written: tsType(false), input: tsType(true),
+          variants: [
+            { tag: "one", fields: { x: sA } },
+            { tag: "pair", fields: { x: sA, y: sB } },
+            { tag: "flag", fields: { flag: sC } },
+          ],
+        })
+        const vOut = `w${this.counter++}`
+        const zero = tVal === "big" ? "0n" : "0"
+        const one = tVal === "big" ? "1n" : "1"
+        header.push(
+          `let ${vOut}: ${TS[tVal]} = ${zero}`,
+          `switch (${pName}.tag) {`,
+          `  case "one": ${vOut} = ${pName}.x; break`,
+          `  case "pair": ${vOut} = ${pName}.x + ${pName}.y; break`,
+          `  case "flag": ${vOut} = ${pName}.flag ? ${one} : ${zero}; break`,
+          `}`,
+        )
+        scope.names.set(vOut, { kind: "var", type: tVal, mutable: true })
+      }
+    }
+
+    const extraScalars = structured ? (r.chance(0.55) ? 1 : 0) : 1 + r.int(3)
+    for (let i = 0; i < extraScalars; i++) {
+      const type = !structured && unbounded && i === 0 ? r.pick(["big", "num"]) : r.pick(TYPES)
+      const spec = this.scalarSpec(type, unbounded, structured ? 2 : 3)
+      const pName = nextParam()
+      const local = `w${this.counter++}`
+      params.push({ ...spec, name: pName, local })
+      scope.names.set(pName, { kind: "param", type })
+      scope.names.set(local, { kind: "var", type, mutable: false, domain: spec.domain })
+      header.push(`const ${local}: ${TS[type]} = ${pName}`)
+    }
+
+    const keyed = params.find(p => p.kind === "scalar" && p.type === "str")
     if (keyed && r.chance(0.6)) {
       const type = r.pick(TYPES)
       const list = r.chance(0.4)
@@ -903,7 +1082,22 @@ function mutate(program, random) {
 
 /** Inputs to compare a function with its mutant on, when its inputs cannot all be listed. */
 function sampleInputs(params, random, count) {
-  const one = p => {
+  const sampleSpec = p => {
+    if (p.kind === "record") {
+      const out = {}
+      for (const [k, spec] of Object.entries(p.fields)) {
+        if (p.optional?.includes(k) && random.chance(0.35)) continue
+        out[k] = sampleSpec(spec)
+      }
+      return out
+    }
+    if (p.kind === "tuple") return p.items.map(sampleSpec)
+    if (p.kind === "union") {
+      const v = random.pick(p.variants)
+      const out = { tag: v.tag }
+      for (const [k, spec] of Object.entries(v.fields)) out[k] = sampleSpec(spec)
+      return out
+    }
     if (!p.range) return random.pick(p.domain)
     const [low, high] = p.range
     const span = Number(high) - Number(low) + 1
@@ -911,7 +1105,7 @@ function sampleInputs(params, random, count) {
     const inside = Math.min(Number(high), Math.max(Number(low), value))
     return p.type === "big" ? BigInt(inside) : inside
   }
-  return Array.from({ length: count }, () => params.map(one))
+  return Array.from({ length: count }, () => params.map(sampleSpec))
 }
 
 // ------------------------------------------------------------------ oracle
@@ -933,6 +1127,25 @@ function truthOf(fn, params) {
   })
 }
 
+function matchExpr(expr, param, value) {
+  if (param.kind === "record") {
+    const parts = Object.entries(param.fields).map(([k, spec]) =>
+      value[k] === undefined ? `${expr}.${k} === undefined` : matchExpr(`${expr}.${k}`, spec, value[k]),
+    )
+    return `(${parts.join(" && ")})`
+  }
+  if (param.kind === "tuple") {
+    return `(${param.items.map((spec, idx) => matchExpr(`${expr}[${idx}]`, spec, value[idx])).join(" && ")})`
+  }
+  if (param.kind === "union") {
+    const variant = param.variants.find(v => v.tag === value.tag)
+    const parts = [`${expr}.tag === ${JSON.stringify(value.tag)}`]
+    for (const [k, spec] of Object.entries(variant.fields)) parts.push(matchExpr(`${expr}.${k}`, spec, value[k]))
+    return `(${parts.join(" && ")})`
+  }
+  return `(${expr} as ${TS[param.type]}) === ${literal(value)}`
+}
+
 function lawSource(program, truth, wrongAt) {
   const names = program.params.map((_, i) => `a${i}`)
   const type = TS[program.returns]
@@ -943,11 +1156,11 @@ function lawSource(program, truth, wrongAt) {
       : entry.value
     return literal(value)
   }
-  const when = entry => entry.input.map((value, i) => `(${names[i]} as ${TS[program.params[i].type]}) === ${literal(value)}`).join(" && ")
+  const when = entry => entry.input.map((value, i) => matchExpr(names[i], program.params[i], value)).join(" && ")
   const chain = truth.slice(0, -1).map((entry, i) => `${when(entry)} ? (${expected(entry, i)} as ${type})`).join("\n      : ")
   const last = `(${expected(truth.at(-1), truth.length - 1)} as ${type})`
   const table = truth.length > 1 ? `${chain}\n      : ${last}` : last
-  const domain = program.params.map(p => p.domain.map(show).join(" | ")).join(", ")
+  const domain = program.params.map(p => p.input ?? p.domain.map(show).join(" | ")).join(", ")
   return `law("${wrongAt === undefined ? "A" : "B"} ${program.name}", domain<[${domain}]>(), ([${names.join(", ")}]) => {
   expect<${type}>(${program.name}(${names.join(", ")})).toEqual(
     ${table},
