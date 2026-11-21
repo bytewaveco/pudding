@@ -86,6 +86,12 @@ export interface Law {
 type Value =
   /** `num` marks an integer expression that stands for a `number` rather than a bigint. */
   | { k: "scalar"; e: Expr; num?: boolean }
+  /** An exact IEEE-754 dyadic rational `num / 2^shift` (`1 <= shift <= MAX_DYADIC_SHIFT`, `num` within safe integer bounds). */
+  | { k: "rat"; num: Expr; shift: number }
+  /** A single IEEE-754 division `fl(num / den)` of two safe integers (`den !== 0`). */
+  | { k: "quot"; num: Expr; den: Expr }
+  /** A known finite non-dyadic IEEE-754 double (e.g. `0.05`, `0.1`, `1.08`). */
+  | { k: "float"; value: number }
   /** `unordered` marks a record from a law input whose property order is not fixed by its type. */
   | { k: "record"; fields: Map<string, Value>; own?: Ownership; unordered?: boolean }
   | { k: "array"; items: Value[]; own?: Ownership }
@@ -252,6 +258,30 @@ function tables() {
 }
 const scalar = (e: Expr, num = false): Value => (num ? { k: "scalar", e, num } : { k: "scalar", e })
 const isNumber = (value: Value) => value.k === "scalar" && value.num === true
+const isNumeric = (value: Value) => isNumber(value) || value.k === "rat" || value.k === "quot" || value.k === "float"
+/** Maximum binary fractional scale (2^-10 = 1/1024) kept as an exact dyadic rational. */
+const MAX_DYADIC_SHIFT = 10
+/** Decompose a finite non-integer JS number as `num / 2^shift` if exact within `MAX_DYADIC_SHIFT`. */
+function dyadicOf(value: number): { num: bigint; shift: number } | undefined {
+  if (!Number.isFinite(value) || Number.isSafeInteger(value)) return undefined
+  for (let shift = 1; shift <= MAX_DYADIC_SHIFT; shift++) {
+    const scale = 2 ** shift
+    const scaled = value * scale
+    if (Number.isSafeInteger(scaled) && scaled / scale === value) return { num: BigInt(scaled), shift }
+  }
+  return undefined
+}
+/** If `d` is `±2^k` with `0 <= k <= MAX_DYADIC_SHIFT`, return `{ sign, shift }`. */
+function pow2Of(d: bigint): { negative: boolean; shift: number } | undefined {
+  if (d === 0n) return undefined
+  const negative = d < 0n
+  const mag = negative ? -d : d
+  if ((mag & (mag - 1n)) !== 0n) return undefined
+  let shift = 0
+  let v = mag
+  while (v > 1n) { v >>= 1n; shift++ }
+  return shift <= MAX_DYADIC_SHIFT ? { negative, shift } : undefined
+}
 /** Integer inputs with at most this many values are enumerated instead of quantified. */
 const MAX_ENUMERATED_RANGE = 256n
 const MAX_ITERATIONS = 2_000
@@ -305,6 +335,9 @@ function sourceText(node: Node): string {
 function describe(value: Value): string {
   switch (value.k) {
     case "scalar": return value.num ? "a number" : { bool: "a boolean", int: "a bigint", str: "a string" }[value.e.ty]
+    case "rat":
+    case "quot":
+    case "float": return "a number"
     case "record": return "an object"
     case "array": return "an array"
     case "closure": return "a function"
@@ -1315,6 +1348,8 @@ export class Translator {
     if (a.k === "bottom") return b
     if (b.k === "bottom") return a
     if (a.k === "scalar" && b.k === "scalar" && a.e.ty === b.e.ty && !!a.num === !!b.num) return scalar(ir.ite(cond, a.e, b.e), a.num)
+    if (a.k === "rat" && b.k === "rat" && a.shift === b.shift) return { k: "rat", num: ir.ite(cond, a.num, b.num), shift: a.shift }
+    if (a.k === "float" && b.k === "float" && a.value === b.value) return a
     if (a.k === "closure" && b.k === "closure" && a.node === b.node && a.env === b.env) return a
     if (a.k === "void" && b.k === "void") return a
     if (a.k === "null" && b.k === "null") return a
@@ -1333,6 +1368,8 @@ export class Translator {
     if (a.k === "bottom") return b
     if (b.k === "bottom") return a
     if (a.k === "scalar" && b.k === "scalar" && a.e.ty === b.e.ty && !!a.num === !!b.num) return scalar(ir.ite(cond, a.e, b.e), a.num)
+    if (a.k === "rat" && b.k === "rat" && a.shift === b.shift) return { k: "rat", num: ir.ite(cond, a.num, b.num), shift: a.shift }
+    if (a.k === "float" && b.k === "float" && a.value === b.value) return a
     // Two objects merged field by field give a third that is neither of them,
     // holding what they hold now. That stays true only while none of the three
     // changes, so all three lose the right to be changed in place.
@@ -1893,11 +1930,11 @@ export class Translator {
       const place = this.place(node.operand, env)
       if (place) {
         const old = place.read()
-        place.store(this.arithmetic(node.operator === K.PlusPlusToken ? K.PlusToken : K.MinusToken, old, scalar(ir.lit(1n), isNumber(old)), node))
+        place.store(this.arithmetic(node.operator === K.PlusPlusToken ? K.PlusToken : K.MinusToken, old, scalar(ir.lit(1n), isNumeric(old)), node))
         return
       }
       const cell = this.assignable(node.operand, env)
-      const one = scalar(ir.lit(1n), isNumber(cell.value))
+      const one = scalar(ir.lit(1n), isNumeric(cell.value))
       cell.value = this.arithmetic(node.operator === K.PlusPlusToken ? K.PlusToken : K.MinusToken, cell.value, one, node)
       this.assignedTo?.add(cell)
       return
@@ -1995,6 +2032,9 @@ export class Translator {
     value = this.settled(value)
     switch (value.k) {
       case "scalar": return value.e.ty === "bool" ? value.e : ir.not(ir.eq(value.e, ir.lit(value.e.ty === "int" ? 0n : "")))
+      case "rat":
+      case "quot": return ir.not(ir.eq(value.num, ir.lit(0n)))
+      case "float": return ir.lit(value.value !== 0)
       case "void":
       case "null": return ir.FALSE
       case "record":
@@ -2036,7 +2076,10 @@ export class Translator {
         case "set":
         case "iterator": return scalar(ir.lit("object"))
         case "closure": return scalar(ir.lit("function"))
-        case "infinite": return scalar(ir.lit("number"))
+        case "infinite":
+        case "rat":
+        case "quot":
+        case "float": return scalar(ir.lit("number"))
         case "scalar": return scalar(ir.lit(part.num ? "number" : { bool: "boolean", int: "bigint", str: "string" }[part.e.ty]))
         default: throw new Unsupported(`typeof ${describe(part)} is not supported`, at)
       }
@@ -2084,8 +2127,8 @@ export class Translator {
       case K.BigIntLiteral: return this.note(ir.lit(BigInt(node.text.replace(/n$/, "").replaceAll("_", ""))))
       case K.NumericLiteral: {
         const value = Number(node.text)
-        if (!Number.isSafeInteger(value)) throw new Unsupported("only whole numbers up to 2^53 - 1 are modeled; fractions and larger numbers are not", node)
-        return this.note(ir.lit(BigInt(value)), true)
+        if (!Number.isFinite(value)) throw new Unsupported("numbers outside the finite double range are not modeled", node)
+        return this.fromJsNumber(value, node, true)
       }
       case K.Identifier: return this.read(node, env)
       case K.ArrowFunction:
@@ -2099,16 +2142,21 @@ export class Translator {
           return operand.k === "bottom" ? BOTTOM : scalar(ir.not(this.truthy(operand, node.operand)))
         }
         if (node.operator === K.PlusToken) {
-          const operand = this.evalExpr(node.operand, env)
-          if (operand.k === "bottom") return BOTTOM
-          if (operand.k === "infinite" || isNumber(operand)) return operand
-          throw new Unsupported(`unary \`+\` is modeled for numbers, but this is ${describe(operand)}`, node)
+          return this.over(this.evalExpr(node.operand, env), operand => {
+            if (operand.k === "bottom") return BOTTOM
+            if (operand.k === "infinite" || isNumeric(operand)) return operand
+            throw new Unsupported(`unary \`+\` is modeled for numbers, but this is ${describe(operand)}`, node)
+          })
         }
         if (node.operator === K.MinusToken) {
-          const operand = this.evalExpr(node.operand, env)
-          if (operand.k === "bottom") return BOTTOM
-          if (operand.k === "infinite") return { k: "infinite", negative: !operand.negative }
-          return scalar(ir.neg(this.scalarOf(operand, node.operand, "int")), isNumber(operand))
+          return this.over(this.evalExpr(node.operand, env), operand => {
+            if (operand.k === "bottom") return BOTTOM
+            if (operand.k === "infinite") return { k: "infinite", negative: !operand.negative }
+            if (operand.k === "rat") return { k: "rat", num: ir.neg(operand.num), shift: operand.shift }
+            if (operand.k === "quot") return { k: "quot", num: ir.neg(operand.num), den: operand.den }
+            if (operand.k === "float") return this.fromJsNumber(-operand.value, node)
+            return scalar(ir.neg(this.scalarOf(operand, node.operand, "int")), isNumber(operand))
+          })
         }
         throw new Unsupported("this operator is not supported", node)
       }
@@ -2306,6 +2354,8 @@ export class Translator {
       if (a.k === "infinite" && b.k === "infinite") return ir.lit(a.negative === b.negative)
       return this.isPlain(a) && this.isPlain(b) ? ir.FALSE : this.refuseEquality(a, b, at)
     }
+    if (isNumeric(a) && isNumeric(b)) return this.compareNumeric(K.EqualsEqualsEqualsToken, a, b, at)
+    if (isNumeric(a) || isNumeric(b)) return this.isPlain(a) && this.isPlain(b) ? ir.FALSE : this.refuseEquality(a, b, at)
     if (a.k !== "scalar" || b.k !== "scalar") return this.refuseEquality(a, b, at)
     return a.e.ty === b.e.ty && !!a.num === !!b.num ? ir.eq(a.e, b.e) : ir.FALSE
   }
@@ -2328,7 +2378,7 @@ export class Translator {
   }
 
   private isPlain(value: Value): boolean {
-    return value.k === "scalar" || value.k === "void" || value.k === "null" || value.k === "infinite"
+    return value.k === "scalar" || value.k === "rat" || value.k === "quot" || value.k === "float" || value.k === "void" || value.k === "null" || value.k === "infinite"
   }
 
   private refuseEquality(a: Value, b: Value, at: Node): never {
@@ -2347,7 +2397,10 @@ export class Translator {
         if (operator === K.QuestionQuestionToken) return left.k === "void" || left.k === "null" ? right() : left
         const taken = this.truthy(left, node.left)
         // Where a boolean, a number or a string did not pass, which value it holds is known.
-        const known = (value: boolean) => (left.k !== "scalar" ? left : left.e.ty === "bool" ? scalar(ir.lit(value)) : value ? left : scalar(ir.lit(left.e.ty === "int" ? 0n : ""), left.num))
+        const known = (value: boolean) =>
+          left.k === "scalar" ? (left.e.ty === "bool" ? scalar(ir.lit(value)) : value ? left : scalar(ir.lit(left.e.ty === "int" ? 0n : ""), left.num))
+          : left.k === "rat" || left.k === "quot" || left.k === "float" ? (value ? left : scalar(ir.lit(0n), true))
+          : left
         return operator === K.AmpersandAmpersandToken ? this.branch(taken, right, () => known(false)) : this.branch(taken, () => known(true), right)
       })
     }
@@ -2395,6 +2448,153 @@ export class Translator {
     return this.arithmetic(operator, leftValue, rightValue, node)
   }
 
+  /** Turn a finite JS double into the sharpest exact model value: whole `scalar`, dyadic `rat`, or known `float`. */
+  private fromJsNumber(value: number, node: Node, note = false): Value {
+    if (Number.isSafeInteger(value)) {
+      const lit = ir.lit(BigInt(value))
+      return note ? this.note(lit, true) : scalar(lit, true)
+    }
+    const dyadic = dyadicOf(value)
+    if (dyadic) return { k: "rat", num: ir.lit(dyadic.num), shift: dyadic.shift }
+    return { k: "float", value }
+  }
+
+  /** Normalize `num / 2^shift` by cancelling factors of 2, checking safe-integer precision, and demoting `shift === 0` to a whole number. */
+  private makeRat(num: Expr, shift: number, node: Node): Value {
+    if (num.t === "lit") {
+      let n = num.value as bigint
+      while (shift > 0 && (n & 1n) === 0n) { n >>= 1n; shift-- }
+      num = ir.lit(n)
+    } else {
+      while (shift > 0 && num.t === "op" && num.op === "mul" && num.args[1]!.t === "lit" && ((num.args[1]!.value as bigint) & 1n) === 0n) {
+        const half = (num.args[1]!.value as bigint) >> 1n
+        num = ir.mul(num.args[0]!, ir.lit(half))
+        shift--
+      }
+    }
+    if (shift === 0) {
+      this.emit("overflow", ir.isSafe(num), node)
+      return scalar(num, true)
+    }
+    if (shift > MAX_DYADIC_SHIFT) {
+      if (num.t === "lit") {
+        const v = Number(num.value as bigint) / (2 ** shift)
+        if (!Number.isFinite(v)) {
+          this.emit("overflow", ir.FALSE, node)
+          return BOTTOM
+        }
+        return this.fromJsNumber(v, node)
+      }
+      throw new Unsupported("fractional binary precision past 2^-10 is not modeled unless the values are known here", node)
+    }
+    this.emit("overflow", ir.isSafe(num), node)
+    return { k: "rat", num, shift }
+  }
+
+  /** The concrete JS number a numeric value holds if it is already known without splitting. */
+  private knownNumber(value: Value): number | undefined {
+    if (value.k === "float") return value.value
+    if (value.k === "scalar" && value.num && value.e.t === "lit") return Number(value.e.value)
+    if (value.k === "rat" && value.num.t === "lit") return Number(value.num.value) / (2 ** value.shift)
+    if (value.k === "quot" && value.num.t === "lit" && value.den.t === "lit" && value.den.value !== 0n) {
+      return Number(value.num.value) / Number(value.den.value)
+    }
+    return undefined
+  }
+
+  /** Settle a numeric value to a concrete JS number, splitting a small finite input if needed. */
+  private settleNumber(value: Value, refusal: () => Unsupported): number {
+    if (value.k === "float") return value.value
+    if (value.k === "scalar" && value.num) return Number(this.settle(value.e, refusal).value)
+    if (value.k === "rat") return Number(this.settle(value.num, refusal).value) / (2 ** value.shift)
+    if (value.k === "quot") {
+      const n = Number(this.settle(value.num, refusal).value)
+      const d = Number(this.settle(value.den, refusal).value)
+      return n / d
+    }
+    throw refusal()
+  }
+
+  /** Exact comparison (`===`, `<`, `<=`, `>`, `>=`) between two modeled finite numbers. */
+  private compareNumeric(op: number, left: Value, right: Value, node: Node): Expr {
+    const lk = this.knownNumber(left)
+    const rk = this.knownNumber(right)
+    if (lk !== undefined && rk !== undefined) {
+      return ir.lit(
+        op === K.EqualsEqualsEqualsToken ? lk === rk
+        : op === K.LessThanToken ? lk < rk
+        : op === K.LessThanEqualsToken ? lk <= rk
+        : op === K.GreaterThanToken ? lk > rk
+        : lk >= rk,
+      )
+    }
+    const cmpInt = (a: Expr, b: Expr, operator: number): Expr =>
+      operator === K.EqualsEqualsEqualsToken ? ir.eq(a, b)
+      : operator === K.LessThanToken ? ir.lt(a, b)
+      : operator === K.LessThanEqualsToken ? ir.le(a, b)
+      : operator === K.GreaterThanToken ? ir.lt(b, a)
+      : ir.le(b, a)
+    const flip = (operator: number): number =>
+      operator === K.LessThanToken ? K.GreaterThanToken
+      : operator === K.LessThanEqualsToken ? K.GreaterThanEqualsToken
+      : operator === K.GreaterThanToken ? K.LessThanToken
+      : operator === K.GreaterThanEqualsToken ? K.LessThanEqualsToken
+      : operator
+    // Whole numbers and dyadic rationals: align binary denominators.
+    if ((isNumber(left) || left.k === "rat") && (isNumber(right) || right.k === "rat")) {
+      const n1 = left.k === "rat" ? left.num : (left as Extract<Value, { k: "scalar" }>).e
+      const s1 = left.k === "rat" ? left.shift : 0
+      const n2 = right.k === "rat" ? right.num : (right as Extract<Value, { k: "scalar" }>).e
+      const s2 = right.k === "rat" ? right.shift : 0
+      const s = Math.max(s1, s2)
+      const a = s > s1 ? ir.mul(n1, ir.lit(2n ** BigInt(s - s1))) : n1
+      const b = s > s2 ? ir.mul(n2, ir.lit(2n ** BigInt(s - s2))) : n2
+      return cmpInt(a, b, op)
+    }
+    // Single quotient `fl(a / b)` vs whole safe integer `c`: exact in IEEE-754 binary64 for all safe integers.
+    if ((left.k === "quot" && isNumber(right)) || (isNumber(left) && right.k === "quot")) {
+      const q = (left.k === "quot" ? left : right) as Extract<Value, { k: "quot" }>
+      const c = ((left.k === "quot" ? right : left) as Extract<Value, { k: "scalar" }>).e
+      const o = left.k === "quot" ? op : flip(op)
+      const rhs = ir.mul(q.den, c)
+      if (o === K.EqualsEqualsEqualsToken) return ir.eq(q.num, rhs)
+      return ir.ite(ir.lt(ir.lit(0n), q.den), cmpInt(q.num, rhs, o), cmpInt(q.num, rhs, flip(o)))
+    }
+    if (left.k === "quot" && right.k === "quot") {
+      if (op === K.EqualsEqualsEqualsToken && ir.same(left.num, right.num) && ir.same(left.den, right.den)) return ir.TRUE
+      const refusal = () => new Unsupported("comparing two divisions can depend on floating-point rounding, which is not modeled unless their values are known here", node)
+      const a = this.settleNumber(left, refusal)
+      const b = this.settleNumber(right, refusal)
+      return ir.lit(op === K.EqualsEqualsEqualsToken ? a === b : op === K.LessThanToken ? a < b : op === K.LessThanEqualsToken ? a <= b : op === K.GreaterThanToken ? a > b : a >= b)
+    }
+    // Whole number or dyadic rational vs known finite float: scale by 2^shift (exact exponent shift) and compare integer against double.
+    if ((left.k === "float" && (isNumber(right) || right.k === "rat")) || ((isNumber(left) || left.k === "rat") && right.k === "float")) {
+      const f = (left.k === "float" ? left : right) as Extract<Value, { k: "float" }>
+      const other = left.k === "float" ? right : left
+      const o = left.k === "float" ? flip(op) : op
+      const x = other.k === "rat" ? other.num : (other as Extract<Value, { k: "scalar" }>).e
+      const shift = other.k === "rat" ? other.shift : 0
+      const scaled = f.value * (2 ** shift)
+      if (!Number.isFinite(scaled)) {
+        if (o === K.EqualsEqualsEqualsToken) return ir.FALSE
+        return ir.lit(o === K.LessThanToken || o === K.LessThanEqualsToken ? scaled > 0 : scaled < 0)
+      }
+      if (Number.isSafeInteger(scaled)) return cmpInt(x, ir.lit(BigInt(scaled)), o)
+      if (!Number.isInteger(scaled)) {
+        if (o === K.EqualsEqualsEqualsToken) return ir.FALSE
+        if (o === K.LessThanToken || o === K.LessThanEqualsToken) return ir.le(x, ir.lit(BigInt(Math.floor(scaled))))
+        return ir.le(ir.lit(BigInt(Math.ceil(scaled))), x)
+      }
+      // `scaled` is an integer outside `[-MAX_SAFE, MAX_SAFE]`, while `x` is a safe integer.
+      if (o === K.EqualsEqualsEqualsToken) return ir.FALSE
+      return ir.lit(o === K.LessThanToken || o === K.LessThanEqualsToken ? scaled > 0 : scaled < 0)
+    }
+    const refusal = () => new Unsupported("comparing a division with a fraction can depend on floating-point rounding, which is not modeled unless the values are known here", node)
+    const a = this.settleNumber(left, refusal)
+    const b = this.settleNumber(right, refusal)
+    return ir.lit(op === K.EqualsEqualsEqualsToken ? a === b : op === K.LessThanToken ? a < b : op === K.LessThanEqualsToken ? a <= b : op === K.GreaterThanToken ? a > b : a >= b)
+  }
+
   /** `+ - * / %` and the comparisons, on values already evaluated. */
   private arithmetic(operator: number, leftValue: Value, rightValue: Value, node: N): Value {
     // A side that is one kind of value or another, such as a number or undefined, is taken case by case.
@@ -2404,7 +2604,7 @@ export class Translator {
     if (leftValue.k === "bottom" || rightValue.k === "bottom") return BOTTOM
     if (leftValue.k === "infinite" || rightValue.k === "infinite") {
       // Infinity is above every number and -Infinity below, which settles a comparison outright.
-      const rank = (value: Value) => (value.k === "infinite" ? (value.negative ? -1 : 1) : isNumber(value) ? 0 : undefined)
+      const rank = (value: Value) => (value.k === "infinite" ? (value.negative ? -1 : 1) : isNumeric(value) ? 0 : undefined)
       const left = rank(leftValue)
       const right = rank(rightValue)
       const result = left === undefined || right === undefined ? undefined
@@ -2416,6 +2616,15 @@ export class Translator {
     if (operator === K.PlusToken && leftValue.k === "scalar" && rightValue.k === "scalar" && leftValue.e.ty === "str" && rightValue.e.ty === "str") {
       return scalar(ir.concat(leftValue.e, rightValue.e))
     }
+    const isComparison = operator === K.LessThanToken || operator === K.LessThanEqualsToken || operator === K.GreaterThanToken || operator === K.GreaterThanEqualsToken
+    if (isNumeric(leftValue) || isNumeric(rightValue)) {
+      if (!isNumeric(leftValue) || !isNumeric(rightValue)) throw new Unsupported(`cannot combine ${describe(leftValue)} with ${describe(rightValue)}`, node)
+      if (isComparison) return scalar(this.compareNumeric(operator, leftValue, rightValue, node))
+      // Fractional arithmetic (dyadic rationals, single quotients, or known floats).
+      if (leftValue.k !== "scalar" || rightValue.k !== "scalar" || operator === K.SlashToken) {
+        return this.fractionalArithmetic(operator, leftValue, rightValue, node)
+      }
+    }
     const left = this.scalarOf(leftValue, node.left ?? node, "int")
     const right = this.scalarOf(rightValue, node.right ?? node, "int")
     if (isNumber(leftValue) !== isNumber(rightValue)) throw new Unsupported(`cannot combine ${describe(leftValue)} with ${describe(rightValue)}`, node)
@@ -2426,7 +2635,17 @@ export class Translator {
           this.emit("unreachable", ir.FALSE, node)
           return BOTTOM
         }
-        throw new Unsupported("negative exponents on numbers can give a fraction, which is not modeled", node)
+        const base = Number(this.settle(left, () => new Unsupported("negative exponents on numbers require values known here", node)).value)
+        if (base === 0) {
+          this.emit("nan", ir.FALSE, node)
+          return BOTTOM
+        }
+        const res = base ** Number(exp)
+        if (!Number.isFinite(res)) {
+          this.emit("overflow", ir.FALSE, node)
+          return BOTTOM
+        }
+        return this.fromJsNumber(res, node)
       }
       const num = isNumber(leftValue)
       const exactNum = (result: Expr) => {
@@ -2459,8 +2678,6 @@ export class Translator {
         case K.PercentToken:
           this.emit("nan", ir.not(ir.eq(right, ir.lit(0n))), node)
           return scalar(ir.mod(left, right), true)
-        case K.SlashToken:
-          throw new Unsupported("dividing numbers can give a fraction, which is not modeled; write Math.floor(a / b) or Math.trunc(a / b), or use bigint", node)
       }
     }
     switch (operator) {
@@ -2477,6 +2694,116 @@ export class Translator {
       case K.GreaterThanEqualsToken: return scalar(ir.le(right, left))
       default: throw new Unsupported("this operator is not supported", node)
     }
+  }
+
+  /** Arithmetic (`+ - * / % **`) when at least one operand is fractional (`rat`, `quot`, `float`) or the operator is `/`. */
+  private fractionalArithmetic(operator: number, leftValue: Value, rightValue: Value, node: N): Value {
+    const evalKnownFloat = (a: number, b: number): Value => {
+      if ((operator === K.SlashToken || operator === K.PercentToken) && b === 0) {
+        this.emit("nan", ir.FALSE, node)
+        return BOTTOM
+      }
+      let res: number
+      switch (operator) {
+        case K.PlusToken: res = a + b; break
+        case K.MinusToken: res = a - b; break
+        case K.AsteriskToken: res = a * b; break
+        case K.SlashToken: res = a / b; break
+        case K.PercentToken: res = a % b; break
+        case K.AsteriskAsteriskToken: res = a ** b; break
+        default: throw new Unsupported("this operator is not supported", node)
+      }
+      if (Number.isNaN(res)) {
+        this.emit("nan", ir.FALSE, node)
+        return BOTTOM
+      }
+      if (!Number.isFinite(res)) {
+        this.emit("overflow", ir.FALSE, node)
+        return BOTTOM
+      }
+      return this.fromJsNumber(res, node)
+    }
+    // Both sides already concrete JS numbers: compute with exact IEEE-754 semantics.
+    const lk = this.knownNumber(leftValue)
+    const rk = this.knownNumber(rightValue)
+    if (lk !== undefined && rk !== undefined) return evalKnownFloat(lk, rk)
+    // Exact dyadic arithmetic (`scalar` and `rat`, plus exact division by `±2^k` or `±2^-k`).
+    if ((isNumber(leftValue) || leftValue.k === "rat") && (isNumber(rightValue) || rightValue.k === "rat")) {
+      const n1 = leftValue.k === "rat" ? leftValue.num : (leftValue as Extract<Value, { k: "scalar" }>).e
+      const s1 = leftValue.k === "rat" ? leftValue.shift : 0
+      const n2 = rightValue.k === "rat" ? rightValue.num : (rightValue as Extract<Value, { k: "scalar" }>).e
+      const s2 = rightValue.k === "rat" ? rightValue.shift : 0
+      if (operator === K.PlusToken || operator === K.MinusToken) {
+        const s = Math.max(s1, s2)
+        const a = s > s1 ? ir.mul(n1, ir.lit(2n ** BigInt(s - s1))) : n1
+        const b = s > s2 ? ir.mul(n2, ir.lit(2n ** BigInt(s - s2))) : n2
+        return this.makeRat(operator === K.PlusToken ? ir.add(a, b) : ir.sub(a, b), s, node)
+      }
+      if (operator === K.AsteriskToken) {
+        return this.makeRat(ir.mul(n1, n2), s1 + s2, node)
+      }
+      if (operator === K.PercentToken) {
+        this.emit("nan", ir.not(ir.eq(n2, ir.lit(0n))), node)
+        const s = Math.max(s1, s2)
+        const a = s > s1 ? ir.mul(n1, ir.lit(2n ** BigInt(s - s1))) : n1
+        const b = s > s2 ? ir.mul(n2, ir.lit(2n ** BigInt(s - s2))) : n2
+        return this.makeRat(ir.mod(a, b), s, node)
+      }
+      if (operator === K.SlashToken) {
+        if (s2 === 0 && n2.t === "lit") {
+          const p2 = pow2Of(n2.value as bigint)
+          if (p2) return this.makeRat(p2.negative ? ir.neg(n1) : n1, s1 + p2.shift, node)
+        }
+        if (rightValue.k === "rat" && n2.t === "lit" && (n2.value === 1n || n2.value === -1n)) {
+          const signed = n2.value < 0n ? ir.neg(n1) : n1
+          if (s1 >= s2) return this.makeRat(signed, s1 - s2, node)
+          return this.makeRat(ir.mul(signed, ir.lit(2n ** BigInt(s2 - s1))), 0, node)
+        }
+        if (s1 === 0 && s2 === 0) {
+          this.emit("nan", ir.not(ir.eq(n2, ir.lit(0n))), node)
+          return { k: "quot", num: n1, den: n2 }
+        }
+      }
+      if (operator === K.AsteriskAsteriskToken && s2 === 0) {
+        const exp = this.settle(n2, () => new Unsupported("exponentiation requires an exponent known here", node)).value as bigint
+        if (exp === 0n) return scalar(ir.lit(1n), true)
+        if (exp === 1n) return leftValue
+        if (exp > 0n && exp <= 8n && s1 * Number(exp) <= MAX_DYADIC_SHIFT) {
+          let acc: Expr = n1
+          for (let i = 1n; i < exp; i++) acc = ir.mul(acc, n1)
+          return this.makeRat(acc, s1 * Number(exp), node)
+        }
+      }
+    }
+    // Exact power-of-2 scaling of a single quotient `fl(a / b) * (±2^k)` or `fl(a / b) / (±2^k)` (pure exponent shift in binary64).
+    if ((operator === K.AsteriskToken || operator === K.SlashToken) && (leftValue.k === "quot" || (operator === K.AsteriskToken && rightValue.k === "quot"))) {
+      const q = (leftValue.k === "quot" ? leftValue : rightValue) as Extract<Value, { k: "quot" }>
+      const other = leftValue.k === "quot" ? rightValue : leftValue
+      if (isNumber(other) && other.k === "scalar" && other.e.t === "lit") {
+        const p2 = pow2Of(other.e.value as bigint)
+        if (p2) {
+          const factor = 2n ** BigInt(p2.shift)
+          if (operator === K.AsteriskToken) {
+            const scaled = ir.mul(p2.negative ? ir.neg(q.num) : q.num, ir.lit(factor))
+            this.emit("overflow", ir.isSafe(scaled), node)
+            return { k: "quot", num: scaled, den: q.den }
+          }
+          const scaledDen = ir.mul(p2.negative ? ir.neg(q.den) : q.den, ir.lit(factor))
+          this.emit("overflow", ir.isSafe(scaledDen), node)
+          return { k: "quot", num: q.num, den: scaledDen }
+        }
+      }
+    }
+    // Non-dyadic decimal or double-rounding arithmetic: settle inputs if small finite domains, else refuse cleanly.
+    const refusal = () => new Unsupported(
+      leftValue.k === "float" || rightValue.k === "float"
+        ? "arithmetic with a non-dyadic decimal requires inputs whose values are known here; use integer scaling like Math.round((x * 15) / 100) for large ranges"
+        : "further arithmetic on a division can double-round in IEEE-754, which is not modeled unless the values are known here",
+      node,
+    )
+    const a = this.settleNumber(leftValue, refusal)
+    const b = this.settleNumber(rightValue, refusal)
+    return evalKnownFloat(a, b)
   }
 
   /** `object.name`, for one object. */
@@ -2673,6 +3000,7 @@ export class Translator {
           if (evaluated.length === 0) return scalar(ir.lit(0n), true)
           return this.over(evaluated[0]!, value => {
             if (value.k === "bottom") return BOTTOM
+            if (value.k === "rat" || value.k === "quot" || value.k === "float" || value.k === "infinite") return value
             const integer = this.scalarOf(value, node, "int")
             // Every whole number is a bigint, but only some bigints fit a number exactly.
             if (!isNumber(value)) this.emit("overflow", ir.isSafe(integer), node)
@@ -2702,6 +3030,10 @@ export class Translator {
         return this.over(first ?? VOID, v => {
           if (v.k === "bottom") return BOTTOM
           if (name === "isNaN") return scalar(ir.FALSE)
+          if (name === "isFinite") return scalar(ir.lit(isNumeric(v)))
+          if (v.k === "rat") return scalar(ir.eq(ir.mod(v.num, ir.lit(2n ** BigInt(v.shift))), ir.lit(0n)))
+          if (v.k === "quot") return scalar(ir.eq(ir.mod(v.num, v.den), ir.lit(0n)))
+          if (v.k === "float") return scalar(ir.lit(name === "isInteger" ? Number.isInteger(v.value) : Number.isSafeInteger(v.value)))
           return scalar(ir.lit(isNumber(v)))
         })
       }
@@ -2846,7 +3178,7 @@ export class Translator {
     if (receiver.k === "bottom") return BOTTOM
     if (receiver.k === "void") return this.throwsOnUndefined(node)
     if (receiver.k === "null") return this.throwsOnNull(node)
-    if (receiver.k === "scalar" && method === "toString" && node.arguments.length === 0) {
+    if ((receiver.k === "scalar" || receiver.k === "rat" || receiver.k === "quot" || receiver.k === "float") && method === "toString" && node.arguments.length === 0) {
       this.assertBuiltinsIntact(node)
       return this.text(receiver, node, false)
     }
@@ -2981,42 +3313,74 @@ export class Translator {
   private math(name: string, node: N, env: Env): Value {
     this.assertBuiltinsIntact(node)
     const parameters = node.arguments as N[]
-    const number = (argument: N) => {
-      const value = this.evalExpr(argument, env)
-      if (!isNumber(value)) throw new Unsupported(`Math.${name} is modeled for numbers, but this is ${describe(value)}`, argument)
-      return (value as { e: Expr }).e
-    }
     const [first] = parameters
     if (first && parameters.length === 1 && (name === "floor" || name === "trunc" || name === "ceil" || name === "round")) {
-      let inner = first
-      while (inner.kind === K.ParenthesizedExpression) inner = inner.expression
-      if (inner.kind !== K.BinaryExpression || inner.operatorToken.kind !== K.SlashToken) return scalar(number(first), true)
-      // Rounding a quotient of whole numbers. Dividing two exactly held whole
-      // numbers and rounding gives the same integer as exact division.
-      const a = number(inner.left)
-      const b = number(inner.right)
-      this.emit("nan", ir.not(ir.eq(b, ir.lit(0n))), inner)
-      if (name === "round") {
-        // Math.round takes a half upward, so it is the floor of the quotient
-        // plus a half: floor((2a + b) / 2b). The quotient JavaScript rounds is
-        // a double, and that double is a half only when the true quotient is,
-        // as long as the dividend is below 2^52: nearer to a half than a
-        // double can tell apart, a fraction over `b` needs a larger dividend.
-        const limit = ir.lit(2n ** 52n)
-        this.emit("round", ir.and(ir.lt(ir.neg(limit), a), ir.lt(a, limit)), inner)
-        return scalar(ir.fdiv(ir.add(ir.mul(ir.lit(2n), a), b), ir.mul(ir.lit(2n), b)), true)
-      }
-      if (name === "trunc") return scalar(ir.div(a, b), true)
-      // The ceiling of a quotient is the negated floor of its negation.
-      return scalar(name === "floor" ? ir.fdiv(a, b) : ir.neg(ir.fdiv(ir.neg(a), b)), true)
+      return this.over(this.evalExpr(first, env), value => {
+        if (value.k === "bottom") return BOTTOM
+        if (isNumber(value)) return value
+        if (value.k === "rat") {
+          const d = ir.lit(2n ** BigInt(value.shift))
+          if (name === "trunc") return scalar(ir.div(value.num, d), true)
+          if (name === "floor") return scalar(ir.fdiv(value.num, d), true)
+          if (name === "ceil") return scalar(ir.neg(ir.fdiv(ir.neg(value.num), d)), true)
+          // `Math.round` on an exact dyadic rational `num / 2^shift` (`shift >= 1`) is `floor((num + 2^(shift - 1)) / 2^shift)`.
+          const half = ir.lit(2n ** BigInt(value.shift - 1))
+          return scalar(ir.fdiv(ir.add(value.num, half), d), true)
+        }
+        if (value.k === "quot") {
+          // Rounding a quotient of whole numbers. Dividing two exactly held whole
+          // numbers and rounding gives the same integer as exact division.
+          const { num: a, den: b } = value
+          if (name === "round") {
+            // Math.round takes a half upward, so it is the floor of the quotient
+            // plus a half: floor((2a + b) / 2b). The quotient JavaScript rounds is
+            // a double, and that double is a half only when the true quotient is,
+            // as long as the dividend is below 2^52: nearer to a half than a
+            // double can tell apart, a fraction over `b` needs a larger dividend.
+            const limit = ir.lit(2n ** 52n)
+            this.emit("round", ir.and(ir.lt(ir.neg(limit), a), ir.lt(a, limit)), first)
+            return scalar(ir.fdiv(ir.add(ir.mul(ir.lit(2n), a), b), ir.mul(ir.lit(2n), b)), true)
+          }
+          if (name === "trunc") return scalar(ir.div(a, b), true)
+          // The ceiling of a quotient is the negated floor of its negation.
+          return scalar(name === "floor" ? ir.fdiv(a, b) : ir.neg(ir.fdiv(ir.neg(a), b)), true)
+        }
+        if (value.k === "float") {
+          const rounded = name === "floor" ? Math.floor(value.value) : name === "ceil" ? Math.ceil(value.value) : name === "trunc" ? Math.trunc(value.value) : Math.round(value.value)
+          return this.fromJsNumber(rounded, node)
+        }
+        throw new Unsupported(`Math.${name} is modeled for numbers, but this is ${describe(value)}`, first)
+      })
     }
     if (first && parameters.length === 1 && name === "abs") {
-      const value = number(first)
-      return scalar(ir.ite(ir.lt(value, ir.lit(0n)), ir.neg(value), value), true)
+      return this.over(this.evalExpr(first, env), value => {
+        if (value.k === "bottom") return BOTTOM
+        if (value.k === "infinite") return { k: "infinite", negative: false }
+        if (value.k === "rat") return { k: "rat", num: ir.ite(ir.lt(value.num, ir.lit(0n)), ir.neg(value.num), value.num), shift: value.shift }
+        if (value.k === "quot") {
+          const abs = (e: Expr) => ir.ite(ir.lt(e, ir.lit(0n)), ir.neg(e), e)
+          return { k: "quot", num: abs(value.num), den: abs(value.den) }
+        }
+        if (value.k === "float") return this.fromJsNumber(Math.abs(value.value), node)
+        if (!isNumber(value)) throw new Unsupported(`Math.abs is modeled for numbers, but this is ${describe(value)}`, first)
+        const e = (value as { e: Expr }).e
+        return scalar(ir.ite(ir.lt(e, ir.lit(0n)), ir.neg(e), e), true)
+      })
     }
     if (first && parameters.length === 1 && name === "sign") {
-      const value = number(first)
-      return scalar(ir.ite(ir.lt(value, ir.lit(0n)), ir.lit(-1n), ir.ite(ir.eq(value, ir.lit(0n)), ir.lit(0n), ir.lit(1n))), true)
+      return this.over(this.evalExpr(first, env), value => {
+        if (value.k === "bottom") return BOTTOM
+        if (value.k === "infinite") return scalar(ir.lit(value.negative ? -1n : 1n), true)
+        if (value.k === "rat") return scalar(ir.ite(ir.lt(value.num, ir.lit(0n)), ir.lit(-1n), ir.ite(ir.eq(value.num, ir.lit(0n)), ir.lit(0n), ir.lit(1n))), true)
+        if (value.k === "quot") {
+          const sameSign = ir.or(ir.and(ir.lt(ir.lit(0n), value.num), ir.lt(ir.lit(0n), value.den)), ir.and(ir.lt(value.num, ir.lit(0n)), ir.lt(value.den, ir.lit(0n))))
+          return scalar(ir.ite(ir.eq(value.num, ir.lit(0n)), ir.lit(0n), ir.ite(sameSign, ir.lit(1n), ir.lit(-1n))), true)
+        }
+        if (value.k === "float") return scalar(ir.lit(BigInt(Math.sign(value.value))), true)
+        if (!isNumber(value)) throw new Unsupported(`Math.sign is modeled for numbers, but this is ${describe(value)}`, first)
+        const e = (value as { e: Expr }).e
+        return scalar(ir.ite(ir.lt(e, ir.lit(0n)), ir.lit(-1n), ir.ite(ir.eq(e, ir.lit(0n)), ir.lit(0n), ir.lit(1n))), true)
+      })
     }
     if (name === "min" || name === "max") {
       const evaluated = this.arguments(node, env)
@@ -3024,7 +3388,7 @@ export class Translator {
       const wantMin = name === "min"
       const checkArg = (v: Value): Value => {
         if (v.k === "bottom") return BOTTOM
-        if (isNumber(v) || v.k === "infinite") return v
+        if (isNumeric(v) || v.k === "infinite") return v
         throw new Unsupported(`Math.${name} is modeled for numbers, but this is ${describe(v)}`, node)
       }
       let best = this.over(evaluated[0]!, checkArg)
@@ -3034,9 +3398,8 @@ export class Translator {
           if (a.k === "bottom" || b.k === "bottom") return BOTTOM
           if (a.k === "infinite") return (wantMin ? a.negative : !a.negative) ? a : b
           if (b.k === "infinite") return (wantMin ? b.negative : !b.negative) ? b : a
-          const ae = (a as { e: Expr }).e
-          const be = (b as { e: Expr }).e
-          return scalar(ir.ite(wantMin ? ir.lt(be, ae) : ir.lt(ae, be), be, ae), true)
+          const pickB = this.compareNumeric(wantMin ? K.LessThanToken : K.GreaterThanToken, b, a, node)
+          return this.merge(pickB, b, a)
         }))
       }
       return best
@@ -3046,7 +3409,7 @@ export class Translator {
       if (args.length !== 2) throw new Unsupported("Math.pow takes two arguments", node)
       return this.over(args[0]!, a => this.over(args[1]!, b => {
         if (a.k === "bottom" || b.k === "bottom") return BOTTOM
-        if (!isNumber(a) || !isNumber(b)) throw new Unsupported("Math.pow is modeled for numbers", node)
+        if (!isNumeric(a) || !isNumeric(b)) throw new Unsupported("Math.pow is modeled for numbers", node)
         return this.arithmetic(K.AsteriskAsteriskToken, a, b, node)
       }))
     }
@@ -3060,6 +3423,11 @@ export class Translator {
       if (part.k === "scalar" && part.e.ty === "str") return part
       if (part.k === "scalar" && part.e.ty === "int") return scalar(ir.toStr(part.e))
       if (part.k === "scalar" && part.e.ty === "bool") return scalar(ir.ite(part.e, ir.lit("true"), ir.lit("false")))
+      if (part.k === "float") return scalar(ir.lit(String(part.value)))
+      if (part.k === "rat" || part.k === "quot") {
+        const known = this.settleNumber(part, () => new Unsupported("converting a fractional number to a string is not supported unless its value is known here", at))
+        return scalar(ir.lit(String(known)))
+      }
       if (allowNullish && part.k === "void") return scalar(ir.lit("undefined"))
       if (allowNullish && part.k === "null") return scalar(ir.lit("null"))
       throw new Unsupported(`converting ${describe(part)} to a string is not supported`, at)
@@ -4097,7 +4465,7 @@ export class Translator {
       this.loading.push({ file: file.fileName, position: declaration.pos })
       try {
         const value = this.evalExpr(declaration.initializer, new Env())
-        if (value.k !== "scalar" && value.k !== "closure") this.assertStable(file, declaration, value, node)
+        if (value.k !== "scalar" && value.k !== "rat" && value.k !== "float" && value.k !== "closure") this.assertStable(file, declaration, value, node)
         this.constants.set(declaration, value)
         return value
       } finally {
