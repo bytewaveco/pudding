@@ -58,22 +58,188 @@ const FILE_TIMEOUT_MS = 30_000
 const THEOREM_TIMEOUT_MS = 10_000
 const MAX_SPECIALIZATIONS = 512
 
+/** Top-level Lean declaration and command keywords that never belong inside a tactic proof block. */
+const FORBIDDEN_SCRIPT_KEYWORDS = new Set([
+  "axiom", "theorem", "lemma", "example", "def", "abbrev", "opaque", "constant",
+  "inductive", "coinductive", "structure", "class", "instance",
+  "import", "namespace", "section", "universe", "variable", "attribute",
+  "macro", "macro_rules", "syntax", "elab", "elab_rules", "notation",
+  "infix", "infixl", "infixr", "prefix", "postfix", "declare_syntax_cat",
+  "initialize", "builtin_initialize",
+])
+
+const OPEN_DELIMS: Record<string, string> = { "(": ")", "[": "]", "{": "}", "⟨": "⟩" }
+const CLOSE_DELIMS: Record<string, string> = { ")": "(", "]": "[", "}": "{", "⟩": "⟨" }
+const IDENT_START = /^[\p{L}_]$/u
+const IDENT_CONT = /^[\p{L}\p{N}_'?!\u2070-\u209f]$/u
+
 /**
- * Why an author's proof script cannot be used, if it cannot. The script is
- * placed inside parentheses in the theorem, and that only confines it if every
- * parenthesis in its text is one Lean sees. So the things that can hide a
- * parenthesis from Lean (comments, string and character literals, quoted
- * names) are not allowed, and the parentheses must balance.
+ * Lex a Lean 4 proof script and verify it is a single, self-contained tactic
+ * block. Comments (`--`, nested `/- ... -/`), string literals, character
+ * literals and `«quoted names»` are tokenized according to Lean's grammar so
+ * harmless uses are accepted while delimiter escapes, unterminated tokens,
+ * interpolated strings and Lean commands/declarations are rejected.
  */
 export function scriptProblem(script: string): string | undefined {
-  if (/--|\/-|"|«/.test(script)) return "a proof script may not contain comments, string literals or «quoted names»"
-  if (/'[()\[\]{}⟨⟩\\]/.test(script)) return "a proof script may not contain character literals"
-  let depth = 0
-  for (const char of script) {
-    if (char === "(") depth++
-    else if (char === ")" && --depth < 0) break
+  const stack: string[] = []
+  let tokens = 0
+  let afterDot = false
+  let i = 0
+  const n = script.length
+
+  while (i < n) {
+    const ch = script[i]!
+    // Whitespace
+    if (ch === " " || ch === "\t" || ch === "\r" || ch === "\n") {
+      i++
+      continue
+    }
+    // Line comment: `--` to end of line
+    if (ch === "-" && script[i + 1] === "-") {
+      i += 2
+      while (i < n && script[i] !== "\n") i++
+      continue
+    }
+    // Nested block comment: `/- ... -/` (including doc comments `/--` and `/-!`)
+    if (ch === "/" && script[i + 1] === "-") {
+      let depth = 1
+      i += 2
+      while (i < n && depth > 0) {
+        if (script[i] === "/" && script[i + 1] === "-") { depth++; i += 2 }
+        else if (script[i] === "-" && script[i + 1] === "/") { depth--; i += 2 }
+        else i++
+      }
+      if (depth > 0) return "unterminated block comment in the proof script"
+      continue
+    }
+    // Raw string literal: `r"..."`, `r#"..."#`, etc.
+    if (ch === "r") {
+      let j = i + 1
+      while (j < n && script[j] === "#") j++
+      if (script[j] === '"') {
+        const hashes = j - (i + 1)
+        const close = '"' + "#".repeat(hashes)
+        const end = script.indexOf(close, j + 1)
+        if (end < 0) return "unterminated string literal in the proof script"
+        i = end + close.length
+        tokens++
+        afterDot = false
+        continue
+      }
+    }
+    // String literal: `"..."` with Lean backslash escapes
+    if (ch === '"') {
+      i++
+      let closed = false
+      while (i < n) {
+        const c = script[i]!
+        if (c === "\\") {
+          if (i + 1 >= n) return "unterminated string literal in the proof script"
+          i += 2
+          continue
+        }
+        if (c === '"') { closed = true; i++; break }
+        i++
+      }
+      if (!closed) return "unterminated string literal in the proof script"
+      tokens++
+      afterDot = false
+      continue
+    }
+    // Character literal: `'c'` or `'\...'` (only outside identifiers)
+    if (ch === "'") {
+      i++
+      if (i >= n || script[i] === "\n" || script[i] === "'") return "unterminated character literal in the proof script"
+      if (script[i] === "\\") {
+        i++
+        if (i >= n) return "unterminated character literal in the proof script"
+        const esc = script[i]!
+        if (esc === "x") {
+          if (!/^[0-9a-fA-F]{2}'/.test(script.slice(i + 1, i + 4))) return "unterminated character literal in the proof script"
+          i += 4
+        } else if (esc === "u") {
+          if (!/^[0-9a-fA-F]{4}'/.test(script.slice(i + 1, i + 6))) return "unterminated character literal in the proof script"
+          i += 6
+        } else {
+          i++
+          if (script[i] !== "'") return "unterminated character literal in the proof script"
+          i++
+        }
+      } else {
+        const cp = script.codePointAt(i)!
+        i += cp > 0xffff ? 2 : 1
+        if (script[i] !== "'") return "unterminated character literal in the proof script"
+        i++
+      }
+      tokens++
+      afterDot = false
+      continue
+    }
+    // French-quoted identifier: `«...»`
+    if (ch === "«") {
+      const end = script.indexOf("»", i + 1)
+      if (end < 0) return "unterminated «quoted name» in the proof script"
+      i = end + 1
+      tokens++
+      afterDot = false
+      continue
+    }
+    if (ch === "»") return "unexpected `»` in the proof script"
+    // Lean `#command` (e.g. `#eval`, `#check`, `#print`, `#exit`)
+    if (ch === "#" && i + 1 < n && IDENT_START.test(script[i + 1]!)) {
+      return "a proof script may not contain Lean commands"
+    }
+    // Delimiters: `()`, `[]`, `{}`, `⟨⟩`
+    if (ch in OPEN_DELIMS) {
+      stack.push(ch)
+      i++
+      tokens++
+      afterDot = false
+      continue
+    }
+    if (ch in CLOSE_DELIMS) {
+      const want = CLOSE_DELIMS[ch]!
+      if (stack.length === 0 || stack[stack.length - 1] !== want) {
+        return ch === ")" || stack[stack.length - 1] === "("
+          ? "the parentheses in the proof script do not balance"
+          : "the delimiters in the proof script do not balance"
+      }
+      stack.pop()
+      i++
+      tokens++
+      afterDot = false
+      continue
+    }
+    // Identifiers and keywords
+    if (IDENT_START.test(ch)) {
+      const start = i
+      i++
+      while (i < n && IDENT_CONT.test(script[i]!)) i++
+      const word = script.slice(start, i)
+      // Interpolated strings (`s!"..."`, `m!"..."`, etc.) embed arbitrary expressions inside quotes.
+      if (word.endsWith("!") && script[i] === '"') {
+        return "interpolated strings are not allowed in proof scripts"
+      }
+      if (!afterDot && FORBIDDEN_SCRIPT_KEYWORDS.has(word)) {
+        return `a proof script may not contain \`${word}\``
+      }
+      tokens++
+      afterDot = false
+      continue
+    }
+    // Dot tracks qualified names (e.g. `Nat.def` or projection) vs standalone keywords
+    afterDot = ch === "."
+    i++
+    tokens++
   }
-  return depth === 0 ? undefined : "the parentheses in the proof script do not balance"
+
+  if (stack.length > 0) {
+    return stack.includes("(")
+      ? "the parentheses in the proof script do not balance"
+      : "the delimiters in the proof script do not balance"
+  }
+  if (tokens === 0) return "the proof script is empty"
+  return undefined
 }
 
 /** How a statement is proved: by evaluating every case, by the default automation, or by the author's script. */

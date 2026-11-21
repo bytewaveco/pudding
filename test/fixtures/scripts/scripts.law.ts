@@ -12,6 +12,16 @@ law("a true law with a script over several lines", domain<bigint>(), x => {
 }, { proof: `intros
 simp` })
 
+law("a true law with comments, nested block comments, strings and primed names", domain<[bigint, bigint]>(), ([a, b]) => {
+  if (a > 0n && b > 0n) expect(a * b > 0n).toBe(true)
+}, { proof: `-- prove positivity (harmless comment with ) and --
+/- nested /- block comment with ) and "unclosed -/ still comment -/
+intro h'
+have _ : "string with ) and -- and /-" = "string with ) and -- and /-" := rfl
+have _ : ')' = ')' := rfl
+simp_all
+exact Int.mul_pos h'.1 h'.2 -- trailing comment` })
+
 // The script proves its own law, then goes on to redefine what == means.
 law("REJECTED: a script that carries on past its proof", domain<bigint>(), x => {
   if (x > 0n) expect(x + x > x).toBe(true)

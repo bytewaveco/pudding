@@ -222,10 +222,9 @@ law("a product of positives is positive", domain<[bigint, bigint]>(), ([a, b]) =
 You or an agent can work on a proof with ordinary Lean tooling, starting from
 the emitted theorems. Nobody has to review the script: Lean rejects it if it
 is wrong or unfinished. A script is a sequence of tactics and nothing else. It
-is checked in a file of its own, and it may not contain comments, string
-literals or unbalanced parentheses, so that it cannot go on to define
-anything. The Lean that comes with `npm install` holds only the part of Lean's
-library Pudding itself uses; a proof that names other lemmas needs
+is checked in a file of its own, and lexed to make sure delimiters balance and
+no Lean commands or declarations can escape the tactic block. The Lean that
+comes with `npm install` holds only the part of Lean's library Pudding itself uses; a proof that names other lemmas needs
 `pudding install-lean --full` or your own Lean.
 
 ## Writing laws
