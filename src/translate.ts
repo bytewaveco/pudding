@@ -357,6 +357,8 @@ export class Translator {
   private writes: Write[] = []
   /** Iterators currently being stepped through by `for...of` or `Array.from`, so reentrant consumption is refused. */
   private readonly activeIterators = new Set<Stored>()
+  /** Nesting depth inside `.toThrow()` callback evaluation, where throw operands must be evaluated for side effects. */
+  private inThrowCheck = 0
   private readonly facts = new Map<Node, { assigned: Set<string>; mentioned: Set<string>; returnsValue: boolean; usesVar: Node | undefined }>()
   private instance: LawInstance | undefined
 
@@ -852,12 +854,23 @@ export class Translator {
     const actual = this.evalExpr(target.arguments[0], env)
     if (matcher === "toThrow") {
       const checkThrow = (fn: Value): Expr => {
-        if (fn.k === "choice") return ir.ite(fn.cond, checkThrow(fn.a), checkThrow(fn.b))
+        if (fn.k === "choice") {
+          return ir.ite(
+            fn.cond,
+            this.under(fn.cond, () => checkThrow(fn.a)),
+            this.under(ir.not(fn.cond), () => checkThrow(fn.b)),
+          )
+        }
         if (fn.k !== "closure") throw new Unsupported("toThrow expects a function", node)
         if (!this.instance) throw new Unsupported("toThrow is only supported inside a law", node)
         const THROWING = new Set<ObligationKind>(["unreachable", "nothrow", "undefined", "null"])
         const start = this.instance.obligations.length
-        this.unchanging("a callback of `.toThrow`", node, () => this.call(fn, [], node))
+        this.inThrowCheck++
+        try {
+          this.unchanging("a callback of `.toThrow`", node, () => this.call(fn, [], node))
+        } finally {
+          this.inThrowCheck--
+        }
         const added = this.instance.obligations.slice(start)
         // Inner `expect()`, `falloff`, and `missing` do not match plain JS throw semantics here, so refuse them inside `toThrow`.
         if (added.some(o => o.kind === "expect" || o.kind === "falloff" || o.kind === "missing")) {
@@ -1486,9 +1499,21 @@ export class Translator {
         return rest()
       case K.ReturnStatement:
         return statement.expression ? this.evalExpr(statement.expression, env) : VOID
-      case K.ThrowStatement:
+      case K.ThrowStatement: {
+        if (this.inThrowCheck > 0 && statement.expression) {
+          const expr = statement.expression
+          if (expr.kind === K.NewExpression && expr.expression.kind === K.Identifier &&
+            ["Error", "TypeError", "RangeError", "ReferenceError", "SyntaxError", "URIError", "EvalError"].includes(expr.expression.text) &&
+            !env.get(expr.expression.text) && this.isBuiltin(expr.expression)) {
+            this.assertBuiltinsIntact(expr)
+            this.arguments({ arguments: expr.arguments ?? [] }, env)
+          } else {
+            this.evalExpr(expr, env)
+          }
+        }
         this.emit("unreachable", ir.FALSE, statement)
         return BOTTOM
+      }
       case K.BreakStatement:
       case K.ContinueStatement: {
         const target = statement.kind === K.BreakStatement ? flow.brk : flow.cont
@@ -2101,7 +2126,7 @@ export class Translator {
             : isNumber(keyVal) && keyVal.k === "scalar" ? ir.toStr(keyVal.e) : undefined
           if (!key) throw new Unsupported(`\`in\` with ${describe(keyVal)} on an array is not supported`, node)
           const lit = this.settle(key, () => new Unsupported("`in` on an array requires a known key or index", node)).value as string
-          if (isArrayIndexKey(lit) && Number(lit) < obj.items.length) return scalar(ir.TRUE)
+          if (lit === "length" || (isArrayIndexKey(lit) && Number(lit) < obj.items.length)) return scalar(ir.TRUE)
           if (lit in Array.prototype) throw new Unsupported(`\`${lit}\` is a property every array inherits, which is not modeled`, node)
           return scalar(ir.FALSE)
         }
@@ -2475,7 +2500,10 @@ export class Translator {
   private assertBuiltinsIntact(use: Node) {
     if (this.tampering === null) {
       this.tampering = undefined
-      const builtins = new Set(["Math", "Object", "Array", "String", "Number", "BigInt", "Boolean", "JSON", "Reflect", "Function", "Symbol", "Map", "Set", "globalThis"])
+      const builtins = new Set([
+        "Math", "Object", "Array", "String", "Number", "BigInt", "Boolean", "JSON", "Reflect", "Function", "Symbol", "Map", "Set", "globalThis",
+        "Error", "TypeError", "RangeError", "ReferenceError", "SyntaxError", "URIError", "EvalError",
+      ])
       // Whether an expression names a built-in, directly or through the global object: `Array`, `globalThis.Array`.
       const fromBuiltin = (node: N): boolean => {
         const root = rootOf(node)
@@ -2751,7 +2779,14 @@ export class Translator {
       case "replaceAll": {
         const search = knownStr(args[0], "search value")
         const repl = knownStr(args[1], "replacement")
+        if (str.length > 500 || repl.length > 500) throw new Unsupported(`\`.${method}\` produces a string too long to model`, node)
+        if (method === "replaceAll") {
+          const matches = search === "" ? str.length + 1 : str.split(search).length - 1
+          const perMatch = repl.includes("$") ? repl.length + str.length : repl.length
+          if (str.length + matches * perMatch > 500) throw new Unsupported("`.replaceAll` produces a string too long to model", node)
+        }
         const out = method === "replace" ? str.replace(search, repl) : str.replaceAll(search, repl)
+        if (out.length > 500) throw new Unsupported(`\`.${method}\` produces a string too long to model`, node)
         return scalar(ir.lit(this.wellFormed(out, node)))
       }
       default:
@@ -2854,14 +2889,23 @@ export class Translator {
       return array
     }
     if (method === "concat") {
-      const join = (index: number, acc: Value[]): Value => {
+      const join = (from: number, before: Value[]): Value => {
+        const acc = [...before]
+        let index = from
+        for (; index < args.length; index++) {
+          const arg = this.settled(args[index]!)
+          if (arg.k === "choice") break
+          if (arg.k === "bottom") return BOTTOM
+          if (arg.k === "array") acc.push(...arg.items)
+          else acc.push(arg)
+        }
         if (index === args.length) return this.fresh({ k: "array", items: acc })
         return this.over(args[index]!, arg => {
           if (arg.k === "bottom") return BOTTOM
           return join(index + 1, arg.k === "array" ? [...acc, ...arg.items] : [...acc, arg])
         })
       }
-      return join(0, [...items])
+      return join(0, items)
     }
     if (method === "join") {
       if (args.length > 1) throw new Unsupported("`.join` takes at most one separator", node)
@@ -3325,7 +3369,13 @@ export class Translator {
       if (second?.k === "tombstone") return { kind: "delete", key: first as Extract<Value, { k: "scalar" }>, value: VOID }
       return { kind: "set", key: first as Extract<Value, { k: "scalar" }>, value: second ?? first! }
     }
-    return collection.log.items.map(entryOf)
+    // Skip entries discarded by the last unconditional `.clear()`.
+    let start = 0
+    for (let i = collection.log.items.length - 1; i >= 0; i--) {
+      const item = collection.log.items[i]!
+      if (item.k === "array" && item.items[0]?.k === "tombstone") { start = i + 1; break }
+    }
+    return collection.log.items.slice(start).map(entryOf)
   }
 
   /**
