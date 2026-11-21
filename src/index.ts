@@ -57,13 +57,13 @@ export interface Matchers<T> {
   /** Equality of booleans, bigints, numbers, strings, null and undefined. */
   toBe(expected: NoInfer<T>): void
   /** Strict greater-than comparison on numbers or bigints. */
-  toBeGreaterThan(expected: T extends number | bigint ? NoInfer<T> : number | bigint): void
+  toBeGreaterThan(expected: T extends number ? number : T extends bigint ? bigint : number | bigint): void
   /** Greater-than-or-equal comparison on numbers or bigints. */
-  toBeGreaterThanOrEqual(expected: T extends number | bigint ? NoInfer<T> : number | bigint): void
+  toBeGreaterThanOrEqual(expected: T extends number ? number : T extends bigint ? bigint : number | bigint): void
   /** Strict less-than comparison on numbers or bigints. */
-  toBeLessThan(expected: T extends number | bigint ? NoInfer<T> : number | bigint): void
+  toBeLessThan(expected: T extends number ? number : T extends bigint ? bigint : number | bigint): void
   /** Less-than-or-equal comparison on numbers or bigints. */
-  toBeLessThanOrEqual(expected: T extends number | bigint ? NoInfer<T> : number | bigint): void
+  toBeLessThanOrEqual(expected: T extends number ? number : T extends bigint ? bigint : number | bigint): void
   /** Check that the value is `undefined`. */
   toBeUndefined(): void
   /** Check that the value is not `undefined`. */
@@ -76,7 +76,7 @@ export interface Matchers<T> {
   toBeFalsy(): void
   /** Check the `.length` of an array or string. */
   toHaveLength(expected: number): void
-  /** Check that an array contains an element (by `===`) or a string contains a substring. */
+  /** Check that an array contains an element (using `Array.prototype.includes` / SameValueZero) or a string contains a substring. */
   toContain(expected: unknown): void
   /** Check that calling a function throws an error. */
   toThrow(): void

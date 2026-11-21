@@ -107,6 +107,7 @@ async function watch(cwd: string, once: (override?: Partial<RunOptions>) => Prom
         }
       }
       if (interactive) process.stdout.write("\x1b[2J\x1b[3J\x1b[H")
+      if (!lawFiles) session.close()
       try {
         await once({ session, ...(lawFiles ? { lawFiles } : {}) })
       } catch (error) {

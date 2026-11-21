@@ -85,6 +85,8 @@ function collectDependencies(program: Program, checker: Checker, entry: string):
         addSpecifier(node.moduleSpecifier)
       } else if (K.ImportType !== undefined && node.kind === K.ImportType && node.argument?.kind === K.LiteralType && node.argument.literal?.kind === K.StringLiteral) {
         addSpecifier(node.argument.literal)
+      } else if (K.ImportEqualsDeclaration !== undefined && node.kind === K.ImportEqualsDeclaration && node.moduleReference?.kind === K.ExternalModuleReference) {
+        addSpecifier(node.moduleReference.expression)
       }
       node.forEachChild(visit)
     }

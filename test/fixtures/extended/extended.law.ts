@@ -276,4 +276,24 @@ describe("soundness regressions from review", () => {
     expect(() => (null as unknown as Record<string, number>)[key()]).toThrow()
     expect(calls).toBe(1)
   })
+
+  law("CHECKED: side effect in throw operand inside toThrow is refused", () => {
+    let calls = 0
+    const bump = () => { calls++; return new Error("boom") }
+    expect(() => { throw bump() }).toThrow()
+    expect(calls).toBe(1)
+  })
+
+  law("toThrow guards conditional callbacks, length is in arrays, numeric literals widen in matchers, and clear discards prior history", domain<0 | 1>(), x => {
+    expect(x).toBeLessThan(2)
+    expect("length" in []).toBe(true)
+    const b = x === 1
+    const fn = b ? () => { throw new Error("a") } : () => { throw new Error("b") }
+    expect(fn).toThrow()
+    const m = new Map<string, number>()
+    if (b) m.set("x", 1)
+    else m.clear()
+    m.clear()
+    expect(m.size).toBe(0)
+  })
 })
