@@ -637,7 +637,29 @@ describe("proof scripts", () => {
     // The law after the tampering script is refuted on its merits, so the script changed nothing for it.
     assert.equal(law(report, "FALSE: a law after the tampering script").findings[0]?.kind, "counterexample")
     assert.match(law(report, "REJECTED: a script that closes its own parentheses").findings[0]?.message ?? "", /parentheses in the proof script do not balance/)
-    assert.match(law(report, "REJECTED: a script that hides a parenthesis in a comment").findings[0]?.message ?? "", /may not contain comments/)
+    assert.match(law(report, "REJECTED: a script that hides a parenthesis in a comment").findings[0]?.message ?? "", /parentheses in the proof script do not balance/)
+    assert.match(law(report, "REJECTED: a script that carries on past its proof").findings[0]?.message ?? "", /may not contain `macro_rules`/)
+    assert.equal(law(report, "a true law with comments, nested block comments, strings and primed names").status, "proved")
+  })
+
+  test("proof script lexer handles Lean comments, literals, delimiters and commands accurately", async () => {
+    const { scriptProblem } = await import("../dist/lean.js")
+    assert.equal(scriptProblem("intro h'; simp_all -- ok )"), undefined)
+    assert.equal(scriptProblem("/- outer /- inner ) -/ still -/ simp"), undefined)
+    assert.equal(scriptProblem('have _ := "a\\")b"; simp'), undefined)
+    assert.equal(scriptProblem('have _ := r#"a")b"#; simp'), undefined)
+    assert.equal(scriptProblem("have _ := ')'; have _ := '\\''; simp"), undefined)
+    assert.equal(scriptProblem("have «x)y» : True := trivial; exact «x)y»"), undefined)
+    assert.match(scriptProblem("   -- only a comment\n/- and block -/") ?? "", /empty/)
+    assert.match(scriptProblem("/- outer /- inner -/ unclosed") ?? "", /unterminated block comment/)
+    assert.match(scriptProblem('have _ := "unclosed') ?? "", /unterminated string/)
+    assert.match(scriptProblem("have _ := 'unclosed") ?? "", /unterminated character/)
+    assert.match(scriptProblem("have _ := «unclosed") ?? "", /unterminated «quoted name»/)
+    assert.match(scriptProblem('have _ := s!"{1 + 2}"') ?? "", /interpolated strings/)
+    assert.match(scriptProblem("#eval 1; simp") ?? "", /Lean commands/)
+    assert.match(scriptProblem("def bad := 1; simp") ?? "", /may not contain `def`/)
+    assert.match(scriptProblem("simp [a, b") ?? "", /delimiters .* do not balance/)
+    assert.match(scriptProblem("simp (a]") ?? "", /parentheses .* do not balance/)
   })
 
   test("a script that rests on anything but the standard axioms is rejected", async () => {
