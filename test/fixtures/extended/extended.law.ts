@@ -334,7 +334,7 @@ describe("soundness regressions from review", () => {
     expect(alwaysThrows()).toBeGreaterThan(0n)
   })
 
-  law("optional tuple elements, try/catch, conditional object spread, Object.assign and ES2025 Set methods", domain<{ items: [bigint, bigint?]; a: bigint; b: bigint; flag: boolean }>(), ({ items, a, b, flag }) => {
+  law("try/catch, conditional object spread, Object.assign, ES2025 Set methods, freeze and spread snapshotting", domain<{ items: [bigint] | [bigint, bigint]; a: bigint; b: bigint; flag: boolean }>(), ({ items, a, b, flag }) => {
     expect(items.length === 1 || items.length === 2).toBe(true)
     expect(safeDivide(a, b)).toBe(b === 0n ? 0n : a / b)
     let fallback = a
@@ -346,11 +346,22 @@ describe("soundness regressions from review", () => {
     expect(fallback).toBe(b === 0n ? 0n : a)
     expect(mergeConfig(flag, a, b)).toEqual(flag ? { a, b } : { a })
     expect({ ...(flag ? { x: a } : null), y: b }).toEqual(flag ? { x: a, y: b } : { y: b })
+    // Spread fields are snapshotted before later properties mutate the source.
+    const src = { x: 1n }
+    const snap = { ...src, y: (() => { src.x = 2n; return 9n })() }
+    expect(snap).toEqual({ x: 1n, y: 9n })
+    // Conditional Object.freeze stays on its own branch so the else branch can still write.
+    const box = { v: a }
+    if (flag) { Object.freeze(box) } else { box.v = b }
+    expect(box.v).toBe(flag ? a : b)
     const s1 = new Set([a, b])
     const s2 = new Set([b])
     expect(s2.isSubsetOf(s1)).toBe(true)
     expect(s1.isSupersetOf(s2)).toBe(true)
     expect(s1.isDisjointFrom(s2)).toBe(false)
+    const s3 = new Set([1n, 2n])
+    s3.delete(flag ? 1n : 2n)
+    expect(s3.size).toBe(1)
     const c1 = new Set(["a", "b"])
     const c2 = new Set(["b", "c"])
     expect([...c1.union(c2)]).toEqual(["a", "b", "c"])
@@ -372,7 +383,44 @@ describe("soundness regressions from review", () => {
     expect(guarded).toBe(a === 0n ? 0n : 10n / a + 5n)
   })
 
-  law("FALSE: optional tuple always has length 2", domain<[bigint, bigint?]>(), items => {
-    expect(items.length).toBe(2)
+  law("parenthesized arrow body expectation is not vacuous", domain<bigint>(), x => (expect(x + 0n).toBe(x)))
+
+  law("CHECKED: try block mutating outer object before throwing is refused", domain<boolean>(), flag => {
+    const box = { x: 0n }
+    try {
+      if (flag) {
+        box.x = 1n
+        throw new Error("boom")
+      }
+    } catch {
+      // ignore
+    }
+    expect(box.x).toBe(flag ? 1n : 0n)
+  })
+
+  law("CHECKED: destructuring catch parameter is refused", domain<boolean>(), _flag => {
+    let ok = false
+    try {
+      try {
+        throw null
+      } catch ({}: any) {
+        ok = true
+      }
+    } catch {
+      ok = false
+    }
+    expect(ok).toBe(false)
+  })
+
+  law("CHECKED: Object.assign adding keys in different orders across branches is refused", domain<boolean>(), flag => {
+    const dst: Record<string, bigint> = {}
+    Object.assign(dst, flag ? { a: 1n, b: 2n } : { b: 2n, a: 1n })
+    expect(Object.keys(dst)).toEqual(flag ? ["a", "b"] : ["b", "a"])
+  })
+
+  law("CHECKED: Math.pow with spread leaving wrong arity is refused cleanly", domain<boolean>(), _flag => {
+    const t: [number] = [3]
+    t.pop()
+    expect(Number.isNaN(Math.pow(...(t as unknown as [number]), 2))).toBe(true)
   })
 })

@@ -214,6 +214,7 @@ interface Saved {
   logged: number
   scopes: number
   written: number
+  frozen: number
   objects: number
 }
 
@@ -340,6 +341,8 @@ export class Translator {
   private frame = 0
   /** Every variable assigned to since code that JavaScript may skip started running, while there is such code. */
   private assignedTo: Set<Cell> | undefined
+  /** Every object mutated or frozen since code that JavaScript may skip started running, independent of branch rollback. */
+  private writtenTo: Set<Stored> | undefined
   /** For each function being evaluated, the names it assigns to anywhere in its body. */
   private assigned: Set<string>[] = []
   private steps = 0
@@ -358,6 +361,8 @@ export class Translator {
   private epoch = 0
   /** Every change made to an object in place since the current law instance started, oldest first. */
   private writes: Write[] = []
+  /** Every freeze made since the current law instance started, so branch restore can undo conditional freezes. */
+  private freezes: { target: Stored; epoch: number }[] = []
   /** Iterators currently being stepped through by `for...of` or `Array.from`, so reentrant consumption is refused. */
   private readonly activeIterators = new Set<Stored>()
   /** Nesting depth inside `.toThrow()` callback evaluation, where throw operands must be evaluated for side effects. */
@@ -450,6 +455,7 @@ export class Translator {
         try {
           // What a describe declares is shared by its laws, so no law may change it: its epoch ends here.
           this.writes = []
+          this.freezes = []
           this.epoch = ++epochs
           if (statement.kind === K.VariableStatement) this.declare(statement, env)
           else if (statement.kind !== K.FunctionDeclaration) invalid(statement, "only laws and declarations are allowed inside describe()")
@@ -568,6 +574,7 @@ export class Translator {
         this.frame = 0
         bindingLog.length = 0
         this.writes = []
+        this.freezes = []
         this.epoch = ++epochs
         this.steps = 0
         const facts = this.factsOf(callback)
@@ -637,6 +644,7 @@ export class Translator {
   }
 
   private scanExpectSites(root: N, into: Law["expectSites"]) {
+    while (root.kind === K.ParenthesizedExpression) root = root.expression
     const visit = (n: N) => {
       if (this.isExpect(n)) {
         let statement = n
@@ -713,15 +721,10 @@ export class Translator {
     }
     if (this.checker.isTupleType(type)) {
       const elementFlags = ((type as N).getTarget?.().elementFlags ?? (type as N).elementFlags ?? []) as number[]
-      if (elementFlags.some(flag => flag !== ElementFlags.Required && flag !== ElementFlags.Optional)) {
-        throw new Unsupported("rest tuple elements are not supported", at)
+      if (elementFlags.some(flag => flag !== ElementFlags.Required)) {
+        throw new Unsupported("optional and rest tuple elements are not supported; use a union of fixed tuples such as `[A] | [A, B]`", at)
       }
-      const items = this.checker.getTypeArguments(type as N).map(item => this.shapeOf(item, at, depth + 1))
-      const required = elementFlags.filter(flag => flag === ElementFlags.Required).length
-      if (required === items.length) return { k: "tuple", items }
-      const alts: Shape[] = []
-      for (let len = required; len <= items.length; len++) alts.push({ k: "tuple", items: items.slice(0, len) })
-      return { k: "union", alts }
+      return { k: "tuple", items: this.checker.getTypeArguments(type as N).map(item => this.shapeOf(item, at, depth + 1)) }
     }
     if (this.checker.isArrayType(type)) throw new Unsupported("arrays of unknown length are not supported as inputs; use a tuple", at)
     if (flags & TypeFlags.Object) {
@@ -908,6 +911,10 @@ export class Translator {
       this.emit("expect", negated ? ir.not(pass) : pass, node)
       return
     }
+    if (actual.k === "bottom") {
+      this.emit("expect", ir.FALSE, node)
+      return
+    }
     const expected = this.evalExpr(node.arguments[0], env)
     if (matcher === "toEqual" || matcher === "toBe") {
       const equal = this.equal(actual, expected, node, matcher === "toBe")
@@ -915,7 +922,7 @@ export class Translator {
       this.emit("expect", negated ? ir.not(equal) : equal, node, sides)
       return
     }
-    if (actual.k === "bottom" || expected.k === "bottom") {
+    if (expected.k === "bottom") {
       this.emit("expect", ir.FALSE, node)
       return
     }
@@ -1012,7 +1019,7 @@ export class Translator {
   }
 
   private save(): Saved {
-    return { values: this.cells.map(cell => cell.value), logged: bindingLog.length, scopes: scopesCreated, written: this.writes.length, objects: objectsCreated }
+    return { values: this.cells.map(cell => cell.value), logged: bindingLog.length, scopes: scopesCreated, written: this.writes.length, frozen: this.freezes.length, objects: objectsCreated }
   }
 
   /** Mark an object as created here and now, which is what allows changing it in place. */
@@ -1023,7 +1030,12 @@ export class Translator {
 
   /** Take away the right to change objects in place. Epochs start at 1, so 0 is never the current one. */
   private freeze(...values: Stored[]) {
-    for (const value of values) if (value.own) value.own.epoch = 0
+    for (const value of values) {
+      if (value.own && value.own.epoch !== 0) {
+        this.freezes.push({ target: value, epoch: value.own.epoch })
+        value.own.epoch = 0
+      }
+    }
   }
 
   private slot(target: Stored, slot: string | number): Value | undefined {
@@ -1040,6 +1052,7 @@ export class Translator {
 
   /** Change an object in place, remembering what was there. */
   private write(target: Stored, slot: string | number, value: Value) {
+    this.writtenTo?.add(target)
     this.writes.push({ target, slot, previous: this.slot(target, slot) })
     this.put(target, slot, value)
   }
@@ -1089,6 +1102,17 @@ export class Translator {
       const b = whenFalse?.get(target)
       const slots = [...new Set([...(a?.keys() ?? []), ...(b?.keys() ?? [])])]
       if (target.k === "array") slots.sort((x, y) => (x as number) - (y as number))
+      else if (!dead && a && b) {
+        const addedA = [...a.keys()].filter(k => this.slot(target, k) === undefined && a.get(k) !== undefined) as string[]
+        const addedB = [...b.keys()].filter(k => this.slot(target, k) === undefined && b.get(k) !== undefined) as string[]
+        if (addedA.length > 1 && addedA.length === addedB.length) {
+          const orderA = ownKeysOrdered(new Map(addedA.map(k => [k, VOID])))
+          const orderB = ownKeysOrdered(new Map(addedB.map(k => [k, VOID])))
+          if (!orderA.every((k, i) => k === orderB[i])) {
+            throw new Unsupported("adding properties to an object in different orders on the two sides of a condition is not supported", undefined)
+          }
+        }
+      }
       const deleted: (string | number)[] = []
       for (const slot of slots) {
         const now = this.slot(target, slot)
@@ -1122,21 +1146,24 @@ export class Translator {
    * existed before it, so anything else is refused.
    */
   private unchanging<T>(what: string, at: N, run: () => T): T {
-    const written = this.writes.length
     const objects = objectsCreated
     const existing = new Set(this.cells)
-    const outer = this.assignedTo
+    const outerAssigned = this.assignedTo
+    const outerWritten = this.writtenTo
     const assigned = this.assignedTo = new Set()
+    const written = this.writtenTo = new Set()
     let result: T
     try {
       result = run()
     } finally {
-      this.assignedTo = outer
-      // Code around this that may be skipped as well sees the same assignments.
-      if (outer) for (const cell of assigned) outer.add(cell)
+      this.assignedTo = outerAssigned
+      this.writtenTo = outerWritten
+      // Code around this that may be skipped as well sees the same assignments and writes.
+      if (outerAssigned) for (const cell of assigned) outerAssigned.add(cell)
+      if (outerWritten) for (const target of written) outerWritten.add(target)
     }
-    for (let i = written; i < this.writes.length; i++) {
-      if (this.writes[i]!.target.own!.born < objects) throw new Unsupported(`${what} changes an object in place, which is not modeled there; make the change in a statement of its own`, at)
+    for (const target of written) {
+      if (target.own && target.own.born < objects) throw new Unsupported(`${what} changes an object in place, which is not modeled there; make the change in a statement of its own`, at)
     }
     // The same goes for a variable that a function called there assigns to. Every assignment counts, not
     // only a value that ends up different: a callback JavaScript never reaches may put back what an earlier one changed.
@@ -1159,6 +1186,19 @@ export class Translator {
       const { target, slot, previous } = this.writes.pop()!
       if (target.own!.born < saved.objects) this.put(target, slot, previous)
     }
+    while (this.freezes.length > saved.frozen) {
+      const { target, epoch } = this.freezes.pop()!
+      if (target.own && target.own.born < saved.objects) target.own.epoch = epoch
+    }
+  }
+
+  private freezesSince(since: Saved): Stored[] {
+    const out: Stored[] = []
+    for (let i = since.frozen; i < this.freezes.length; i++) {
+      const target = this.freezes[i]!.target
+      if (target.own && target.own.born < since.objects) out.push(target)
+    }
+    return out
   }
 
   /**
@@ -1183,13 +1223,17 @@ export class Translator {
     const outlives = control ? this.frame : before.values.length
     const a = this.under(cond, whenTrue)
     const changedA = this.changesSince(before)
+    const frozenA = this.freezesSince(before)
     const heldA = this.cells.slice(0, outlives).map(cell => cell.value)
     this.restore(before)
     const b = this.under(ir.not(cond), whenFalse)
     const changedB = this.changesSince(before)
+    const frozenB = this.freezesSince(before)
     const heldB = this.cells.slice(0, outlives).map(cell => cell.value)
     this.restore(before)
     this.mergeChanges(cond, changedA, changedB, a.k === "bottom" ? "true" : b.k === "bottom" ? "false" : undefined)
+    if (a.k !== "bottom" && frozenA.length) this.freeze(...frozenA)
+    if (b.k !== "bottom" && frozenB.length) this.freeze(...frozenB)
     for (let i = 0; i < outlives; i++) {
       // A side that never continues leaves the variable as the other side has it.
       const onTrue = a.k === "bottom" ? heldB[i]! : heldA[i]!
@@ -1213,19 +1257,25 @@ export class Translator {
     let afterFalse: Value[]
     let changedTrue: Changes | undefined
     let changedFalse: Changes | undefined
+    let frozenTrue: Stored[] = []
+    let frozenFalse: Stored[] = []
     try {
       this.under(cond, whenTrue)
       afterTrue = this.cells.slice(0, kept).map(cell => cell.value)
       changedTrue = this.changesSince(before)
+      frozenTrue = this.freezesSince(before)
       this.restore(before)
       this.under(ir.not(cond), whenFalse)
       afterFalse = this.cells.slice(0, kept).map(cell => cell.value)
       changedFalse = this.changesSince(before)
+      frozenFalse = this.freezesSince(before)
       this.restore(before)
     } finally {
       this.merging--
     }
     this.mergeChanges(cond, changedTrue, changedFalse)
+    if (frozenTrue.length) this.freeze(...frozenTrue)
+    if (frozenFalse.length) this.freeze(...frozenFalse)
     this.cells.forEach((cell, i) => {
       const a = afterTrue[i]!
       const b = afterFalse[i]!
@@ -1739,11 +1789,14 @@ export class Translator {
         const catchClause = statement.catchClause
         if (!catchClause || !this.instance) throw new Unsupported("try/catch is only supported inside a law", statement)
         if (catchClause.variableDeclaration) {
-          const names = new Set(boundNames(catchClause.variableDeclaration.name))
+          if (catchClause.variableDeclaration.name.kind !== K.Identifier) {
+            throw new Unsupported("destructuring the caught error in `catch` is not supported", catchClause)
+          }
+          const errName = catchClause.variableDeclaration.name.text as string
           let usedErr = false
           const scan = (n: N) => {
             if (usedErr) return
-            if (n.kind === K.Identifier && names.has(n.text)) { usedErr = true; return }
+            if (n.kind === K.Identifier && n.text === errName) { usedErr = true; return }
             n.forEachChild(scan)
           }
           scan(catchClause.block)
@@ -2061,7 +2114,15 @@ export class Translator {
         const parts: ({ spread: true; value: Value; node: N } | { spread: false; name: string; value: Value })[] = []
         for (const property of node.properties as N[]) {
           if (property.kind === K.SpreadAssignment) {
-            const spread = this.evalExpr(property.expression, env)
+            const raw = this.evalExpr(property.expression, env)
+            if (raw.k === "bottom") return BOTTOM
+            // Snapshot own fields now, before later properties run and can mutate the spread source.
+            const spread = this.over(raw, alt => {
+              if (alt.k === "bottom") return BOTTOM
+              if (alt.k === "void" || alt.k === "null") return alt
+              if (alt.k !== "record") throw new Unsupported(`cannot spread ${describe(alt)} into an object`, property)
+              return this.fresh({ k: "record", fields: new Map(alt.fields), ...(alt.unordered ? { unordered: true } : {}) })
+            })
             if (spread.k === "bottom") return BOTTOM
             parts.push({ spread: true, value: spread, node: property })
           } else if (property.kind === K.ShorthandPropertyAssignment) {
@@ -2077,7 +2138,11 @@ export class Translator {
             parts.push({ spread: false, name: propName, value: val })
           } else throw new Unsupported("methods, accessors and computed property names are not supported in object literals", property)
         }
+        let shapes = 0
         const build = (from: number, before: Map<string, Value>, unorderedBefore: boolean): Value => {
+          if (++shapes > MAX_ALTERNATIVES) {
+            throw new Unsupported(`an object literal with more than ${MAX_ALTERNATIVES} conditional spread combinations is not supported`, node)
+          }
           const fields = new Map(before)
           let unordered = unorderedBefore
           for (let index = from; index < parts.length; index++) {
@@ -2635,7 +2700,10 @@ export class Translator {
     if (name === "freeze") {
       if (args.length > 1) throw new Unsupported("`Object.freeze` takes one argument", node)
       return this.over(args[0] ?? VOID, v => {
-        if (v.k === "record" || v.k === "array") this.freeze(v)
+        if (v.k === "record" || v.k === "array") {
+          if (v.own?.epoch === this.epoch) this.writtenTo?.add(v)
+          this.freeze(v)
+        }
         return v
       })
     }
@@ -2953,8 +3021,9 @@ export class Translator {
       }
       return best
     }
-    if (name === "pow" && parameters.length === 2) {
+    if (name === "pow") {
       const args = this.arguments(node, env)
+      if (args.length !== 2) throw new Unsupported("Math.pow takes two arguments", node)
       return this.over(args[0]!, a => this.over(args[1]!, b => {
         if (a.k === "bottom" || b.k === "bottom") return BOTTOM
         if (!isNumber(a) || !isNumber(b)) throw new Unsupported("Math.pow is modeled for numbers", node)
@@ -3707,10 +3776,11 @@ export class Translator {
       if (entry.k === "choice") {
         const a = entryOf(entry.a)
         const b = entryOf(entry.b)
-        if (a.kind !== "set" || b.kind !== "set" || !a.key || !b.key || a.key.e.ty !== b.key.e.ty || !!a.key.num !== !!b.key.num) {
-          throw new Unsupported("a Map or a Set updated incompatibly on the two sides of a condition is not supported", undefined)
+        if ((a.kind === "set" || a.kind === "delete") && a.kind === b.kind && a.key && b.key && a.key.e.ty === b.key.e.ty && !!a.key.num === !!b.key.num) {
+          const key = scalar(ir.ite(entry.cond, a.key.e, b.key.e), a.key.num) as Extract<Value, { k: "scalar" }>
+          return a.kind === "delete" ? { kind: "delete", key, value: VOID } : { kind: "set", key, value: this.mergeHeld(entry.cond, a.value, b.value) }
         }
-        return { kind: "set", key: scalar(ir.ite(entry.cond, a.key.e, b.key.e), a.key.num) as Extract<Value, { k: "scalar" }>, value: this.mergeHeld(entry.cond, a.value, b.value) }
+        throw new Unsupported("a Map or a Set updated incompatibly on the two sides of a condition is not supported", undefined)
       }
       if (entry.k !== "array") throw new Error("an entry of a Map or a Set is a list")
       const [first, second] = entry.items
@@ -4016,25 +4086,31 @@ export class Translator {
       }
     }
     if (declaration.kind === K.EnumDeclaration) {
-      if (declaration.parent.kind !== K.SourceFile) throw new Unsupported(`\`${node.text}\` is a local enum that is not supported`, node)
-      const early = this.loading.find(entry => entry.file === file.fileName && declaration.pos > entry.position)
+      const decls = (symbol.declarations as readonly N[]).map(d => d.resolve()).filter((d: N) => d.kind === K.EnumDeclaration)
+      if (decls.some(d => d.parent.kind !== K.SourceFile || d.getSourceFile() !== file)) {
+        throw new Unsupported(`\`${node.text}\` is a local or cross-file merged enum that is not supported`, node)
+      }
+      const lastPos = Math.max(...decls.map(d => d.pos as number))
+      const early = this.loading.find(entry => entry.file === file.fileName && lastPos > entry.position)
       if (early) throw new Unsupported(`\`${node.text}\` is read while its module is loading, before its own declaration has run, which throws`, node)
       const known = this.constants.get(declaration)
       if (known) return known
-      const isConst = declaration.modifiers?.some((m: N) => m.kind === K.ConstKeyword) === true
       const fields = new Map<string, Value>()
-      for (const member of declaration.members as readonly N[]) {
-        if (member.name.kind !== K.Identifier && member.name.kind !== K.StringLiteral) {
-          throw new Unsupported("computed enum member names are not supported", member)
+      for (const decl of decls) {
+        const isConst = decl.modifiers?.some((m: N) => m.kind === K.ConstKeyword) === true
+        for (const member of decl.members as readonly N[]) {
+          if (member.name.kind !== K.Identifier && member.name.kind !== K.StringLiteral) {
+            throw new Unsupported("computed enum member names are not supported", member)
+          }
+          const val = this.checker.getConstantValue(member)
+          if (typeof val !== "string" && (typeof val !== "number" || !Number.isSafeInteger(val))) {
+            throw new Unsupported("only enums with constant whole-number or string values are supported", member)
+          }
+          const key = member.name.text as string
+          if (key === "__proto__") throw new Unsupported("`__proto__` as an enum member is not modeled", member)
+          fields.set(key, typeof val === "string" ? scalar(ir.lit(this.wellFormed(val, member))) : scalar(ir.lit(BigInt(val)), true))
+          if (!isConst && typeof val === "number") fields.set(String(val), scalar(ir.lit(this.wellFormed(key, member))))
         }
-        const val = this.checker.getConstantValue(member)
-        if (typeof val !== "string" && (typeof val !== "number" || !Number.isSafeInteger(val))) {
-          throw new Unsupported("only enums with constant whole-number or string values are supported", member)
-        }
-        const key = member.name.text as string
-        if (key === "__proto__") throw new Unsupported("`__proto__` as an enum member is not modeled", member)
-        fields.set(key, typeof val === "string" ? scalar(ir.lit(this.wellFormed(val, member))) : scalar(ir.lit(BigInt(val)), true))
-        if (!isConst && typeof val === "number") fields.set(String(val), scalar(ir.lit(this.wellFormed(key, member))))
       }
       const value: Value = { k: "record", fields }
       this.assertStable(file, declaration, value, node)
@@ -4116,7 +4192,8 @@ export class Translator {
     })()
     const handedOver: { at: N; inFunction: boolean }[] = []
     const visit = (node: N, inFunction: boolean) => {
-      if (node.kind === K.Identifier && node.text === name && node !== declaration.name) {
+      if (node.kind === K.Identifier && node.text === name && node !== declaration.name &&
+        !(declaration.kind === K.EnumDeclaration && node.parent?.kind === K.EnumDeclaration && node.parent.name === node)) {
         // The longest access path that starts at this name, such as `table.rows[0]`.
         let top = node
         const path: (string | undefined)[] = []

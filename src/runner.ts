@@ -32,18 +32,19 @@ export interface WatchSession {
   close(): void
   /** Law files affected by a change to `changedFile`, or `undefined` when a full run is needed. */
   affected(changedFile: string): string[] | undefined
-  /** Internal state mapping each law file to its transitive dependencies and an optional open compiler API. */
-  readonly _internal: {
-    dependencies: Map<string, Set<string>>
-    api?: InstanceType<typeof API>
-    apiCwd?: string
-  }
 }
 
+interface SessionState {
+  dependencies: Map<string, Set<string>>
+  api?: InstanceType<typeof API>
+  apiCwd?: string
+}
+
+const sessionStates = new WeakMap<WatchSession, SessionState>()
+
 export function createWatchSession(): WatchSession {
-  const state: WatchSession["_internal"] = { dependencies: new Map() }
-  return {
-    _internal: state,
+  const state: SessionState = { dependencies: new Map() }
+  const session: WatchSession = {
     close() {
       state.dependencies.clear()
       state.api?.close()
@@ -60,6 +61,8 @@ export function createWatchSession(): WatchSession {
       return hit
     },
   }
+  sessionStates.set(session, state)
+  return session
 }
 
 /** Collect every project file transitively imported or re-exported by `entry`, including type-only imports and `.d.ts` files. */
@@ -403,18 +406,19 @@ function runtimeMap(program: Program, checker: Checker, ambiguous: (message: str
     const text = source.text
     const resolutions = new Map<string, string>()
     const edits: [number, number, string][] = []
-    /** The range of a binding, widened over one neighbouring comma. */
+    /** The range of a binding, widened over one neighbouring comma (skipping trivia/comments). */
     const withComma = (node: N): [number, number, string] => {
       let start = node.getStart(source) as number
       let end = node.end as number
-      const after = /^\s*,/.exec(text.slice(end))
+      const after = /^(?:\s|\/\/[^\n]*|\/\*[\s\S]*?\*\/)*,/.exec(text.slice(end))
       if (after) end += after[0].length
       else {
-        const before = /,\s*$/.exec(text.slice(0, start))
+        const before = /,(?:\s|\/\*[\s\S]*?\*\/)*$/.exec(text.slice(0, start))
         if (before) start -= before[0].length
       }
       return [start, end, ""]
     }
+    const seenEnums = new Set<string>()
     for (const statement of source.statements as readonly N[]) {
       if (statement.kind === K.EnumDeclaration && statement.name?.kind === K.Identifier) {
         if (statement.modifiers?.some((m: N) => m.kind === K.DeclareKeyword)) continue
@@ -431,7 +435,14 @@ function runtimeMap(program: Program, checker: Checker, ambiguous: (message: str
           entries.push(`${JSON.stringify(key)}:${JSON.stringify(val)}`)
           if (!isConst && typeof val === "number") entries.push(`${JSON.stringify(String(val))}:${JSON.stringify(key)}`)
         }
-        if (ok) edits.push([statement.getStart(source), statement.end, `${isExport ? "export " : ""}const ${statement.name.text} = {${entries.join(",")}};`])
+        if (ok) {
+          const enumName = statement.name.text as string
+          const emitted = seenEnums.has(enumName)
+            ? `Object.assign(${enumName}, {${entries.join(",")}});`
+            : `${isExport ? "export " : ""}const ${enumName} = {${entries.join(",")}};`
+          seenEnums.add(enumName)
+          edits.push([statement.getStart(source), statement.end, emitted])
+        }
         continue
       }
       const isImport = statement.kind === K.ImportDeclaration
@@ -554,7 +565,7 @@ export async function run(options: RunOptions = {}): Promise<Report> {
     return finish()
   }
   if (!lawFiles.length) {
-    if (options.session && config.lawFiles === undefined && !filters.length && !config.name) options.session._internal.dependencies.clear()
+    if (options.session && config.lawFiles === undefined && !filters.length && !config.name) sessionStates.get(options.session)?.dependencies.clear()
     report.errors.push(filters.length ? `no law file matches ${filters.map(f => `\`${f}\``).join(" or ")}` : "no law files were found")
     return finish()
   }
@@ -578,7 +589,7 @@ export async function run(options: RunOptions = {}): Promise<Report> {
 
   // Read and translate the laws.
   const reading = performance.now()
-  const session = options.session?._internal
+  const session = options.session ? sessionStates.get(options.session) : undefined
   const changed = config.changedFiles?.map(file => resolve(cwd, file))
   const reuseApi = !!(session && changed?.length && session.api && session.apiCwd === cwd)
   let api: InstanceType<typeof API>

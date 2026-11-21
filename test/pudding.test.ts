@@ -945,12 +945,12 @@ law("SAFE[0] is 1", () => expect(readSafe()).toBe(1))
 export type A = bigint
 export type B = bigint
 export enum Role { Viewer = "viewer", Admin = "admin" }
-export enum Priority { Low, High = 10 }
+export enum Priority { Low }
+export enum Priority { High = 10 }
 export const enum Flags { Read = 1, Write = 2 }
 `)
       writeFileSync(join(project, "order.law.ts"), `import { domain, expect, law } from "@bytewaveco/pudding"
-import DefaultT from "./types"
-import { type A, B, Role, Priority, Flags } from "./types"
+import DefaultT /* comment before comma */, { type A, B, Role, Priority, Flags } from "./types"
 law("enums work as domains and values", domain<{ role: Role; prio: Priority; flag: Flags }>(), ({ role, prio, flag }) => {
   expect(role === Role.Viewer || role === Role.Admin).toBe(true)
   expect(Priority[prio]).toBe(prio === Priority.Low ? "Low" : "High")
@@ -963,11 +963,16 @@ law("FALSE: x is greater than 5", domain<A>(), (x: B) => {
 law("VACUOUS: impossible arithmetic", domain<bigint>(), x => {
   if (x > 10n && x < 5n) expect(x).toBeGreaterThan(0n)
 })
+law("optional tuple refused", domain<[bigint, bigint?]>(), items => {
+  expect(items.length === 1 || items.length === 2).toBe(true)
+})
 `)
       const first = await run({ cwd: project })
       assert.deepEqual(first.errors, [])
       assert.deepEqual(first.warnings, [])
       assert.equal(law(first, "enums work as domains and values").status, "proved")
+      assert.equal(law(first, "optional tuple refused").status, "failed")
+      assert.equal(law(first, "optional tuple refused").findings[0]?.kind, "unsupported")
       const gt = law(first, "FALSE: x is greater than 5")
       assert.equal(gt.status, "failed")
       assert.match(gt.findings[0]?.detail ?? "", /actual: +.*\nexpected: > 5n/)
