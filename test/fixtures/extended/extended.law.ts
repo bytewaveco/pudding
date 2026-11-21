@@ -1,7 +1,7 @@
 import { describe, domain, expect, law, type Integer } from "@bytewaveco/pudding"
 import {
-  hasField, listOps, mapDeleteOrder, mapSymbolicDelete, minOfList, nullAccess, nullOrDefault,
-  optionalNull, orderedKeys, paramDefault, requirePositive, roundTripEntries, stackOps,
+  alwaysThrows, daysOrDefault, FROZEN_DAYS, hasField, listOps, mapDeleteOrder, mapSymbolicDelete, mergeConfig, minOfList, nullAccess, nullOrDefault,
+  optionalNull, orderedKeys, paramDefault, requirePositive, roundTripEntries, safeDivide, stackOps,
   stringHelpers, sumVariadic, tagOf,
 } from "./extended.ts"
 
@@ -295,5 +295,84 @@ describe("soundness regressions from review", () => {
     else m.clear()
     m.clear()
     expect(m.size).toBe(0)
+  })
+
+  law("symbolic array indexing, Object.freeze, with, toSpliced, 1-arg reduce, flat(Infinity), Math.min/max with Infinity, Map/Set forEach, codePointAt and exponentiation", domain<{ i: Integer<0, 500>; a: bigint; b: bigint; k: "x" | "y" | undefined; pad: "0" | "_" }>(), ({ i, a, b, k, pad }) => {
+    expect(daysOrDefault(i)).toBe(i === 0 ? 31 : i === 1 ? 28 : i === 2 ? 31 : i === 3 ? 30 : 0)
+    if (i < 4) expect(FROZEN_DAYS[i]!).toBeGreaterThanOrEqual(28)
+    expect([a, b].with(-1, 0n)).toEqual([a, 0n])
+    expect(() => [a].with(2, 0n)).toThrow()
+    expect(([a, b, 0n] as bigint[]).toSpliced(0, 0)).toEqual([a, b, 0n])
+    expect([a, b, 0n].toSpliced(1)).toEqual([a])
+    expect([a, b, 0n].toSpliced(1, -5, 9n)).toEqual([a, 9n, b, 0n])
+    expect([a, b, 0n].toSpliced(1, undefined as unknown as number, 9n)).toEqual([a, 9n, b, 0n])
+    expect([a, b].reduce((x, y) => x + y)).toBe(a + b)
+    expect([a, b].reduceRight((x, y) => x - y)).toBe(b - a)
+    expect(() => ([] as bigint[]).reduce((x, y) => x + y)).toThrow()
+    expect([[[a]], [b]].flat(Infinity)).toEqual([a, b])
+    expect([[[a]], [b]].flat(-Infinity)).toEqual([[[a]], [b]])
+    expect(Math.min(i, Infinity)).toBe(i)
+    expect(Math.max(i, -Infinity)).toBe(i)
+    const m = new Map<string | undefined, bigint>([["x", a], ["y", b]])
+    expect(m.has(k)).toBe(k !== undefined)
+    expect(m.get(k)).toBe(k === "x" ? a : k === "y" ? b : undefined)
+    let sum = 0n
+    m.forEach(v => { sum += v })
+    expect(sum).toBe(a + b)
+    expect("A".codePointAt(0)).toBe(65)
+    expect("A".codePointAt(5)).toBeUndefined()
+    expect("7".padStart(3, pad)).toBe(`${pad}${pad}7`)
+    expect(2 ** 10).toBe(1024)
+    expect(10n ** 0n).toBe(1n)
+    expect(a ** 2n).toBe(a * a)
+    expect(() => 2n ** -1n).toThrow()
+    expect(() => alwaysThrows() === 1n).toThrow()
+    expect(() => !alwaysThrows()).toThrow()
+  })
+
+  law("FALSE: ordering matcher on unconditional throw reports throws instead of unsupported", () => {
+    expect(alwaysThrows()).toBeGreaterThan(0n)
+  })
+
+  law("optional tuple elements, try/catch, conditional object spread, Object.assign and ES2025 Set methods", domain<{ items: [bigint, bigint?]; a: bigint; b: bigint; flag: boolean }>(), ({ items, a, b, flag }) => {
+    expect(items.length === 1 || items.length === 2).toBe(true)
+    expect(safeDivide(a, b)).toBe(b === 0n ? 0n : a / b)
+    let fallback = a
+    try {
+      if (b === 0n) throw new Error("zero")
+    } catch {
+      fallback = 0n
+    }
+    expect(fallback).toBe(b === 0n ? 0n : a)
+    expect(mergeConfig(flag, a, b)).toEqual(flag ? { a, b } : { a })
+    expect({ ...(flag ? { x: a } : null), y: b }).toEqual(flag ? { x: a, y: b } : { y: b })
+    const s1 = new Set([a, b])
+    const s2 = new Set([b])
+    expect(s2.isSubsetOf(s1)).toBe(true)
+    expect(s1.isSupersetOf(s2)).toBe(true)
+    expect(s1.isDisjointFrom(s2)).toBe(false)
+    const c1 = new Set(["a", "b"])
+    const c2 = new Set(["b", "c"])
+    expect([...c1.union(c2)]).toEqual(["a", "b", "c"])
+    expect([...c1.intersection(c2)]).toEqual(["b"])
+    expect([...c1.difference(c2)]).toEqual(["a"])
+    expect([...c1.symmetricDifference(c2)]).toEqual(["a", "c"])
+    expect(Math.pow(3, 2)).toBe(9)
+    expect(new Set(null).size).toBe(0)
+    // A non-throwing obligation after a throwing expression in `try` is guarded by the earlier throw not happening.
+    const guarded = (() => {
+      try {
+        const q = 10n / a
+        const r = Math.trunc(10 / (a === 0n ? 0 : 2))
+        return q + BigInt(r)
+      } catch {
+        return 0n
+      }
+    })()
+    expect(guarded).toBe(a === 0n ? 0n : 10n / a + 5n)
+  })
+
+  law("FALSE: optional tuple always has length 2", domain<[bigint, bigint?]>(), items => {
+    expect(items.length).toBe(2)
   })
 })

@@ -169,6 +169,8 @@ class Generator {
     add(1, () => `({ p: ${sub(type)}, q: ${sub(r.pick(TYPES))} }).p`)
     add(0.6, () => `[${sub(type)}, ${sub(type)}][${r.int(2)}]!`)
     add(0.5, () => `({ ...{ p: ${sub(type)}, q: ${sub(type)} }, q: ${sub(type)} }).${r.pick(["p", "q"])}`)
+    add(0.5, () => `({ p: ${sub(type)}, ...(${sub("bool")} ? { p: ${sub(type)} } : null) }).p`)
+    add(0.5, () => `(Object.assign({}, { p: ${sub(type)} }, ${sub("bool")} ? { p: ${sub(type)} } : null)).p`)
     add(0.5, () => {
       const from = r.pick(TYPES)
       const inner = new Scope(scope, true)
@@ -195,16 +197,23 @@ class Generator {
       inner.names.set(name, { kind: "var", type: t })
       return `${name} => ${this.expr("bool", inner, depth - 1)}`
     }
-    // A value that may be undefined, and what stands in for it.
+    // A value that may be undefined or null, and what stands in for it.
     const maybe = t => r.pick([
       () => `(${sub("bool")} ? ${sub(t)} : undefined)`,
+      () => `(${sub("bool")} ? ${sub(t)} : null)`,
       () => `(${sub("bool")} ? { p: ${sub(t)} } : undefined)?.p`,
+      () => `(${sub("bool")} ? { p: ${sub(t)} } : null)?.p`,
       () => `({ p: ${sub(t)} } as { p: ${TS[t]}; q?: ${TS[t]} }).${r.pick(["p", "q"])}`,
-      () => `[${sub(t)}, ${sub(t)}].find(${predicate(t)})`,
+      () => `[${sub(t)}, ${sub(t)}].${r.pick(["find", "findLast"])}(${predicate(t)})`,
       () => `[${sub(t)}, ${sub(t)}].at(${r.pick([-3, -1, 0, 1, 2])})`,
       () => `new Map<string, ${TS[t]}>([[${sub("str")}, ${sub(t)}], [${sub("str")}, ${sub(t)}]]).get(${sub("str")})`,
     ])()
     add(1.2, () => `(${maybe(type)} ?? ${sub(type)})`)
+    add(0.6, () => `[${sub(type)}, ${sub(type)}].concat([${sub(type)}]).toReversed()[${r.int(3)}]!`)
+    add(0.5, () => `([[${sub(type)}], [${sub(type)}, ${sub(type)}]].flat(${r.pick(["", "1", "Infinity"])}) as ${TS[type]}[])[${r.int(3)}]!`)
+    add(0.5, () => `[${sub(type)}, ${sub(type)}].with(${r.pick([-2, -1, 0, 1])}, ${sub(type)})[${r.int(2)}]!`)
+    add(0.5, () => `[${sub(type)}, ${sub(type)}, ${sub(type)}].toSpliced(${r.pick([0, 1, -1])}, ${r.pick([0, 1, -1])}, ${sub(type)})[${r.int(2)}]!`)
+    add(0.4, () => `(Object.fromEntries([["a", ${sub(type)}], ["b", ${sub(type)}]]) as { a: ${TS[type]}; b: ${TS[type]} }).${r.pick(["a", "b"])}`)
     // TypeScript rejects a literal as the left side, so the value goes through a call.
     const opaque = t => `call((): ${TS[t]} => ${sub(t)})`
     if (type !== "bool") add(0.8, () => `(${opaque(type)} ${r.pick(["||", "&&"])} ${sub(type)})`)
@@ -220,12 +229,35 @@ class Generator {
       add(1, () => `(!${opaque(r.pick(["big", "num", "str"]))})`)
       add(0.8, () => {
         const t = r.pick(TYPES)
-        return `(${maybe(t)} ${r.pick(["===", "!=="])} undefined)`
+        return `(${maybe(t)} ${r.pick(["===", "!=="])} ${r.pick(["undefined", "null"])})`
       })
+      add(0.6, () => `(typeof ${maybe(r.pick(TYPES))} === ${JSON.stringify(r.pick(["undefined", "object", "boolean", "bigint", "number", "string"]))})`)
+      add(0.5, () => `(${JSON.stringify(r.pick(["a", "b", "c"]))} in { a: ${sub("big")}, b: ${sub("str")} })`)
+      add(0.5, () => `Object.hasOwn({ a: ${sub("big")}, "0": ${sub("str")} }, ${JSON.stringify(r.pick(["a", "0", "z"]))})`)
+      add(0.4, () => `Array.isArray(${r.pick([`[${sub("big")}]`, `{ a: ${sub("big")} }`, `new Map().keys()`])})`)
+      add(0.4, () => `Boolean(${maybe(r.pick(TYPES))})`)
+      add(0.4, () => `Number.${r.pick(["isInteger", "isFinite", "isNaN", "isSafeInteger"])}(${r.pick([sub("num"), "Infinity", "-Infinity"])})`)
+      add(0.5, () => `("pre_" + ${sub("str")}).startsWith(${JSON.stringify(r.pick(["pre_", "pr", "x"]))})`)
+      add(0.5, () => `(${sub("str")} + "_end").endsWith(${JSON.stringify(r.pick(["_end", "nd", "x"]))})`)
+      add(0.5, () => `(${sub("str")} + "MID" + ${sub("str")}).includes("MID")`)
       add(0.6, () => `(${sub("num")} ${r.pick(["<", "<=", ">", ">="])} (${maybe("num")} ?? ${r.pick(["Infinity", "-Infinity"])}))`)
       add(0.6, () => {
         const t = r.pick(["big", "num", "str"])
         return `new Set([${sub(t)}, ${sub(t)}]).has(${sub(t)})`
+      })
+      add(0.5, () => {
+        const t = r.pick(["big", "num", "str"])
+        return `new Set([${sub(t)}]).${r.pick(["isSubsetOf", "isSupersetOf", "isDisjointFrom"])}(new Set([${sub(t)}, ${sub(t)}]))`
+      })
+      add(0.4, () => {
+        const a = r.sample(STRS, 2).map(literal)
+        const b = r.sample(STRS, 2).map(literal)
+        return `new Set([${a.join(", ")}]).${r.pick(["union", "intersection", "difference", "symmetricDifference"])}(new Set([${b.join(", ")}])).has(${literal(r.pick(STRS))})`
+      })
+      add(0.5, () => `(() => { try { if (${sub("bool")}) throw new Error("x"); return true } catch { return false } })()`)
+      add(0.5, () => {
+        const t = r.pick(["big", "num", "str"])
+        return `(() => { const m = new Map([[${sub(t)}, 1n], [${sub(t)}, 2n]]); return m.delete(${sub(t)}) })()`
       })
       add(0.4, () => `new Set<number | bigint>([${sub("num")}, ${sub("big")}]).has(${sub(r.pick(["num", "big"]))})`)
       add(2, () => `(${sub("bool")} ${r.pick(["&&", "||"])} ${sub("bool")})`)
@@ -254,7 +286,8 @@ class Generator {
       add(2, () => `(${sub("big")} ${r.pick(["/", "%"])} ${literal(r.pick(BIGS.filter(v => v !== 0n && v !== 1n)))})`)
       add(0.4, () => `(${sub("big")} ${r.pick(["/", "%"])} ${sub("big")})`)
       add(0.7, () => `BigInt(${sub("num")})`)
-      add(1, () => `[${sub("big")}, ${sub("big")}, ${sub("big")}].reduce((s, e) => s ${r.pick(["+", "-", "*"])} e, ${sub("big")})`)
+      add(1, () => `[${sub("big")}, ${sub("big")}, ${sub("big")}].${r.pick(["reduce", "reduceRight"])}((s, e) => s ${r.pick(["+", "-", "*"])} e, ${sub("big")})`)
+      add(0.6, () => `[${sub("big")}, ${sub("big")}, ${sub("big")}].${r.pick(["reduce", "reduceRight"])}((s, e) => s ${r.pick(["+", "-"])} e)`)
       add(0.8, () => `[${sub("big")}, ${sub("big")}, ${sub("big")}].filter(${predicate("big")}).reduce((s, e) => s + e, ${sub("big")})`)
       add(0.5, () => `[${sub("big")}, ${sub("big")}].flatMap(e => (${sub("bool")} ? [e, ${sub("big")}] : [])).reduce((s, e) => s - e, ${sub("big")})`)
     } else if (type === "num") {
@@ -265,6 +298,14 @@ class Generator {
       add(2, () => `Math.${r.pick(["floor", "trunc", "ceil"])}(${sub("num")} / ${literal(r.pick(NUMS.filter(v => v !== 0)))})`)
       add(1.5, () => `Math.${r.pick(["abs", "sign"])}(${sub("num")})`)
       add(1.5, () => `Math.${r.pick(["min", "max"])}(${sub("num")}, ${sub("num")})`)
+      add(0.6, () => `Math.${r.pick(["min", "max"])}(${sub("num")}, ${r.pick(["Infinity", "-Infinity"])}) === Infinity ? 1 : Math.${r.pick(["min", "max"])}(${sub("num")}, ${sub("num")})`)
+      add(0.8, () => {
+        const t = r.pick(TYPES)
+        return `[${sub(t)}, ${sub(t)}, ${sub(t)}].${r.pick(["indexOf", "lastIndexOf"])}(${sub(t)}${r.chance(0.5) ? `, ${r.pick([-2, 0, 1, 2, "undefined"])}` : ""})`
+      })
+      add(0.7, () => `[${sub("big")}, ${sub("big")}, ${sub("big")}].${r.pick(["findIndex", "findLastIndex"])}(${predicate("big")})`)
+      add(0.6, () => `([10, 20, 30].at(${sub("num")}) ?? -1)`)
+      add(0.6, () => `(() => { const m = new Map([[${sub("str")}, 1], [${sub("str")}, 2]]); m.delete(${sub("str")}); return m.size })()`)
       add(0.7, () => `Number(${sub("big")})`)
       // A half rounds upward, whatever its sign.
       add(1.5, () => `Math.round(${sub("num")} / ${literal(r.pick(NUMS.filter(v => v !== 0)))})`)
@@ -289,6 +330,9 @@ class Generator {
       // Padding depends on the length of the text, which for a number depends on its size and sign.
       add(1.2, () => `${r.chance(0.7) ? `String(${sub(r.pick(["big", "num"]))})` : leaf()}.${r.pick(["padStart", "padEnd"])}(${r.int(6)}${r.chance(0.8) ? `, ${JSON.stringify(r.pick(["0", " ", "ab", "x.y", ""]))}` : ""})`)
       add(1, () => `(${sub(r.pick(["big", "num"]))}).toString()`)
+      add(0.8, () => `[${sub("big")}, ${r.pick(["null", "undefined", sub("str")])}, ${sub("num")}].join(${r.pick(["", '":"', "undefined", "null as unknown as string"])})`)
+      add(0.7, () => `Object.keys({ z: 1, "2": 2, a: 3, "0": 4 }).join(",")`)
+      add(0.7, () => `${JSON.stringify(r.pick(["  Ada-ok  ", "ababa", "hello"]))}.${r.pick(['trim()', 'toUpperCase()', 'toLowerCase()', 'slice(1, 4)', 'replace("a", "X")', 'replaceAll("a", "X")', 'split("-").join(":")'])}`)
     }
     const total = choices.reduce((sum, [weight]) => sum + weight, 0)
     let roll = r.next() * total
@@ -759,7 +803,11 @@ class Generator {
         const list = pickList()
         const value = this.expr(list.type, scope, 2)
         const roll = r.next()
-        return [roll < 0.5 ? `${list.name}.push(${value})` : `${list.name}[${roll < 0.75 ? "0" : `${list.name}.length - 1`}] = ${value}`]
+        if (roll < 0.35) return [`${list.name}.push(${value})`]
+        if (roll < 0.5) return [`${list.name}.unshift(${value})`]
+        if (roll < 0.65) return [`${list.name}.reverse()`]
+        if (roll < 0.8) return [`if (${list.name}.length > 1) ${list.name}.${r.pick(["pop", "shift"])}()`]
+        return [`${list.name}[${roll < 0.9 ? "0" : `${list.name}.length - 1`}] = ${value}`]
       })
       // Everything in the list, folded into a value the rest of the function can use.
       add(1, () => {
@@ -767,7 +815,9 @@ class Generator {
         const k = `v${this.counter++}`
         if (list.type === "big") {
           scope.names.set(k, { kind: "var", type: "big", mutable: true })
-          return [`let ${k}: bigint = 0n`, `for (const x of ${list.name}) ${k} += x`]
+          return r.chance(0.5)
+            ? [`let ${k}: bigint = 0n`, `for (const x of ${list.name}) ${k} += x`]
+            : [`let ${k}: bigint = 0n`, `${list.name}.forEach(x => { ${k} += x })`]
         }
         scope.names.set(k, { kind: "var", type: "num", mutable: false })
         return [`const ${k}: number = ${list.name}.length`]

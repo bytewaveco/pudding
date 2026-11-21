@@ -277,13 +277,13 @@ queues and leave requests.
   and tuples; `null` and `undefined`, with `??`, `?.`, defaults, `typeof` and
   `in`; `if`, `switch` and loops of known length; local changes in place;
   functions in any module, with rest/spread arguments and callbacks that keep
-  a running total; `const` tables; `Object.keys`/`values`/`entries`/`hasOwn`/
-  `fromEntries`; `Map` and `Set` (including `.delete`, `.clear`, `.keys`,
-  `.values`, `.entries`); `Math` rounding and `Number`/`Boolean`/`Array.isArray`
+  a running total; `const` tables and constant `enum`s; `Object.keys`/`values`/`entries`/`hasOwn`/
+  `fromEntries`/`freeze`/`assign`; `Map` and `Set` (including `.delete`, `.clear`, `.forEach`, `.keys`,
+  `.values`, `.entries`, and ES2025 `Set` algebra); `try`/`catch`; `Math` rounding and `Number`/`Boolean`/`Array.isArray`
   helpers; array methods (`.map`, `.filter`, `.flatMap`, `.flat`, `.find`,
   `.findIndex`, `.findLast`, `.findLastIndex`, `.reduce`, `.reduceRight`,
   `.forEach`, `.some`, `.every`, `.includes`, `.indexOf`, `.lastIndexOf`,
-  `.concat`, `.join`, `.at`, `.slice`, `.reverse`, `.toReversed`, `.push`,
+  `.concat`, `.join`, `.at`, `.slice`, `.with`, `.toSpliced`, `.reverse`, `.toReversed`, `.push`,
   `.pop`, `.shift`, `.unshift`, `.sort`, `.toSorted`); and string methods on
   known strings and static affixes.
 - **Refused:** fractions, loops whose length depends on an input, recursion,
