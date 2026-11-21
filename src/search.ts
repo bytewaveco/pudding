@@ -57,10 +57,18 @@ export function assignments(binders: readonly Binder[], pool: Pool, budget: numb
           if (visit(env)) return
           for (let i = pools.length - 1; i >= 0 && ++index[i]! === pools[i]!.length; i--) index[i] = 0
         }
+      } else if (pools.length) {
+        // When the full grid is too large, probe synchronized pool entries (e.g. all 0s, 1s, literals) before random draws.
+        const maxPool = Math.min(32, Math.max(...pools.map(p => p.length)))
+        for (let k = 0; k < maxPool && ran < budget; k++) {
+          binders.forEach((b, i) => env.set(b.name, pools[i]![k % pools[i]!.length]!))
+          ran++
+          if (visit(env)) return
+        }
       }
       if (finite && grid) return
       const random = generator(0x9e3779b9)
-      const draws = Math.max(0, Math.min(budget - ran, 5_000))
+      const draws = Math.max(0, Math.min(budget - ran, 25_000))
       for (let n = 0; n < draws; n++) {
         binders.forEach((b, i) => {
           const pool = pools[i]!
@@ -165,6 +173,11 @@ function shrink(binders: readonly Binder[], holds: (env: Map<string, Scalar>) =>
         for (let len = Math.floor(best.length / 2); len >= 1; len = Math.floor(len / 2)) {
           if (tryStr(best.slice(0, len).join(""))) best = best.slice(0, len)
           else if (tryStr(best.slice(-len).join(""))) best = best.slice(-len)
+        }
+        for (let step = 0; step < 16 && best.length > 1; step++) {
+          if (tryStr(best.slice(0, -1).join(""))) best = best.slice(0, -1)
+          else if (tryStr(best.slice(1).join(""))) best = best.slice(1)
+          else break
         }
       }
     }
