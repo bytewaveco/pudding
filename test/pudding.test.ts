@@ -825,11 +825,11 @@ law("every role can write", domain<Role>(), role => expect(canWrite(role)).toBe(
       assert.equal(afterTypeEdit.ok, false)
       assert.deepEqual(law(afterTypeEdit, "every role can write").findings[0]?.inputs, { role: '"guest"' })
 
-      // Edit the value module so the law passes again: session must see the new implementation immediately.
+      // Edit the value module so the law passes again: session with changedFiles reuses the open compiler API and sees the edit immediately.
       writeFileSync(join(project, "auth.ts"), `import type { Role } from "./types.ts"\nexport const canWrite = (_role: Role) => true\n`)
       const affectedValue = session.affected(join(project, "auth.ts"))
       assert.ok(affectedValue && affectedValue.some(file => file.endsWith("auth.law.ts")))
-      const afterValueEdit = await run({ cwd: project, cache: false, session, lawFiles: affectedValue })
+      const afterValueEdit = await run({ cwd: project, cache: false, session, lawFiles: affectedValue, changedFiles: [join(project, "auth.ts")] })
       assert.equal(afterValueEdit.ok, true)
 
       // Triple-slash `/// <reference path="..." />` directives (including indentation/spaces) must also be tracked, and deleted law files pruned on full runs.
@@ -866,6 +866,114 @@ law("own __proto__ property survives cross-check", domain<{ ["__proto__"]: 1; a:
       const report = await run({ cwd: project, cache: false })
       assert.equal(report.ok, true, JSON.stringify(report.laws))
       assert.equal(law(report, "own __proto__ property survives cross-check").status, "proved")
+    } finally {
+      rmSync(project, { recursive: true, force: true })
+    }
+  })
+
+  test("assertStable refuses module array tables mutated via callback-taking array methods", async () => {
+    const project = mkdtempSync(join(fixtures, ".tmp-"))
+    try {
+      writeFileSync(join(project, "evil.ts"), `export const A = [1, 2, 3]
+const _m = A.map((_, __, arr) => { arr[0] = 999; return 0 })
+export const B = [1, 2, 3]
+const _r = B.reduce((s, _, __, arr) => { arr[0] = 999; return s }, 0)
+export const C = [1, 2, 3]
+const _f = C.map(function (x) { (arguments[2] as number[])[0] = 999; return x })
+export const SAFE = [1, 2, 3]
+const _ok = SAFE.map(x => x + 1)
+export const readA = () => A[0]
+export const readB = () => B[0]
+export const readC = () => C[0]
+export const readSafe = () => SAFE[0]
+`)
+      writeFileSync(join(project, "evil.law.ts"), `import { expect, law } from "@bytewaveco/pudding"
+import { readA, readB, readC, readSafe } from "./evil.ts"
+law("FALSE: A[0] is 1", () => expect(readA()).toBe(1))
+law("FALSE: B[0] is 1", () => expect(readB()).toBe(1))
+law("FALSE: C[0] is 1", () => expect(readC()).toBe(1))
+law("SAFE[0] is 1", () => expect(readSafe()).toBe(1))
+`)
+      for (const crossCheck of [false, true]) {
+        const report = await run({ cwd: project, cache: false, crossCheck })
+        for (const name of ["FALSE: A[0] is 1", "FALSE: B[0] is 1", "FALSE: C[0] is 1"]) {
+          assert.equal(law(report, name).status, "failed", `${name} (crossCheck=${crossCheck})`)
+        }
+        assert.equal(law(report, "SAFE[0] is 1").status, "proved")
+      }
+    } finally {
+      rmSync(project, { recursive: true, force: true })
+    }
+  })
+
+  test("IR same/concat handle deep shared DAGs, algebraic rules simplify, and value-based CSE shares separate equal subtrees", () => {
+    const x = ir.variable("x0", "int")
+    let a: ir.Expr = x
+    let b: ir.Expr = x
+    for (let i = 0; i < 60; i++) {
+      a = ir.add(a, a)
+      b = ir.add(b, b)
+    }
+    assert.equal(ir.same(a, b), true)
+    assert.equal(ir.same(a, ir.add(b, ir.lit(1n))), false)
+
+    let chain: ir.Expr = ir.variable("s0", "str")
+    for (let i = 0; i < 2000; i++) chain = ir.concat(chain, ir.lit("a"))
+    assert.equal(chain.t === "op" && chain.args[1]?.t === "lit" && (chain.args[1].value as string).length === 2000, true)
+
+    assert.equal(ir.same(ir.not(ir.lt(x, ir.lit(0n))), ir.le(ir.lit(0n), x)), true)
+    assert.equal(ir.and(ir.lt(x, ir.lit(0n)), ir.le(ir.lit(0n), x)), ir.FALSE)
+    assert.equal(ir.same(ir.add(ir.add(x, ir.lit(2n)), ir.lit(3n)), ir.add(x, ir.lit(5n))), true)
+    assert.equal(ir.same(ir.sub(ir.add(x, ir.lit(3n)), ir.lit(3n)), x), true)
+
+    const makeBig = () => ir.add(ir.mul(x, ir.lit(3n)), ir.sub(ir.mul(x, ir.lit(7n)), ir.lit(11n)))
+    const [check] = checksFor([{ name: "x0", label: "x", ty: "int" }], ir.TRUE, ir.lt(makeBig(), ir.add(makeBig(), ir.lit(1n))), undefined)
+    assert.ok(check)
+    assert.match(check.statement, /let _v0 :=/)
+  })
+
+  test("enums (string, numeric, const enum) prove and cross-check cleanly, and ordering/vacuity/type-elision/4-var search work", async () => {
+    const vars = [0, 1, 2, 3].map(i => ir.variable(`x${i}`, "int"))
+    const binders: ir.Binder[] = vars.map((v, i) => ({ name: v.t === "var" ? v.name : "", label: `v${i}`, ty: "int" }))
+    const allZero = ir.all(vars.map(v => ir.eq(v, ir.lit(0n))))
+    const found = findInput(binders, allZero)
+    assert.deepEqual(found.found ? showInputs(binders, found.found) : undefined, { v0: "0n", v1: "0n", v2: "0n", v3: "0n" })
+
+    const project = mkdtempSync(join(fixtures, ".tmp-"))
+    try {
+      writeFileSync(join(project, "types.ts"), `export default interface DefaultT { v: bigint }
+export type A = bigint
+export type B = bigint
+export enum Role { Viewer = "viewer", Admin = "admin" }
+export enum Priority { Low, High = 10 }
+export const enum Flags { Read = 1, Write = 2 }
+`)
+      writeFileSync(join(project, "order.law.ts"), `import { domain, expect, law } from "@bytewaveco/pudding"
+import DefaultT from "./types"
+import { type A, B, Role, Priority, Flags } from "./types"
+law("enums work as domains and values", domain<{ role: Role; prio: Priority; flag: Flags }>(), ({ role, prio, flag }) => {
+  expect(role === Role.Viewer || role === Role.Admin).toBe(true)
+  expect(Priority[prio]).toBe(prio === Priority.Low ? "Low" : "High")
+  expect(flag === Flags.Read || flag === Flags.Write).toBe(true)
+})
+law("FALSE: x is greater than 5", domain<A>(), (x: B) => {
+  const _box: DefaultT = { v: x }
+  expect(_box.v).toBeGreaterThan(5n)
+})
+law("VACUOUS: impossible arithmetic", domain<bigint>(), x => {
+  if (x > 10n && x < 5n) expect(x).toBeGreaterThan(0n)
+})
+`)
+      const first = await run({ cwd: project })
+      assert.deepEqual(first.errors, [])
+      assert.deepEqual(first.warnings, [])
+      assert.equal(law(first, "enums work as domains and values").status, "proved")
+      const gt = law(first, "FALSE: x is greater than 5")
+      assert.equal(gt.status, "failed")
+      assert.match(gt.findings[0]?.detail ?? "", /actual: +.*\nexpected: > 5n/)
+      assert.deepEqual(law(first, "VACUOUS: impossible arithmetic").findings.map(f => f.kind), ["vacuous"])
+      const second = await run({ cwd: project })
+      assert.deepEqual(law(second, "VACUOUS: impossible arithmetic").findings.map(f => f.kind), ["vacuous"])
     } finally {
       rmSync(project, { recursive: true, force: true })
     }

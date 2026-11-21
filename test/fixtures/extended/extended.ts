@@ -94,3 +94,26 @@ export function requirePositive(x: bigint): bigint {
   if (x <= 0n) throw new Error("must be positive")
   return x
 }
+
+export const FROZEN_DAYS = Object.freeze([31, 28, 31, 30])
+
+export function daysOrDefault(month: number): number {
+  return FROZEN_DAYS.at(month) ?? 0
+}
+
+export function alwaysThrows(): bigint {
+  throw Error("always")
+}
+
+export function safeDivide(a: bigint, b: bigint): bigint {
+  try {
+    return a / b
+  } catch {
+    return 0n
+  }
+}
+
+export function mergeConfig(flag: boolean, a: bigint, b: bigint): { a: bigint; b?: bigint } {
+  const extra = flag ? { b } : null
+  return Object.assign({}, { a }, extra)
+}
