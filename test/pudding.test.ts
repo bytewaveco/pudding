@@ -130,7 +130,14 @@ describe("imperative code", () => {
     const [zero] = law(report, "whole numbers > FALSE: pages never divide by zero").findings
     assert.equal(zero?.kind, "inexact")
     assert.deepEqual(zero?.inputs, { size: "0" })
-    assert.match(law(report, "counted loops > SAMPLED: plain division is refused").notes[0] ?? "", /dividing numbers can give a fraction/)
+    assert.equal(law(report, "fractions > dyadic division and multiplication round-trip exactly").status, "proved")
+    assert.equal(law(report, "fractions > stored quotients flow through variables, helpers and comparisons").status, "proved")
+    assert.equal(law(report, "fractions > non-dyadic decimals follow exact IEEE-754 arithmetic when values settle").status, "proved")
+    const [recip] = law(report, "fractions > FALSE: dividing and multiplying back is always exact in IEEE-754").findings
+    assert.equal(recip?.kind, "counterexample")
+    assert.deepEqual(recip?.inputs, { b: "49" })
+    assert.match(law(report, "fractions > SAMPLED: double-rounding arithmetic on symbolic division is refused").notes[0] ?? "", /double-round/)
+    assert.match(law(report, "fractions > SAMPLED: non-dyadic decimal arithmetic on a large range is refused").notes[0] ?? "", /non-dyadic decimal/)
   })
 
   test("a law is translated once per value of a small input that a loop bound depends on", () => {

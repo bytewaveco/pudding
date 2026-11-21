@@ -818,7 +818,9 @@ export async function run(options: RunOptions = {}): Promise<Report> {
     const at = { file: obligation.file, line: obligation.line, column: obligation.column, text: obligation.text }
     const found = counterexamples.get(obligation)
     if (found) {
-      const inputs = showInputs(instance.binders, found)
+      const assignment = new Map(found)
+      for (const [name, value] of instance.fixed) if (!assignment.has(name) && value.t === "lit") assignment.set(name, value.value)
+      const inputs = showInputs(instance.binders, assignment)
       if (obligation.kind === "expect") {
         const sides = obligation.sides
         const flip: Record<string, string> = { ">": "<=", ">=": "<", "<": ">=", "<=": ">" }

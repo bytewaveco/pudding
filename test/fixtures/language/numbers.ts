@@ -51,3 +51,16 @@ export function toCents(dollars: bigint): number {
 export function average(a: number, b: number): number {
   return (a + b) / 2
 }
+
+export function ratioPage(total: number, size: number): number {
+  const ratio = total / size
+  return Math.ceil(ratio)
+}
+
+export function withSmallTax(cents: number): number {
+  return Math.round(cents * 1.08)
+}
+
+export function weightedHalf(a: number, b: number): number {
+  return a * 0.5 + b * 0.25
+}

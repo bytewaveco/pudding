@@ -210,6 +210,8 @@ export function div(a: Expr, b: Expr): Expr {
   if (isInt(b, -1n)) return neg(a)
   // Zero divided by anything is zero; a zero divisor is ruled out separately.
   if (isInt(a, 0n)) return a
+  // Truncated division is odd: `(-a) / b = -(a / b)`.
+  if (a.t === "op" && a.op === "neg" && isLit(b) && (b.value as bigint) > 0n) return neg(div(a.args[0]!, b))
   return op("div", "int", a, b)
 }
 
@@ -570,5 +572,6 @@ export const MAX_SAFE = 2n ** 53n - 1n
 
 /** Whether an integer is one a `number` holds exactly. */
 export function isSafe(e: Expr): Expr {
+  if (e.t === "op" && e.op === "neg") e = e.args[0]!
   return and(le(lit(-MAX_SAFE), e), le(e, lit(MAX_SAFE)))
 }

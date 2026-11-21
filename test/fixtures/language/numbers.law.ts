@@ -1,5 +1,5 @@
 import { describe, domain, expect, law, type Integer } from "@bytewaveco/pudding"
-import { average, clampPercent, countdown, label, minutes, pageCount, pageOf, parity, sumIndexed, sumTo, toCents } from "./numbers.ts"
+import { average, clampPercent, countdown, label, minutes, pageCount, pageOf, parity, ratioPage, sumIndexed, sumTo, toCents, weightedHalf, withSmallTax } from "./numbers.ts"
 
 describe("whole numbers", () => {
   law("pages cover every item without an empty page", domain<[Integer<0, 1000000>, Integer<1, 12>]>(), ([total, size]) => {
@@ -83,8 +83,49 @@ describe("counted loops", () => {
   law("a loop bounded by a small input is unrolled for each of its values", domain<Integer<0, 20>>(), limit => {
     expect(sumTo(limit) * 2).toEqual(limit * (limit + 1))
   })
+})
 
-  law("SAMPLED: plain division is refused", domain<[Integer<0, 100>, Integer<0, 100>]>(), ([a, b]) => {
+describe("fractions", () => {
+  law("dyadic division and multiplication round-trip exactly", domain<[Integer<0, 1000000>, Integer<0, 1000000>]>(), ([a, b]) => {
     expect(average(a, b) * 2).toEqual(a + b)
+    expect(average(a, b) >= Math.min(a, b)).toBe(true)
+    expect(average(a, b) <= Math.max(a, b)).toBe(true)
+  })
+
+  law("dyadic weights, rounding and integer checks are exact", domain<[Integer<-10000, 10000>, Integer<-10000, 10000>]>(), ([a, b]) => {
+    expect(weightedHalf(a, b) * 4).toEqual(a * 2 + b)
+    expect(Math.round(a * 0.5) * 2 >= a).toBe(true)
+    expect(Number.isInteger(a / 2)).toEqual(a % 2 === 0)
+    expect(a < 0.5).toEqual(a <= 0)
+    expect(a >= 1.3).toEqual(a >= 2)
+  })
+
+  law("stored quotients flow through variables, helpers and comparisons", domain<[Integer<0, 10000>, Integer<1, 20>]>(), ([total, size]) => {
+    const q = total / size
+    expect(ratioPage(total, size)).toEqual(pageCount(total, size))
+    expect(Math.floor(q) * size <= total).toBe(true)
+    expect(q >= 5).toEqual(total >= 5 * size)
+    expect(Number.isInteger(q)).toEqual(total % size === 0)
+  })
+
+  law("non-dyadic decimals follow exact IEEE-754 arithmetic when values settle", domain<Integer<0, 100>>(), cents => {
+    expect(withSmallTax(cents)).toBeGreaterThanOrEqual(cents)
+    expect(0.1 + 0.2 === 0.3).toBe(false)
+  })
+
+  law("FALSE: multiplying by 1.5 stays exact for any Integer", domain<Integer>(), value => {
+    expect((value * 1.5) * 2).toEqual(value * 3)
+  })
+
+  law("FALSE: dividing and multiplying back is always exact in IEEE-754", domain<Integer<1, 50>>(), b => {
+    expect((1 / b) * b).toEqual(1)
+  })
+
+  law("SAMPLED: double-rounding arithmetic on symbolic division is refused", domain<[Integer<0, 10000>, Integer<1, 10000>]>(), ([a, b]) => {
+    expect((a / b) + 1 > 0).toBe(true)
+  })
+
+  law("SAMPLED: non-dyadic decimal arithmetic on a large range is refused", domain<Integer<0, 10000>>(), cents => {
+    expect(withSmallTax(cents)).toBeGreaterThanOrEqual(cents)
   })
 })
