@@ -712,6 +712,9 @@ describe("proof scripts", () => {
     assert.match(scriptProblem("def bad := 1; simp") ?? "", /may not contain `def`/)
     assert.match(scriptProblem("simp [a, b") ?? "", /delimiters .* do not balance/)
     assert.match(scriptProblem("simp (a]") ?? "", /parentheses .* do not balance/)
+    assert.match(scriptProblem(". axiom bad : False") ?? "", /may not contain `axiom`/)
+    assert.match(scriptProblem(".\n  def bad := 1") ?? "", /may not contain `def`/)
+    assert.match(scriptProblem(". -- note\nimport Init") ?? "", /may not contain `import`/)
   })
 
   test("a script that rests on anything but the standard axioms is rejected", async () => {
@@ -1089,5 +1092,94 @@ law("optional tuple refused", domain<[bigint, bigint?]>(), items => {
     assert.ok(!rendered.includes("Init.Omega"))
     const [outcome] = await prove(lean, KERNEL_HEADER, checks.map(c => c.statement))
     assert.equal(outcome?.ok, true, outcome?.message ?? "")
+  })
+
+  test("withNonLinear handles theorems whose parameters include List types", async () => {
+    const { withNonLinear } = await import("../dist/lean.js")
+    const a = ir.variable("x1", "int")
+    const stmt = " (x0 : List Int) (x1 : Int) : (decide ((0 : Int) ≤ (x1 * x1))) = true := by grind"
+    const rewritten = withNonLinear(stmt, ir.TRUE, ir.le(ir.lit(0n), ir.mul(a, a)))
+    assert.ok(rewritten && rewritten.includes("Int.mul_nonneg"), rewritten ?? "")
+  })
+
+  test("emitted Lean isolates recursive definition groups in separate namespaces", async () => {
+    const project = mkdtempSync(join(fixtures, ".tmp-emit-defs-"))
+    try {
+      writeFileSync(join(project, "a.ts"), `export function rec(n: bigint): bigint { return n <= 0n ? 0n : 1n + rec(n - 1n) }\n`)
+      writeFileSync(join(project, "b.ts"), `export function rec(n: bigint): bigint { return n <= 0n ? 1n : 2n + rec(n - 1n) }\n`)
+      writeFileSync(join(project, "both.law.ts"), `import { domain, expect, law, type Integer } from "@bytewaveco/pudding"
+import { rec as recA } from "./a.ts"
+import { rec as recB } from "./b.ts"
+law("recA on small inputs", domain<Integer<0, 3>>(), n => { expect(recA(BigInt(n))).toEqual(BigInt(n)) })
+law("recB on small inputs", domain<Integer<0, 3>>(), n => { expect(recB(BigInt(n))).toEqual(1n + 2n * BigInt(n)) })
+`)
+      const outFile = join(project, "emitted.lean")
+      const report = await run({ cwd: project, cache: false, emit: outFile })
+      assert.deepEqual(report.errors, [])
+      assert.equal(report.ok, true)
+      const leanSource = readFileSync(outFile, "utf8")
+      assert.match(leanSource, /namespace _g0/)
+      assert.match(leanSource, /namespace _g1/)
+      const check = spawnSync(lean, [outFile], { encoding: "utf8" })
+      assert.equal(check.status, 0, check.stdout + check.stderr)
+    } finally {
+      rmSync(project, { recursive: true, force: true })
+    }
+  })
+
+  test("Vitest plugin does not duplicate existing globalSetup and scopes options/reruns per project", async () => {
+    const { pudding, setup } = await import("../dist/vitest-plugin.js")
+    const project = mkdtempSync(join(fixtures, ".tmp-vitest-multi-"))
+    try {
+      const marker = join(project, "setup-count.txt")
+      writeFileSync(join(project, "my-setup.ts"), `import { appendFileSync } from "node:fs"
+export default function () { appendFileSync(${JSON.stringify(marker)}, "x") }
+`)
+      cpSync(join(fixtures, "vitest", "coin.law.ts"), join(project, "coin.law.ts"))
+      writeFileSync(join(project, "vitest.config.ts"), `import { defineConfig } from "vitest/config"
+import { pudding } from "@bytewaveco/pudding/vitest"
+export default defineConfig({
+  plugins: [pudding()],
+  test: { globalSetup: ["./my-setup.ts"] },
+})
+`)
+      const res = spawnSync("npx", ["vitest", "run", "--root", project], { encoding: "utf8", cwd: join(import.meta.dirname, "..") })
+      assert.equal(res.status, 0, res.stdout + res.stderr)
+      assert.equal(readFileSync(marker, "utf8"), "x", "user globalSetup must run exactly once")
+
+      // Distinct named projects sharing a root keep their own plugin options and filter onTestsRerun specs.
+      const subA = join(project, "a.law.ts")
+      const subB = join(project, "b.law.ts")
+      writeFileSync(subA, `import { expect, law } from "@bytewaveco/pudding"\nlaw("a", () => { expect(1).toEqual(1) })\n`)
+      writeFileSync(subB, `import { expect, law } from "@bytewaveco/pudding"\nlaw("b", () => { expect(2).toEqual(2) })\n`)
+      const pluginA = pudding({ include: ["a.law.ts"] })
+      const pluginB = pudding({ include: ["b.law.ts"] })
+      pluginA.config({ root: project, test: { name: "proj-a" } })
+      pluginB.config({ root: project, test: { name: "proj-b" } })
+      let reportFileA = ""
+      let rerunA: ((specs: readonly { moduleId?: string; project?: { name?: string; config?: { root?: string } } }[]) => Promise<void> | void) | undefined
+      const projA = {
+        name: "proj-a",
+        config: { root: project },
+        provide: (_k: string, v: unknown) => { reportFileA = v as string },
+        onTestsRerun: (cb: typeof rerunA) => { rerunA = cb },
+      }
+      const teardownA = await setup(projA)
+      try {
+        const snap1 = JSON.parse(readFileSync(reportFileA, "utf8")) as { lawsByFile: Record<string, unknown[]>; runs: number }
+        assert.equal(Object.keys(snap1.lawsByFile).length, 1)
+        assert.ok(snap1.lawsByFile[subA])
+        assert.equal(snap1.lawsByFile[subB], undefined)
+        // A rerun event for proj-b must be ignored by proj-a.
+        await rerunA?.([{ moduleId: subB, project: { name: "proj-b", config: { root: project } } }])
+        const snap2 = JSON.parse(readFileSync(reportFileA, "utf8")) as { lawsByFile: Record<string, unknown[]>; runs: number }
+        assert.equal(snap2.runs, snap1.runs)
+        assert.equal(snap2.lawsByFile[subB], undefined)
+      } finally {
+        teardownA()
+      }
+    } finally {
+      rmSync(project, { recursive: true, force: true })
+    }
   })
 })

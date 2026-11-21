@@ -1,5 +1,5 @@
 import { describe, domain, expect, law, type Integer } from "@bytewaveco/pudding"
-import { countPositive, doubleAll, nonTerminating, positives, sumList, sumRec, sumToRec } from "./lists.ts"
+import { calleeB, callerA, countPositive, divergesOnPos, doubleAll, makeRecAdder, nonTerminating, positives, shadowSelf, sumList, sumRec, sumToRec, throwingRec } from "./lists.ts"
 
 describe("arbitrary-length arrays and folds", () => {
   law("map, filter, reverse, concat and spread preserve length and structure for any array", domain<[bigint[], bigint[]]>(), ([xs, ys]) => {
@@ -87,5 +87,106 @@ describe("recursive functions", () => {
 
   law("SAMPLED: non-terminating recursion is refused by Lean termination checker", domain<bigint>(), n => {
     if (n >= 0n && n <= 10n) expect(nonTerminating(n)).toEqual(n)
+  })
+
+  law("SAMPLED: late termination rejection with skipped inputs is not reported as checked", domain<0n | 1n>(), n => {
+    expect(divergesOnPos(n)).toEqual(0n)
+  })
+
+  law("recursive caller and callee are emitted in topological order", domain<Integer<0, 4>>(), n => {
+    const b = BigInt(n)
+    expect(callerA(b) >= calleeB(b)).toBe(true)
+  })
+
+  law("FALSE: recursive closures capturing different constants return equal results", () => {
+    const a = makeRecAdder(1n)
+    const b = makeRecAdder(2n)
+    expect(a(1n)).toEqual(b(1n))
+  })
+
+  law("shadowed local function with the same name is not treated as recursive", domain<Integer<0, 100>>(), n => {
+    expect(shadowSelf(n)).toEqual(n + 1)
+  })
+
+  law("vacuity check accepts a guard calling a recursive function", domain<Integer<0, 6>>(), n => {
+    const b = BigInt(n)
+    if (sumToRec(b) > 0n) expect(b > 0n).toBe(true)
+  })
+
+  law("SAMPLED: calling a throwing recursive function inside try is refused", domain<bigint>(), n => {
+    if (n <= 10n) {
+      let ok = true
+      try {
+        throwingRec(n)
+      } catch {
+        ok = n < 0n
+      }
+      expect(ok).toBe(true)
+    }
+  })
+})
+
+describe("list and soundness edge cases", () => {
+  law("concat of fixed array with symbolic list flattens properly", domain<bigint[]>(), xs => {
+    if (xs.length <= 1000000) expect([1n].concat(xs).length).toEqual(xs.length + 1)
+  })
+
+  law("FALSE: [1n].concat(xs) always has length 2", domain<bigint[]>(), xs => {
+    expect([1n].concat(xs).length).toEqual(2)
+  })
+
+  law("SAMPLED: flat over a symbolic list element is refused", domain<bigint[]>(), xs => {
+    expect([xs].flat().length).toEqual(xs.length)
+  })
+
+  law("SAMPLED: flatMap returning a symbolic list is refused", domain<bigint[]>(), xs => {
+    expect([0].flatMap(() => xs).length).toEqual(xs.length)
+  })
+
+  law("Object.hasOwn on symbolic lists models length and index keys accurately", domain<bigint[]>(), xs => {
+    expect(Object.hasOwn(xs, "length")).toBe(true)
+    expect(Object.hasOwn(xs, "0")).toEqual(xs.length > 0)
+    expect(Object.hasOwn(xs, "foo")).toBe(false)
+  })
+
+  law("FALSE: any two arbitrary arrays are equal", domain<[bigint[], bigint[]]>(), ([xs, ys]) => {
+    expect(xs).toEqual(ys)
+  })
+
+  law("FALSE: integer array never includes a dyadic fraction", domain<[Integer<0, 10>[], Integer<0, 10>]>(), ([xs, n]) => {
+    expect(xs.includes(n / 2)).toBe(false)
+  })
+
+  law("integer array includes exact dyadic fraction when divisible", domain<[Integer<0, 10>[], Integer<0, 10>]>(), ([xs, n]) => {
+    if (n % 2 === 0 && xs.includes(n / 2)) expect(xs.length > 0).toBe(true)
+  })
+
+  law("SAMPLED: symbolic some with throwing callback inside try is refused", domain<bigint[]>(), xs => {
+    const res = (() => {
+      try {
+        return xs.some(x => {
+          if (x < 0n) throw new Error("neg")
+          return x === 0n
+        })
+      } catch {
+        return false
+      }
+    })()
+    expect(typeof res).toBe("boolean")
+  })
+
+  law("FALSE: reassigning for-of let variable inside a branch leaks to other branches", domain<bigint[]>(), xs => {
+    let total = 0n
+    for (let x of xs) {
+      if (x > 10n) x = 100n
+      total += x
+    }
+    let expected = 0n
+    for (const x of xs) expected += 100n
+    expect(total).toEqual(expected)
+  })
+
+  law("SAMPLED: expect inside for-of over a symbolic list is refused", domain<bigint[]>(), xs => {
+    for (const x of xs) expect(x === x).toBe(true)
   })
 })

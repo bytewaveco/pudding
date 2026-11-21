@@ -3,7 +3,7 @@
 
 import { existsSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
-import { join, resolve } from "node:path"
+import { join, resolve, sep } from "node:path"
 import { fileURLToPath } from "node:url"
 import type { Config } from "./index.ts"
 import { createWatchSession, run, type LawReport, type WatchSession } from "./runner.ts"
@@ -24,6 +24,8 @@ export interface PrecomputedReport {
 }
 
 interface PluginState {
+  root: string
+  name: string
   options: PuddingPluginOptions
   changed: Set<string>
   session?: WatchSession
@@ -32,16 +34,48 @@ interface PluginState {
 const states = new Map<string, PluginState>()
 const OPTIONS_ENV = "PUDDING_VITEST_PLUGIN_OPTIONS"
 
-function stateFor(root: string): PluginState {
-  const key = resolve(root)
-  let state = states.get(key)
-  if (!state) {
-    let options: PuddingPluginOptions = {}
-    const raw = process.env[OPTIONS_ENV]
-    if (raw) {
-      try { options = JSON.parse(raw) as PuddingPluginOptions } catch { /* ignore */ }
+function projectNameOf(raw: unknown): string {
+  if (typeof raw === "string") return raw
+  if (raw && typeof raw === "object" && "label" in raw && typeof (raw as { label?: unknown }).label === "string") {
+    return (raw as { label: string }).label
+  }
+  return ""
+}
+
+function stateKey(root: string, name: string): string {
+  return `${resolve(root)}\0${name}`
+}
+
+function readEnvOptionsMap(): Record<string, PuddingPluginOptions> {
+  const raw = process.env[OPTIONS_ENV]
+  if (!raw) return {}
+  try {
+    const parsed = JSON.parse(raw) as unknown
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as Record<string, PuddingPluginOptions>
     }
-    state = { options, changed: new Set() }
+  } catch { /* ignore */ }
+  return {}
+}
+
+function saveEnvOptions(key: string, options: PuddingPluginOptions): void {
+  const map = readEnvOptionsMap()
+  map[key] = options
+  process.env[OPTIONS_ENV] = JSON.stringify(map)
+}
+
+function stateFor(root: string, name: string): PluginState {
+  const resolvedRoot = resolve(root)
+  const key = stateKey(resolvedRoot, name)
+  let state = states.get(key)
+  if (!state && name) {
+    const fallback = states.get(stateKey(resolvedRoot, ""))
+    if (fallback) return fallback
+  }
+  if (!state) {
+    const envMap = readEnvOptionsMap()
+    const options = envMap[key] ?? (name ? envMap[stateKey(resolvedRoot, "")] : undefined) ?? {}
+    state = { root: resolvedRoot, name, options, changed: new Set() }
     states.set(key, state)
   }
   return state
@@ -58,14 +92,16 @@ function isLawPath(file: string): boolean {
 }
 
 interface GlobalSetupProject {
-  config?: { root?: string }
+  name?: string
+  config?: { root?: string; name?: string | { label: string } }
   provide(key: string, value: unknown): void
-  onTestsRerun?(cb: (specs: readonly (string | { moduleId?: string })[]) => void | Promise<void>): void
+  onTestsRerun?(cb: (specs: readonly (string | { moduleId?: string; project?: { name?: string; config?: { root?: string; name?: string | { label: string } } } })[]) => void | Promise<void>): void
 }
 
 interface VitestConfigLike {
   root?: string
   test?: {
+    name?: string | { label: string }
     include?: string[]
     globalSetup?: string | string[]
   }
@@ -96,27 +132,41 @@ export function pudding(options: PuddingPluginOptions = {}): {
     name: "pudding",
     config(userConfig) {
       const root = resolve(userConfig.root ?? process.cwd())
-      states.set(root, { options: runOptions, changed: new Set() })
-      process.env[OPTIONS_ENV] = JSON.stringify(runOptions)
+      const name = projectNameOf(userConfig.test?.name)
+      const key = stateKey(root, name)
+      states.set(key, { root, name, options: runOptions, changed: new Set() })
+      saveEnvOptions(key, runOptions)
 
+      const hasInclude = userConfig.test?.include !== undefined
       const existingInclude = userConfig.test?.include ?? DEFAULT_VITEST_INCLUDE
-      const include = [...new Set([...existingInclude, ...lawInclude])]
+      const addedInclude = hasInclude
+        ? lawInclude.filter(p => !existingInclude.includes(p))
+        : [...new Set([...DEFAULT_VITEST_INCLUDE, ...lawInclude])]
       const existingSetup = userConfig.test?.globalSetup
       const setups = Array.isArray(existingSetup) ? existingSetup : existingSetup ? [existingSetup] : []
-      const globalSetup = setups.includes(setupFile) ? setups : [...setups, setupFile]
       return {
         test: {
-          include,
-          globalSetup,
+          ...(addedInclude.length ? { include: addedInclude } : {}),
+          ...(setups.includes(setupFile) ? {} : { globalSetup: [setupFile] }),
         },
       }
     },
     configureServer(server) {
-      const root = resolve(server.config?.root ?? process.cwd())
-      const state = stateFor(root)
-      server.watcher?.on("change", file => state.changed.add(resolve(file)))
-      server.watcher?.on("add", file => state.changed.add(resolve(file)))
-      server.watcher?.on("unlink", file => state.changed.add(resolve(file)))
+      const serverRoot = resolve(server.config?.root ?? process.cwd())
+      const recordChange = (file: string) => {
+        const resolvedFile = resolve(file)
+        let matched = false
+        for (const state of states.values()) {
+          if (state.root === serverRoot || resolvedFile.startsWith(state.root + sep) || resolvedFile === state.root) {
+            state.changed.add(resolvedFile)
+            matched = true
+          }
+        }
+        if (!matched) stateFor(serverRoot, "").changed.add(resolvedFile)
+      }
+      server.watcher?.on("change", recordChange)
+      server.watcher?.on("add", recordChange)
+      server.watcher?.on("unlink", recordChange)
     },
   }
 }
@@ -124,36 +174,49 @@ export function pudding(options: PuddingPluginOptions = {}): {
 /** Vitest globalSetup entry point registered automatically by `pudding()`. */
 export async function setup(project: GlobalSetupProject): Promise<() => void> {
   const root = resolve(project.config?.root ?? process.cwd())
-  const state = stateFor(root)
+  const name = projectNameOf(project.name ?? project.config?.name)
+  const state = stateFor(root, name)
+  const key = stateKey(state.root, state.name)
   const session = createWatchSession()
   state.session = session
 
   const dir = mkdtempSync(join(tmpdir(), "pudding-vitest-"))
   const reportFile = join(dir, "report.json")
+  const cleanup = () => {
+    session.close()
+    states.delete(key)
+    rmSync(dir, { recursive: true, force: true })
+  }
 
   const snapshot: PrecomputedReport = { root, errors: [], lawsByFile: {}, runs: 0 }
 
-  const mergeReport = (report: Awaited<ReturnType<typeof run>>, replacedFiles?: readonly string[]) => {
+  const applyReport = (report: Awaited<ReturnType<typeof run>>, replacedFiles?: readonly string[]) => {
     snapshot.runs++
+    // If a project has unit tests and no law files yet, do not fail the Vitest run.
+    if (!replacedFiles && report.errors.length === 1 && report.errors[0] === "no law files were found") {
+      snapshot.errors = []
+      snapshot.lawsByFile = {}
+      writeSnapshot(reportFile, snapshot)
+      return
+    }
     snapshot.errors = report.errors
     if (!replacedFiles) snapshot.lawsByFile = {}
     else for (const file of replacedFiles) delete snapshot.lawsByFile[resolve(file)]
     for (const entry of report.laws) {
-      const key = resolve(entry.file)
-      const list = snapshot.lawsByFile[key] ?? []
+      const fileKey = resolve(entry.file)
+      const list = snapshot.lawsByFile[fileKey] ?? []
       list.push(entry)
-      snapshot.lawsByFile[key] = list
+      snapshot.lawsByFile[fileKey] = list
     }
     writeSnapshot(reportFile, snapshot)
   }
 
-  const initial = await run({ ...state.options, cwd: root, session })
-  // If a project has unit tests and no law files yet, do not fail the Vitest run.
-  if (initial.errors.length === 1 && initial.errors[0] === "no law files were found") {
-    snapshot.runs++
-    writeSnapshot(reportFile, snapshot)
-  } else {
-    mergeReport(initial)
+  try {
+    const initial = await run({ ...state.options, cwd: root, session })
+    applyReport(initial)
+  } catch (error) {
+    cleanup()
+    throw error
   }
 
   project.provide("puddingReportFile", reportFile)
@@ -163,6 +226,11 @@ export async function setup(project: GlobalSetupProject): Promise<() => void> {
     state.changed.clear()
     const rerunLawFiles = new Set<string>()
     for (const spec of specs) {
+      if (typeof spec === "object" && spec?.project) {
+        const specName = projectNameOf(spec.project.name ?? spec.project.config?.name)
+        const specRoot = spec.project.config?.root ? resolve(spec.project.config.root) : root
+        if (spec.project !== project && (specName !== name || specRoot !== root)) continue
+      }
       const id = typeof spec === "string" ? spec : spec?.moduleId
       if (id && isLawPath(id) && existsSync(id)) rerunLawFiles.add(resolve(id))
     }
@@ -174,26 +242,22 @@ export async function setup(project: GlobalSetupProject): Promise<() => void> {
       }
       const affected = session.affected(file)
       if (!affected) {
-        if (isLawPath(file)) needFull = true
-        continue
+        needFull = true
+        break
       }
       for (const lawFile of affected) if (existsSync(lawFile)) rerunLawFiles.add(resolve(lawFile))
     }
     if (needFull) {
       session.close()
       const next = await run({ ...state.options, cwd: root, session })
-      mergeReport(next)
+      applyReport(next)
       return
     }
     if (!rerunLawFiles.size) return
     const lawFiles = [...rerunLawFiles].sort()
     const next = await run({ ...state.options, cwd: root, session, lawFiles, ...(changed.length ? { changedFiles: changed } : {}) })
-    mergeReport(next, lawFiles)
+    applyReport(next, lawFiles)
   })
 
-  return () => {
-    session.close()
-    states.delete(root)
-    rmSync(dir, { recursive: true, force: true })
-  }
+  return cleanup
 }

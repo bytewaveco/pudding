@@ -322,17 +322,20 @@ export function scriptProblem(script: string): string | undefined {
     const ch = script[i]!
     // Whitespace
     if (ch === " " || ch === "\t" || ch === "\r" || ch === "\n") {
+      afterDot = false
       i++
       continue
     }
     // Line comment: `--` to end of line
     if (ch === "-" && script[i + 1] === "-") {
+      afterDot = false
       i += 2
       while (i < n && script[i] !== "\n") i++
       continue
     }
     // Nested block comment: `/- ... -/` (including doc comments `/--` and `/-!`)
     if (ch === "/" && script[i + 1] === "-") {
+      afterDot = false
       let depth = 1
       i += 2
       while (i < n && depth > 0) {
@@ -544,7 +547,7 @@ export function describeNonLinearOps(guard: Expr, claim: Expr, binders: readonly
 export function withNonLinear(statement: string, guard: Expr, claim: Expr): string | undefined {
   if (!statement.endsWith(` := by ${DEFAULT_TACTIC}`)) return undefined
   // Extract the theorem's bound Int variables from the parameter prefix so we never reference specialized-away vars.
-  const params = /^(?: \([a-zA-Z_]\w* : (?:Bool|Int|String)\))*/.exec(statement)?.[0] ?? ""
+  const params = /^(?: \([a-zA-Z_]\w* : (?:Bool|Int|String|List (?:Bool|Int|String))\))*/.exec(statement)?.[0] ?? ""
   const bound = new Set<string>()
   for (const match of params.matchAll(/\(([a-zA-Z_]\w*) : Int\)/g)) bound.add(match[1]!)
   if (!bound.size) return undefined
@@ -910,34 +913,36 @@ function nonLinearVars(root: Expr): Set<string> {
 
 function usedDefs(root: Expr, defs: readonly ir.FnDef[] | undefined): string | undefined {
   if (!defs?.length) return undefined
-  const called = new Set<string>()
-  const seen = new Set<Expr>()
-  const walk = (e: Expr) => {
+  const directCalls = (e: Expr): Set<string> => {
+    const names = new Set<string>()
+    const seen = new Set<Expr>()
     const stack: Expr[] = [e]
     while (stack.length) {
       const cur = stack.pop()!
       if (cur.t !== "op" || seen.has(cur)) continue
       seen.add(cur)
-      if (cur.op === "call" && cur.fn) called.add(cur.fn)
+      if (cur.op === "call" && cur.fn) names.add(cur.fn)
       for (const arg of cur.args) stack.push(arg)
     }
+    return names
   }
-  walk(root)
-  if (!called.size) return undefined
+  const rootCalls = directCalls(root)
+  if (!rootCalls.size) return undefined
   const byName = new Map(defs.map(d => [d.name, d]))
   const ordered: ir.FnDef[] = []
-  const added = new Set<string>()
-  const add = (name: string) => {
-    if (added.has(name)) return
+  const visiting = new Set<string>()
+  const emitted = new Set<string>()
+  const emit = (name: string) => {
+    if (emitted.has(name) || visiting.has(name)) return
     const def = byName.get(name)
     if (!def) return
-    added.add(name)
-    const before = new Set(called)
-    walk(def.body)
-    for (const next of called) if (!before.has(next)) add(next)
+    visiting.add(name)
+    for (const dep of directCalls(def.body)) emit(dep)
+    visiting.delete(name)
+    emitted.add(name)
     ordered.push(def)
   }
-  for (const name of [...called]) add(name)
+  for (const name of rootCalls) emit(name)
   return ordered.length ? ordered.map(printDef).join("\n\n") : undefined
 }
 
@@ -1359,12 +1364,11 @@ export async function prove(lean: string, header: string, statements: string[], 
 }
 
 /** The Lean source for a set of statements, for inspection. */
-export function render(header: string, statements: string[], comments?: ReadonlyMap<string, string>, defs?: readonly string[]): string {
-  const uniqueDefs = defs ? [...new Set(defs.filter(Boolean))] : []
-  const defsBlock = uniqueDefs.join("\n\n")
-  const allFinite = !defsBlock && statements.length > 0 && statements.every(s => proofKind(s) === "finite")
-  const needsStrings = statements.some(usesStringPrelude) || usesStringPrelude(defsBlock)
-  const needsLists = Boolean(defsBlock) || statements.some(usesListPrelude)
+export function render(header: string, statements: string[], comments?: ReadonlyMap<string, string>, defs?: readonly (string | undefined)[]): string {
+  const allDefsText = defs ? defs.filter((d): d is string => Boolean(d)).join("\n\n") : ""
+  const allFinite = !allDefsText && statements.length > 0 && statements.every(s => proofKind(s) === "finite")
+  const needsStrings = statements.some(usesStringPrelude) || usesStringPrelude(allDefsText)
+  const needsLists = Boolean(allDefsText) || statements.some(usesListPrelude)
   const effectiveHeader = header === FAST_HEADER
     ? (allFinite ? KERNEL_HEADER : needsStrings ? FALLBACK_HEADER : header)
     : header
@@ -1372,11 +1376,28 @@ export function render(header: string, statements: string[], comments?: Readonly
   const prelude = [
     needsStrings ? (kernelOnly ? KERNEL_STRING_DEFS : STRING_PRELUDE) : "",
     needsLists ? (kernelOnly ? KERNEL_LIST_DEFS : LIST_PRELUDE) : "",
-    defsBlock,
   ].filter(Boolean).join("\n\n")
-  return effectiveHeader + (prelude ? `\n\n${prelude}` : "") + "\n\n" + statements.map((statement, i) => {
-    const note = comments?.get(statement)
-    const comment = note ? note.split(/\r?\n/).map(line => `-- ${line}`).join("\n") + "\n" : ""
-    return `${comment}theorem c${i}${statement}`
-  }).join("\n\n") + "\n"
+  const groups = new Map<string, number[]>()
+  for (let i = 0; i < statements.length; i++) {
+    const key = defs?.[i] ?? ""
+    let list = groups.get(key)
+    if (!list) groups.set(key, list = [])
+    list.push(i)
+  }
+  let groupId = 0
+  const sections: string[] = []
+  for (const [defBlock, indices] of groups) {
+    const theorems = indices.map(i => {
+      const statement = statements[i]!
+      const note = comments?.get(defBlock ? `${defBlock}\0${statement}` : statement) ?? comments?.get(statement)
+      const comment = note ? note.split(/\r?\n/).map(line => `-- ${line}`).join("\n") + "\n" : ""
+      return `${comment}theorem c${i}${statement}`
+    }).join("\n\n")
+    if (!defBlock) sections.push(theorems)
+    else {
+      const ns = `_g${groupId++}`
+      sections.push(`namespace ${ns}\n\n${defBlock}\n\n${theorems}\n\nend ${ns}`)
+    }
+  }
+  return effectiveHeader + (prelude ? `\n\n${prelude}` : "") + "\n\n" + sections.join("\n\n") + "\n"
 }

@@ -744,17 +744,24 @@ export async function run(options: RunOptions = {}): Promise<Report> {
   report.cachedObligations = ids.length - fresh.length
   if (config.emit) {
     const comments = new Map<string, string>()
-    const allDefs: string[] = []
     for (const { law, instance, obligation, checks } of pending) {
       const mapping = instance.binders.filter(b => b.label !== b.name).map(b => `${b.name} = ${b.label}`).join(", ")
       const note = `${displayPath(cwd, obligation.file)}:${obligation.line} "${law.name.replace(/\r?\n/g, "\\n")}"${mapping ? ` (${mapping})` : ""}`
       for (const check of checks) {
-        if (!comments.has(check.statement)) comments.set(check.statement, note)
-        if (check.defs) allDefs.push(check.defs)
+        const id = checkKey(check.statement, check.defs)
+        if (!comments.has(id)) comments.set(id, note)
       }
     }
     mkdirSync(dirname(resolve(cwd, config.emit)), { recursive: true })
-    writeFileSync(resolve(cwd, config.emit), render(FAST_HEADER, ids.map(id => uniqueChecks.get(id)!.statement), comments, allDefs))
+    writeFileSync(
+      resolve(cwd, config.emit),
+      render(
+        FAST_HEADER,
+        ids.map(id => uniqueChecks.get(id)!.statement),
+        comments,
+        ids.map(id => uniqueChecks.get(id)!.defs),
+      ),
+    )
   }
   // Everything starts under the fast imports. Statements sharing a recursive `defs`
   // block run together in their own group so termination errors stay isolated.
@@ -938,12 +945,15 @@ export async function run(options: RunOptions = {}): Promise<Report> {
         vacuous()
         continue
       }
-      const searches = reaching.map(({ instance, obligation }) => findInput(instance.binders, obligation.guard))
+      const searches = reaching.map(({ instance, obligation }) => {
+        const defsMap = instance.defs?.length ? new Map(instance.defs.map(d => [d.name, d])) : undefined
+        return findInput(instance.binders, obligation.guard, defsMap)
+      })
       if (searches.some(s => s.found)) continue
       if (searches.every(s => s.exhaustive)) vacuous()
       else {
         try {
-          const checks = reaching.flatMap(({ instance, obligation }) => checksFor(instance.binders, obligation.guard, ir.FALSE, undefined))
+          const checks = reaching.flatMap(({ instance, obligation }) => checksFor(instance.binders, obligation.guard, ir.FALSE, undefined, instance.defs))
           vacuityChecks.push({ entry, site, law, checks })
         } catch (error) {
           if (!(error instanceof TooLarge)) throw error
@@ -953,26 +963,41 @@ export async function run(options: RunOptions = {}): Promise<Report> {
     }
   }
   if (vacuityChecks.length) {
-    const all = [...new Set(vacuityChecks.flatMap(v => v.checks.map(c => c.statement)))]
+    const uniqueVacuity = new Map<string, { statement: string; defs?: string }>()
+    for (const v of vacuityChecks) {
+      for (const c of v.checks) {
+        const id = checkKey(c.statement, c.defs)
+        if (!uniqueVacuity.has(id)) uniqueVacuity.set(id, { statement: c.statement, ...(c.defs ? { defs: c.defs } : {}) })
+      }
+    }
     const neverTrue = new Set<string>()
-    const freshVacuity: string[] = []
-    for (const statement of all) {
-      if (proved.has(keyOf(statement))) neverTrue.add(statement)
-      else freshVacuity.push(statement)
+    const freshVacuity: { id: string; statement: string; defs?: string }[] = []
+    for (const [id, item] of uniqueVacuity) {
+      if (proved.has(keyOf(id))) neverTrue.add(id)
+      else freshVacuity.push({ id, ...item })
     }
     if (freshVacuity.length) {
       const vacuityStart = performance.now()
-      const results = await prove(lean, FAST_HEADER, freshVacuity)
-      report.timings.prove += Math.round(performance.now() - vacuityStart)
-      for (const [i, statement] of freshVacuity.entries()) {
-        if (results[i]!.ok) {
-          neverTrue.add(statement)
-          used.add(keyOf(statement))
-        }
+      const groups = new Map<string, typeof freshVacuity>()
+      for (const item of freshVacuity) {
+        const d = item.defs ?? ""
+        let list = groups.get(d)
+        if (!list) groups.set(d, list = [])
+        list.push(item)
       }
+      await Promise.all([...groups].map(async ([defs, group]) => {
+        const results = await prove(lean, FAST_HEADER, group.map(item => item.statement), undefined, false, defs || undefined)
+        group.forEach(({ id }, i) => {
+          if (results[i]!.ok) {
+            neverTrue.add(id)
+            used.add(keyOf(id))
+          }
+        })
+      }))
+      report.timings.prove += Math.round(performance.now() - vacuityStart)
     }
     for (const { entry, site, checks } of vacuityChecks) {
-      if (checks.every(c => neverTrue.has(c.statement))) {
+      if (checks.every(c => neverTrue.has(checkKey(c.statement, c.defs)))) {
         entry.findings.push({ kind: "vacuous", message: "the condition guarding this expectation is never true, so it proves nothing", ...site })
       } else entry.notes.push(`line ${site.line}: no input satisfying the condition was found by sampling`)
     }
