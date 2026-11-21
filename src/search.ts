@@ -105,7 +105,7 @@ export function valuePool(expressions: readonly Expr[]): Pool {
 function stringPool(expressions: readonly Expr[]): string[] {
   const literals = new Set<string>()
   for (const e of expressions) ir.stringLiterals(e, literals)
-  const pool = new Set(["", "a", "b", ...literals])
+  const pool = new Set(["", "a", "b", "é", "😀", ...literals])
   for (const literal of literals) {
     for (const token of literal.split(/[^\p{L}\p{N}]+/u)) pool.add(token)
     const chars = [...literal]

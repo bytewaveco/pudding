@@ -8,7 +8,7 @@ export type Scalar = boolean | bigint | string
 export type Op =
   | "not" | "and" | "or" | "eq" | "lt" | "le"
   | "add" | "sub" | "mul" | "neg" | "div" | "mod" | "fdiv"
-  | "concat" | "str" | "ite"
+  | "concat" | "str" | "strlen" | "startsWith" | "endsWith" | "includes" | "ite"
 
 export type Expr =
   | { readonly t: "var"; readonly ty: Ty; readonly name: string }
@@ -262,6 +262,76 @@ export function toStr(a: Expr): Expr {
   return op("str", "str", a)
 }
 
+/** Exact JavaScript UTF-16 code-unit length of a string (`s.length`). */
+export function strLen(a: Expr): Expr {
+  if (isLit(a)) return lit(BigInt((a.value as string).length))
+  if (a.t === "op" && a.op === "concat") return add(strLen(a.args[0]!), strLen(a.args[1]!))
+  if (a.t === "op" && a.op === "ite") return ite(a.args[0]!, strLen(a.args[1]!), strLen(a.args[2]!))
+  return op("strlen", "int", a)
+}
+
+function concatParts(e: Expr): Expr[] {
+  const parts: Expr[] = []
+  const stack: Expr[] = [e]
+  while (stack.length) {
+    const cur = stack.pop()!
+    if (cur.t === "op" && cur.op === "concat") {
+      for (let i = cur.args.length - 1; i >= 0; i--) stack.push(cur.args[i]!)
+    } else parts.push(cur)
+  }
+  return parts
+}
+
+/** Whether `s` begins with `pre` (`s.startsWith(pre)`). */
+export function startsWith(s: Expr, pre: Expr): Expr {
+  if (isLit(pre) && pre.value === "") return TRUE
+  if (isLit(s) && isLit(pre)) return lit((s.value as string).startsWith(pre.value as string))
+  if (same(s, pre)) return TRUE
+  if (isLit(s) && s.value === "" && isLit(pre)) return FALSE
+  const parts = concatParts(s)
+  if (parts.length > 1) {
+    if (same(parts[0]!, pre)) return TRUE
+    if (isLit(pre) && parts[0]!.t === "lit") {
+      const head = parts[0]!.value as string
+      const needle = pre.value as string
+      if (head.length >= needle.length) return lit(head.startsWith(needle))
+      if (!needle.startsWith(head)) return FALSE
+    }
+  }
+  return op("startsWith", "bool", s, pre)
+}
+
+/** Whether `s` ends with `suf` (`s.endsWith(suf)`). */
+export function endsWith(s: Expr, suf: Expr): Expr {
+  if (isLit(suf) && suf.value === "") return TRUE
+  if (isLit(s) && isLit(suf)) return lit((s.value as string).endsWith(suf.value as string))
+  if (same(s, suf)) return TRUE
+  if (isLit(s) && s.value === "" && isLit(suf)) return FALSE
+  const parts = concatParts(s)
+  if (parts.length > 1) {
+    const last = parts.at(-1)!
+    if (same(last, suf)) return TRUE
+    if (isLit(suf) && last.t === "lit") {
+      const tail = last.value as string
+      const needle = suf.value as string
+      if (tail.length >= needle.length) return lit(tail.endsWith(needle))
+      if (!needle.endsWith(tail)) return FALSE
+    }
+  }
+  return op("endsWith", "bool", s, suf)
+}
+
+/** Whether `s` contains `sub` (`s.includes(sub)`). */
+export function includes(s: Expr, sub: Expr): Expr {
+  if (isLit(sub) && sub.value === "") return TRUE
+  if (isLit(s) && isLit(sub)) return lit((s.value as string).includes(sub.value as string))
+  if (same(s, sub)) return TRUE
+  if (isLit(s) && s.value === "" && isLit(sub)) return FALSE
+  const parts = concatParts(s)
+  if (parts.some(p => same(p, sub) || (isLit(sub) && p.t === "lit" && (p.value as string).includes(sub.value as string)))) return TRUE
+  return op("includes", "bool", s, sub)
+}
+
 export function ite(c: Expr, a: Expr, b: Expr): Expr {
   if (isLit(c)) return c.value ? a : b
   if (c.t === "op" && c.op === "not") return ite(c.args[0]!, b, a)
@@ -294,6 +364,10 @@ function rebuild(o: Op, args: Expr[]): Expr {
     case "fdiv": return fdiv(a, b)
     case "concat": return concat(a, b)
     case "str": return toStr(a)
+    case "strlen": return strLen(a)
+    case "startsWith": return startsWith(a, b)
+    case "endsWith": return endsWith(a, b)
+    case "includes": return includes(a, b)
     case "ite": return ite(a, b, c)
   }
 }
@@ -453,6 +527,10 @@ export function evaluate(root: Expr, env: ReadonlyMap<string, Scalar>): Scalar {
       case "fdiv": result = evalFdiv(a0 as bigint, a1 as bigint); break
       case "concat": result = (a0 as string) + (a1 as string); break
       case "str": result = String(a0); break
+      case "strlen": result = BigInt((a0 as string).length); break
+      case "startsWith": result = (a0 as string).startsWith(a1 as string); break
+      case "endsWith": result = (a0 as string).endsWith(a1 as string); break
+      case "includes": result = (a0 as string).includes(a1 as string); break
     }
     memo.set(e, result)
     stack.pop()
@@ -543,6 +621,10 @@ export function compile(root: Expr): (env: ReadonlyMap<string, Scalar>) => Scala
       case "fdiv": code = `f(${a[0]},${a[1]})`; break
       case "concat": code = `(${a[0]} + ${a[1]})`; break
       case "str": code = `String(${a[0]})`; break
+      case "strlen": code = `BigInt((${a[0]}).length)`; break
+      case "startsWith": code = `(${a[0]}).startsWith(${a[1]})`; break
+      case "endsWith": code = `(${a[0]}).endsWith(${a[1]})`; break
+      case "includes": code = `(${a[0]}).includes(${a[1]})`; break
       case "ite": code = `(${a[0]}?${a[1]}:${a[2]})`; break
     }
     if ((refs.get(e) ?? 0) > 1 && e !== root) {
