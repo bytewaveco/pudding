@@ -332,7 +332,7 @@ $ npx pudding --reporter verbose
 A failed law says why:
 
 - **A counterexample.** The inputs are named as the law names them, shrunk toward minimal values, with both sides of the failed equality.
-- **A throw that can be reached**, including division by zero, a lookup with a key the table does not have, reading a property of `null` or `undefined`, and a function that ends without returning. A law holds only if the code it calls cannot throw for the inputs it covers (unless asserted with `expect(() => ...).toThrow()`).
+- **A throw that can be reached**, including division by zero, a lookup with a key the table does not have, reading a property of `null` or `undefined`, and a function that ends without returning. A law holds only if the code it calls cannot throw for the inputs it covers (unless asserted with `expect(() => ...).toThrow()`, and aside from JavaScript runtime resource exhaustion such as call-stack or memory limits — see [What a proof means](#what-a-proof-means)).
 - **A law file that throws when it is loaded.** Nothing in it holds at run time, whatever was proved.
 - **A number that stops being exact.** A result beyond 2^53 − 1, a remainder by zero, or a `Math.round` of a quotient whose dividend reaches 2^52 either way.
 - **A lookup that could find something every object inherits.** `table[key]` with a key that may be `"toString"` reads a function, which is not modeled.
