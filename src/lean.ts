@@ -34,6 +34,172 @@ export const FALLBACK_HEADER = header(FALLBACK_IMPORTS)
 /** The whole core library, for proofs an author wrote. A trimmed runtime does not have it. */
 export const FULL_HEADER = "import Init"
 
+/**
+ * Exact UTF-16 string helpers and `@[grind]` lemmas, emitted only when a
+ * theorem uses symbolic string length or affix operations. Uses only modules
+ * already shipped in `FALLBACK_IMPORTS` (no new runtime `.olean` packages).
+ */
+const STRING_PRELUDE = `
+def _p_utf16Units : List Char → Nat
+  | [] => 0
+  | c :: cs => (if c.val.toNat < 0x10000 then 1 else 2) + _p_utf16Units cs
+
+noncomputable def _p_strLen (s : String) : Int := (_p_utf16Units s.toList : Int)
+
+theorem _p_utf16Units_append (a b : List Char) : _p_utf16Units (a ++ b) = _p_utf16Units a + _p_utf16Units b := by
+  induction a with
+  | nil => simp [_p_utf16Units]
+  | cons c cs ih => simp [_p_utf16Units, ih, Nat.add_assoc]
+
+@[grind =, simp] theorem _p_strLen_append (a b : String) : _p_strLen (a ++ b) = _p_strLen a + _p_strLen b := by
+  simp [_p_strLen, String.toList_append, _p_utf16Units_append]
+
+theorem _p_strLen_nonneg (s : String) : 0 ≤ _p_strLen s := Int.natCast_nonneg _
+grind_pattern _p_strLen_nonneg => _p_strLen s
+
+theorem _p_utf16Units_eq_zero (cs : List Char) : _p_utf16Units cs = 0 ↔ cs = [] := by
+  cases cs with
+  | nil => simp [_p_utf16Units]
+  | cons c cs =>
+    constructor
+    · intro h; unfold _p_utf16Units at h; split at h <;> omega
+    · intro h; cases h
+
+theorem _p_strLen_zero_iff (s : String) : _p_strLen s = 0 ↔ s = "" := by
+  unfold _p_strLen
+  constructor
+  · intro h
+    have h0 : _p_utf16Units s.toList = 0 := by omega
+    have hl : s.toList = [] := (_p_utf16Units_eq_zero _).mp h0
+    exact String.toList_inj.mp (by simpa using hl)
+  · intro h; subst h; decide +kernel
+grind_pattern _p_strLen_zero_iff => _p_strLen s
+
+def _p_isPrefixOf : List Char → List Char → Bool
+  | [], _ => true
+  | _ :: _, [] => false
+  | x :: xs, y :: ys => x == y && _p_isPrefixOf xs ys
+
+noncomputable def _p_startsWith (s pre : String) : Bool := _p_isPrefixOf pre.toList s.toList
+noncomputable def _p_endsWith (s suf : String) : Bool := _p_isPrefixOf suf.toList.reverse s.toList.reverse
+
+def _p_containsList : List Char → List Char → Bool
+  | [], _ => true
+  | _ :: _, [] => false
+  | pat@(_ :: _), c :: cs => _p_isPrefixOf pat (c :: cs) || _p_containsList pat cs
+
+noncomputable def _p_includes (s sub : String) : Bool := _p_containsList sub.toList s.toList
+
+theorem _p_isPrefixOf_append (a b : List Char) : _p_isPrefixOf a (a ++ b) = true := by
+  induction a with
+  | nil => rfl
+  | cons c cs ih => simp [_p_isPrefixOf, ih]
+
+@[grind =, simp] theorem _p_startsWith_append (a b : String) : _p_startsWith (a ++ b) a = true := by
+  simp [_p_startsWith, String.toList_append, _p_isPrefixOf_append]
+
+@[grind =, simp] theorem _p_startsWith_self (a : String) : _p_startsWith a a = true := by
+  have := _p_startsWith_append a ""; simpa using this
+
+@[grind =, simp] theorem _p_startsWith_empty (a : String) : _p_startsWith a "" = true := by
+  simp [_p_startsWith, _p_isPrefixOf]
+
+@[grind =, simp] theorem _p_endsWith_append (a b : String) : _p_endsWith (a ++ b) b = true := by
+  simp [_p_endsWith, String.toList_append, List.reverse_append, _p_isPrefixOf_append]
+
+@[grind =, simp] theorem _p_endsWith_self (a : String) : _p_endsWith a a = true := by
+  have := _p_endsWith_append "" a; simpa using this
+
+@[grind =, simp] theorem _p_endsWith_empty (a : String) : _p_endsWith a "" = true := by
+  simp [_p_endsWith, _p_isPrefixOf]
+
+theorem _p_containsList_of_prefix (p s : List Char) : _p_isPrefixOf p s = true → _p_containsList p s = true := by
+  cases p with
+  | nil => intro _; cases s <;> rfl
+  | cons x xs =>
+    cases s with
+    | nil => intro h; cases h
+    | cons y ys => intro h; simp [_p_containsList, h]
+
+theorem _p_containsList_append_left (p a b : List Char) : _p_containsList p b = true → _p_containsList p (a ++ b) = true := by
+  induction a with
+  | nil => intro h; exact h
+  | cons c cs ih =>
+    cases p with
+    | nil => intro _; cases cs <;> rfl
+    | cons x xs => intro h; simp only [_p_containsList, Bool.or_eq_true, List.cons_append]; right; exact ih h
+
+@[grind =, simp] theorem _p_includes_self (a : String) : _p_includes a a = true :=
+  _p_containsList_of_prefix _ _ (by simpa [_p_startsWith] using _p_startsWith_self a)
+
+@[grind =, simp] theorem _p_includes_empty (a : String) : _p_includes a "" = true := by
+  unfold _p_includes; cases a.toList <;> rfl
+
+@[grind =, simp] theorem _p_includes_append_left (a b : String) : _p_includes (a ++ b) a = true :=
+  _p_containsList_of_prefix _ _ (by simpa [_p_startsWith] using _p_startsWith_append a b)
+
+@[grind =, simp] theorem _p_includes_append_right (a b : String) : _p_includes (a ++ b) b = true := by
+  unfold _p_includes; rw [String.toList_append]
+  exact _p_containsList_append_left _ _ _ (by simpa [_p_includes] using _p_includes_self b)
+
+theorem _p_includes_of_startsWith (s p : String) : _p_startsWith s p = true → _p_includes s p = true :=
+  _p_containsList_of_prefix _ _
+grind_pattern _p_includes_of_startsWith => _p_startsWith s p
+
+theorem _p_isPrefixOf_len (a b : List Char) : _p_isPrefixOf a b = true → _p_utf16Units a ≤ _p_utf16Units b := by
+  induction a generalizing b with
+  | nil => intro _; simp [_p_utf16Units]
+  | cons x xs ih =>
+    cases b with
+    | nil => intro h; cases h
+    | cons y ys =>
+      simp only [_p_isPrefixOf, Bool.and_eq_true, beq_iff_eq]
+      rintro ⟨rfl, h⟩; have := ih ys h; simp only [_p_utf16Units]; omega
+
+theorem _p_startsWith_len (s pre : String) : _p_startsWith s pre = true → _p_strLen pre ≤ _p_strLen s := by
+  intro h; have := _p_isPrefixOf_len pre.toList s.toList h; unfold _p_strLen; omega
+grind_pattern _p_startsWith_len => _p_startsWith s pre
+
+theorem _p_utf16Units_reverse (a : List Char) : _p_utf16Units a.reverse = _p_utf16Units a := by
+  induction a with
+  | nil => rfl
+  | cons c cs ih => simp [_p_utf16Units, _p_utf16Units_append, ih, Nat.add_comm]
+
+theorem _p_endsWith_len (s suf : String) : _p_endsWith s suf = true → _p_strLen suf ≤ _p_strLen s := by
+  intro h
+  have := _p_isPrefixOf_len suf.toList.reverse s.toList.reverse h
+  rw [_p_utf16Units_reverse, _p_utf16Units_reverse] at this
+  unfold _p_strLen; omega
+grind_pattern _p_endsWith_len => _p_endsWith s suf
+
+theorem _p_startsWith_concat (s t pre : String) : _p_startsWith s pre = true → _p_startsWith (s ++ t) pre = true := by
+  unfold _p_startsWith; rw [String.toList_append]
+  generalize pre.toList = p; generalize s.toList = a; generalize t.toList = b
+  induction p generalizing a with
+  | nil => intro _; rfl
+  | cons x xs ih =>
+    cases a with
+    | nil => intro h; cases h
+    | cons y ys =>
+      simp only [_p_isPrefixOf, Bool.and_eq_true, beq_iff_eq, List.cons_append]
+      rintro ⟨rfl, h⟩; exact ⟨rfl, ih ys h⟩
+grind_pattern _p_startsWith_concat => _p_startsWith (s ++ t) pre
+
+theorem _p_endsWith_concat (s t suf : String) : _p_endsWith t suf = true → _p_endsWith (s ++ t) suf = true := by
+  unfold _p_endsWith; rw [String.toList_append, List.reverse_append]
+  generalize suf.toList.reverse = p; generalize t.toList.reverse = a; generalize s.toList.reverse = b
+  induction p generalizing a with
+  | nil => intro _; rfl
+  | cons x xs ih =>
+    cases a with
+    | nil => intro h; cases h
+    | cons y ys =>
+      simp only [_p_isPrefixOf, Bool.and_eq_true, beq_iff_eq, List.cons_append]
+      rintro ⟨rfl, h⟩; exact ⟨rfl, ih ys h⟩
+grind_pattern _p_endsWith_concat => _p_endsWith (s ++ t) suf`.trim()
+
+const usesStringPrelude = (statement: string) => /_p_(?:strLen|startsWith|endsWith|includes)\b/.test(statement)
+
 export const DEFAULT_TACTIC = "grind"
 const FINITE_TACTIC = "decide +kernel"
 /** Tried, under the fallback imports, on statements the default tactic could not close. */
@@ -437,6 +603,10 @@ function printOp(e: Extract<Expr, { t: "op" }>, a: string, b: string, c: string)
     case "neg": return `(-${a})`
     case "concat": return `(${a} ++ ${b})`
     case "str": return `(toString ${a})`
+    case "strlen": return `(_p_strLen ${a})`
+    case "startsWith": return `(_p_startsWith ${a} ${b})`
+    case "endsWith": return `(_p_endsWith ${a} ${b})`
+    case "includes": return `(_p_includes ${a} ${b})`
     case "ite": return `(if ${a} then ${b} else ${c})`
     case "fdiv": {
       // Lean's `/` on integers rounds toward minus infinity when the divisor
@@ -915,6 +1085,7 @@ async function runChunk(lean: string, header: string, statements: string[], dire
   // it *and* answers that question acceptably. Silence is never taken for
   // success, and neither is an unfinished proof, which Lean only warns about.
   const lines = header.split("\n")
+  if (statements.some(usesStringPrelude)) lines.push("", ...STRING_PRELUDE.split("\n"))
   const firstLine: number[] = []
   const askedAt: number[] = []
   for (const [i, statement] of statements.entries()) {
@@ -977,6 +1148,7 @@ async function runChunk(lean: string, header: string, statements: string[], dire
  */
 export async function prove(lean: string, header: string, statements: string[], processes = availableParallelism(), alone = false): Promise<LeanOutcome[]> {
   if (!statements.length) return []
+  const effectiveHeader = header === FAST_HEADER && statements.some(usesStringPrelude) ? FALLBACK_HEADER : header
   const directory = await mkdtemp(join(tmpdir(), "pudding-"))
   try {
     const chunks: string[][] = []
@@ -989,7 +1161,7 @@ export async function prove(lean: string, header: string, statements: string[], 
     }
     // Reuse a cached header snapshot when running a modest number of chunks
     // (avoids memory contention on wide fan-out while cutting startup in half).
-    const snapshot = chunks.length <= SNAPSHOT_MAX_CHUNKS ? await ensureHeaderSnapshot(lean, header, directory) : undefined
+    const snapshot = chunks.length <= SNAPSHOT_MAX_CHUNKS ? await ensureHeaderSnapshot(lean, effectiveHeader, directory) : undefined
     // Lean bounds its tactics by work done, not by the clock, and reading a
     // huge theorem is not bounded at all. A file that runs past its time is
     // tried again one theorem at a time, so that only the slow one goes unproved.
@@ -999,7 +1171,7 @@ export async function prove(lean: string, header: string, statements: string[], 
         // The slot is held while Lean runs, never while waiting for another.
         const release = await slot(timeout + 10_000)
         try {
-          return await runChunk(lean, header, chunk, directory, file, alone, timeout, snapshot)
+          return await runChunk(lean, effectiveHeader, chunk, directory, file, alone, timeout, snapshot)
         } finally {
           release()
         }
@@ -1036,7 +1208,10 @@ export async function prove(lean: string, header: string, statements: string[], 
 
 /** The Lean source for a set of statements, for inspection. */
 export function render(header: string, statements: string[], comments?: ReadonlyMap<string, string>): string {
-  return header + "\n\n" + statements.map((statement, i) => {
+  const needsStrings = statements.some(usesStringPrelude)
+  const effectiveHeader = header === FAST_HEADER && needsStrings ? FALLBACK_HEADER : header
+  const prelude = needsStrings ? `\n\n${STRING_PRELUDE}` : ""
+  return effectiveHeader + prelude + "\n\n" + statements.map((statement, i) => {
     const note = comments?.get(statement)
     const comment = note ? note.split(/\r?\n/).map(line => `-- ${line}`).join("\n") + "\n" : ""
     return `${comment}theorem c${i}${statement}`

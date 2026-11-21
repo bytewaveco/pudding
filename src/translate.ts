@@ -984,8 +984,7 @@ export class Translator {
         if (value.k === "bottom") return BOTTOM
         if (value.k === "array") return scalar(ir.lit(BigInt(value.items.length)), true)
         if (value.k === "scalar" && value.e.ty === "str") {
-          const text = this.settle(value.e, () => new Unsupported("the length of a string that is not known here is not modeled", node))
-          return scalar(ir.lit(BigInt((text.value as string).length)), true)
+          return scalar(ir.strLen(value.e), true)
         }
         throw new Unsupported(`toHaveLength is not supported for ${describe(value)}`, node)
       })
@@ -2815,9 +2814,7 @@ export class Translator {
     if (object.k === "null") return this.throwsOnNull(node)
     if (name === "length" && object.k === "array") return scalar(ir.lit(BigInt(object.items.length)), true)
     if (name === "length" && object.k === "scalar" && object.e.ty === "str") {
-      // JavaScript counts UTF-16 units and Lean counts characters, so only a known string has a length here.
-      if (object.e.t !== "lit") throw new Unsupported("the length of a string that is not known here is not modeled", node)
-      return scalar(ir.lit(BigInt((object.e.value as string).length)), true)
+      return scalar(ir.strLen(object.e), true)
     }
     if (object.k === "map" || object.k === "set") {
       if (name === "size") return this.collectionSize(object, node)
@@ -3452,28 +3449,49 @@ export class Translator {
       if (!isNumber(s) || s.k !== "scalar") throw new Unsupported(`\`.${method}\` expects a number ${what}`, node)
       return Number(this.settle(s.e, () => new Unsupported(`\`.${method}\` requires a ${what} known here`, node)).value)
     }
-    // Static symbolic fast-paths for startsWith / endsWith / includes when the pattern is a literal.
-    if ((method === "startsWith" || method === "endsWith" || method === "includes") && args.length === 1 && text.t !== "lit") {
-      const needleVal = this.settled(args[0]!)
-      if (needleVal.k === "scalar" && needleVal.e.ty === "str" && needleVal.e.t === "lit") {
-        const needle = needleVal.e.value as string
-        if (needle === "") return scalar(ir.TRUE)
-        const parts: Expr[] = []
-        const flatten = (e: Expr) => { if (e.t === "op" && e.op === "concat") e.args.forEach(flatten); else parts.push(e) }
-        flatten(text)
-        if (method === "startsWith" && parts[0]?.t === "lit") {
-          const head = parts[0].value as string
-          if (head.length >= needle.length) return scalar(ir.lit(head.startsWith(needle)))
-          if (!needle.startsWith(head)) return scalar(ir.FALSE)
+    // Exact symbolic UTF-16 models for startsWith, endsWith, includes (1-arg, or position 0 for startsWith/includes).
+    if ((method === "startsWith" || method === "endsWith" || method === "includes") && text.t !== "lit") {
+      const noPos = args.length === 1 || (args.length === 2 && (args[1]!.k === "void" || (method !== "endsWith" && isNumber(args[1]!) && args[1]!.k === "scalar" && args[1]!.e.t === "lit" && args[1]!.e.value === 0n)))
+      if (noPos && args[0]) {
+        const needleVal = this.settled(args[0])
+        if (needleVal.k === "scalar" && needleVal.e.ty === "str") {
+          if (method === "startsWith") return scalar(ir.startsWith(text, needleVal.e))
+          if (method === "endsWith") return scalar(ir.endsWith(text, needleVal.e))
+          return scalar(ir.includes(text, needleVal.e))
         }
-        const lastPart = parts.at(-1)
-        if (method === "endsWith" && lastPart?.t === "lit") {
-          const tail = lastPart.value as string
-          if (tail.length >= needle.length) return scalar(ir.lit(tail.endsWith(needle)))
-          if (!needle.endsWith(tail)) return scalar(ir.FALSE)
+      }
+    }
+    // Exact symbolic `.slice` on well-formed literal prefix/suffix boundaries (never splits surrogate pairs).
+    if (method === "slice" && text.t !== "lit") {
+      const start = knownOptNum(args[0], "start")
+      const end = knownOptNum(args[1], "end")
+      if ((start === undefined || start === 0) && end === undefined) return scalar(text)
+      const parts: Expr[] = []
+      const flatten = (e: Expr) => { if (e.t === "op" && e.op === "concat") e.args.forEach(flatten); else parts.push(e) }
+      flatten(text)
+      if (parts[0]?.t === "lit") {
+        const head = parts[0].value as string
+        const rest = parts.slice(1).reduce(ir.concat, ir.lit(""))
+        if (start !== undefined && start >= 0 && start <= head.length && end === undefined) {
+          const piece = head.slice(start)
+          if (piece.isWellFormed()) return scalar(ir.concat(ir.lit(piece), rest))
         }
-        if (method === "includes" && parts.some(p => p.t === "lit" && (p.value as string).includes(needle))) {
-          return scalar(ir.TRUE)
+        if (start !== undefined && end !== undefined && start >= 0 && end >= start && end <= head.length) {
+          const piece = head.slice(start, end)
+          if (piece.isWellFormed()) return scalar(ir.lit(piece))
+        }
+      }
+      const last = parts.at(-1)
+      if (last?.t === "lit") {
+        const tail = last.value as string
+        const init = parts.slice(0, -1).reduce(ir.concat, ir.lit(""))
+        if ((start === undefined || start === 0) && end !== undefined && end < 0 && -end <= tail.length) {
+          const piece = tail.slice(0, end)
+          if (piece.isWellFormed()) return scalar(ir.concat(init, ir.lit(piece)))
+        }
+        if (start !== undefined && start < 0 && -start <= tail.length && end === undefined) {
+          const piece = tail.slice(start)
+          if (piece.isWellFormed()) return scalar(ir.lit(piece))
         }
       }
     }
@@ -3596,20 +3614,25 @@ export class Translator {
       const added = ir.lit(fill.repeat(Math.ceil(missing / fill.length)).slice(0, missing))
       return atStart ? ir.concat(added, inner) : ir.concat(inner, added)
     }
-    // Any other string has to be known here, which an input with few values becomes once the law is split on it.
-    if (text.t !== "lit" && !(text.t === "op" && text.op === "str")) {
-      text = this.settle(text, () => new Unsupported("padding is modeled for a string known here or the text of a whole number; the length of this string is not known", node))
-    }
+    // Known string: pad directly.
     if (text.t === "lit") return scalar(padded(length - (text.value as string).length, text))
-    if (text.t !== "op") throw new Error("the text of a whole number is an operation")
-    // The text of a whole number is its digits, with a minus sign in front of a negative one.
-    const [number] = text.args as [Expr]
+    // The text of a whole number: keep the digit-range encoding so it stays in FAST_HEADER without `_p_strLen`.
+    if (text.t === "op" && text.op === "str") {
+      const [number] = text.args as [Expr]
+      let result: Expr = text
+      for (let size = length - 1; size >= 1; size--) {
+        const low = size === 1 ? 0n : 10n ** BigInt(size - 1)
+        const positive = ir.and(ir.le(ir.lit(low), number), ir.lt(number, ir.lit(10n ** BigInt(size))))
+        const negative = size === 1 ? ir.FALSE : ir.and(ir.lt(ir.lit(-(10n ** BigInt(size - 1))), number), ir.le(number, ir.lit(-(10n ** BigInt(size - 2)))))
+        result = ir.ite(ir.or(positive, negative), padded(length - size, text), result)
+      }
+      return scalar(result)
+    }
+    // General symbolic string: case-split on exact UTF-16 length up to `length`.
+    const len = ir.strLen(text)
     let result: Expr = text
-    for (let size = length - 1; size >= 1; size--) {
-      const low = size === 1 ? 0n : 10n ** BigInt(size - 1)
-      const positive = ir.and(ir.le(ir.lit(low), number), ir.lt(number, ir.lit(10n ** BigInt(size))))
-      const negative = size === 1 ? ir.FALSE : ir.and(ir.lt(ir.lit(-(10n ** BigInt(size - 1))), number), ir.le(number, ir.lit(-(10n ** BigInt(size - 2)))))
-      result = ir.ite(ir.or(positive, negative), padded(length - size, text), result)
+    for (let size = length - 1; size >= 0; size--) {
+      result = ir.ite(ir.eq(len, ir.lit(BigInt(size))), padded(length - size, text), result)
     }
     return scalar(result)
   }

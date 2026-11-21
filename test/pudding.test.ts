@@ -662,7 +662,10 @@ test("padStart and padEnd follow JavaScript for known strings and the text of wh
     const expected = entry.name.startsWith("FALSE") ? ["failed"] : entry.name.startsWith("REFUSED") ? ["checked", "sampled"] : ["proved"]
     assert.ok(expected.includes(entry.status), `${entry.name}: ${entry.status} ${JSON.stringify(entry.findings)} ${entry.notes.join(" ")}`)
   }
-  assert.match(law(report, "REFUSED: padding a string whose length is not known").notes[0] ?? "", /the length of this string is not known/)
+  assert.equal(law(report, "padding an arbitrary symbolic string is idempotent and enforces minimum UTF-16 length").status, "proved")
+  assert.equal(law(report, "symbolic string length, affixes and boundary slices hold for all Unicode text").status, "proved")
+  assert.match(law(report, "REFUSED: padding with a non-BMP multi-unit character").notes[0] ?? "", /one UTF-16 unit each/)
+  assert.match(law(report, "REFUSED: slicing an arbitrary symbolic string at a mid-string offset").notes[0] ?? "", /calling `\.slice`/)
 })
 
 test("strings too long for Lean to compare are refused, never called false", async () => {

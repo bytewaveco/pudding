@@ -250,6 +250,7 @@ class Generator {
       add(0.5, () => `("pre_" + ${sub("str")}).startsWith(${JSON.stringify(r.pick(["pre_", "pr", "x"]))})`)
       add(0.5, () => `(${sub("str")} + "_end").endsWith(${JSON.stringify(r.pick(["_end", "nd", "x"]))})`)
       add(0.5, () => `(${sub("str")} + "MID" + ${sub("str")}).includes("MID")`)
+      add(0.6, () => `(${sub("str")}).${r.pick(["startsWith", "endsWith", "includes"])}(${sub("str")})`)
       add(0.6, () => `(${sub("num")} ${r.pick(["<", "<=", ">", ">="])} (${maybe("num")} ?? ${r.pick(["Infinity", "-Infinity"])}))`)
       add(0.6, () => {
         const t = r.pick(["big", "num", "str"])
@@ -331,6 +332,7 @@ class Generator {
         return `[${values.map(literal).join(", ")}].sort((x, y) => ${r.pick(["x - y", "y - x", "Math.abs(x) - Math.abs(y)"])})[${r.int(3)}]!`
       })
       add(0.7, () => `[${sub(r.pick(TYPES))}, ${sub("bool")}].length`)
+      add(0.8, () => `(${sub("str")}).length`)
       if (listTable) add(1, () => `${listTable.name}[${listTable.key}].length`)
     } else {
       add(3, () => `(${sub("str")} + ${sub("str")})`)
@@ -340,7 +342,9 @@ class Generator {
       })
       add(1, () => `String(${sub(r.pick(["big", "num"]))})`)
       // Padding depends on the length of the text, which for a number depends on its size and sign.
-      add(1.2, () => `${r.chance(0.7) ? `String(${sub(r.pick(["big", "num"]))})` : leaf()}.${r.pick(["padStart", "padEnd"])}(${r.int(6)}${r.chance(0.8) ? `, ${JSON.stringify(r.pick(["0", " ", "ab", "x.y", ""]))}` : ""})`)
+      add(1.2, () => `${r.chance(0.5) ? `String(${sub(r.pick(["big", "num"]))})` : sub("str")}.${r.pick(["padStart", "padEnd"])}(${r.int(6)}${r.chance(0.8) ? `, ${JSON.stringify(r.pick(["0", " ", "ab", "x.y", ""]))}` : ""})`)
+      add(0.6, () => `("pre_" + ${sub("str")}).slice(${r.pick([0, 2, 4])})`)
+      add(0.6, () => `(${sub("str")} + ".ts").slice(0, ${r.pick([-1, -3])})`)
       add(1, () => `(${sub(r.pick(["big", "num"]))}).toString()`)
       add(0.8, () => `[${sub("big")}, ${r.pick(["null", "undefined", sub("str")])}, ${sub("num")}].join(${r.pick(["", '":"', "undefined", "null as unknown as string"])})`)
       add(0.7, () => `Object.keys({ z: 1, "2": 2, a: 3, "0": 4 }).join(",")`)
