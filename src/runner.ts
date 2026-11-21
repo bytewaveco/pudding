@@ -680,7 +680,9 @@ export async function run(options: RunOptions = {}): Promise<Report> {
       const batch: Pending[] = []
       for (const instance of law.instances) {
         for (const obligation of instance.obligations) {
-          batch.push({ law, instance, obligation, checks: checksFor(instance.binders, obligation.guard, obligation.claim, law.proof) })
+          const binders = obligation.extraBinders ? [...obligation.extraBinders, ...instance.binders] : instance.binders
+          const proof = obligation.extraBinders ? undefined : law.proof
+          batch.push({ law, instance, obligation, checks: checksFor(binders, obligation.guard, obligation.claim, proof, instance.defs) })
         }
       }
       pending.push(...batch)
@@ -707,7 +709,8 @@ export async function run(options: RunOptions = {}): Promise<Report> {
         budget: law.problem ? FALLBACK_RUNTIME_BUDGET : PROVED_RUNTIME_BUDGET,
         mentioned: law.mentioned,
         instances: law.instances.map(instance => ({
-          binders: instance.binders, arg: instance.arg, obligations: instance.obligations.map(o => ({ guard: o.guard, claim: o.claim, inexact: o.kind === "overflow" || o.kind === "nan" || o.kind === "round" || o.kind === "inherited" })),
+          binders: instance.binders, arg: instance.arg, ...(instance.defs ? { defs: instance.defs } : {}),
+          obligations: instance.obligations.filter(o => !o.extraBinders).map(o => ({ guard: o.guard, claim: o.claim, inexact: o.kind === "overflow" || o.kind === "nan" || o.kind === "round" || o.kind === "inherited" })),
         })),
       })),
     })),
@@ -721,44 +724,67 @@ export async function run(options: RunOptions = {}): Promise<Report> {
   const known = config.cache === false ? { keys: new Set<string>(), lines: 0 } : loadProofs()
   const proved = known.keys
   const build = buildDigest()
-  const keyOf = (statement: string) => hash(build + "\0" + version + "\0" + statement)
-  const statements = [...new Set(pending.flatMap(p => p.checks.map(c => c.statement)))]
+  const checkKey = (statement: string, defs?: string) => (defs ? `${defs}\0${statement}` : statement)
+  const keyOf = (id: string) => hash(build + "\0" + version + "\0" + id)
+  const uniqueChecks = new Map<string, { statement: string; defs?: string }>()
+  for (const p of pending) {
+    for (const c of p.checks) {
+      const id = checkKey(c.statement, c.defs)
+      if (!uniqueChecks.has(id)) uniqueChecks.set(id, { statement: c.statement, ...(c.defs ? { defs: c.defs } : {}) })
+    }
+  }
+  const ids = [...uniqueChecks.keys()]
   const outcomes = new Map<string, { ok: boolean; message: string }>()
   const fresh: string[] = []
-  for (const statement of statements) {
-    if (proved.has(keyOf(statement))) outcomes.set(statement, { ok: true, message: "" })
-    else fresh.push(statement)
+  for (const id of ids) {
+    if (proved.has(keyOf(id))) outcomes.set(id, { ok: true, message: "" })
+    else fresh.push(id)
   }
-  report.obligations = statements.length
-  report.cachedObligations = statements.length - fresh.length
+  report.obligations = ids.length
+  report.cachedObligations = ids.length - fresh.length
   if (config.emit) {
     const comments = new Map<string, string>()
+    const allDefs: string[] = []
     for (const { law, instance, obligation, checks } of pending) {
       const mapping = instance.binders.filter(b => b.label !== b.name).map(b => `${b.name} = ${b.label}`).join(", ")
       const note = `${displayPath(cwd, obligation.file)}:${obligation.line} "${law.name.replace(/\r?\n/g, "\\n")}"${mapping ? ` (${mapping})` : ""}`
-      for (const check of checks) if (!comments.has(check.statement)) comments.set(check.statement, note)
+      for (const check of checks) {
+        if (!comments.has(check.statement)) comments.set(check.statement, note)
+        if (check.defs) allDefs.push(check.defs)
+      }
     }
     mkdirSync(dirname(resolve(cwd, config.emit)), { recursive: true })
-    writeFileSync(resolve(cwd, config.emit), render(FAST_HEADER, statements, comments))
+    writeFileSync(resolve(cwd, config.emit), render(FAST_HEADER, ids.map(id => uniqueChecks.get(id)!.statement), comments, allDefs))
   }
-  // Everything starts under the fast imports. A proof the author supplied may
-  // name lemmas from anywhere in Lean's core library, so one that fails is
-  // tried again with all of it, where the installed Lean has all of it.
+  // Everything starts under the fast imports. Statements sharing a recursive `defs`
+  // block run together in their own group so termination errors stay isolated.
   const proving = performance.now()
-  const generated = fresh.filter(statement => proofKind(statement) !== "authored")
-  const scripted = fresh.filter(statement => proofKind(statement) === "authored")
-  // A theorem with an author's script is checked in a file of its own.
-  const [first, own] = await Promise.all([prove(lean, FAST_HEADER, generated), prove(lean, FAST_HEADER, scripted, undefined, true)])
-  generated.forEach((statement, i) => outcomes.set(statement, first[i]!))
-  scripted.forEach((statement, i) => outcomes.set(statement, own[i]!))
-  const authored = scripted.filter((_, i) => !own[i]!.ok)
+  const proveGrouped = async (header: string, targetIds: string[], transform: (s: string) => string, alone: boolean) => {
+    const groups = new Map<string, string[]>()
+    for (const id of targetIds) {
+      const defs = uniqueChecks.get(id)!.defs ?? ""
+      let list = groups.get(defs)
+      if (!list) groups.set(defs, list = [])
+      list.push(id)
+    }
+    await Promise.all([...groups].map(async ([defs, groupIds]) => {
+      const res = await prove(lean, header, groupIds.map(id => transform(uniqueChecks.get(id)!.statement)), undefined, alone, defs || undefined)
+      groupIds.forEach((id, i) => outcomes.set(id, res[i]!))
+    }))
+  }
+  const generated = fresh.filter(id => proofKind(uniqueChecks.get(id)!.statement) !== "authored")
+  const scripted = fresh.filter(id => proofKind(uniqueChecks.get(id)!.statement) === "authored")
+  await Promise.all([
+    proveGrouped(FAST_HEADER, generated, s => s, false),
+    proveGrouped(FAST_HEADER, scripted, s => s, true),
+  ])
+  const authored = scripted.filter(id => !outcomes.get(id)!.ok)
   if (authored.length) {
     try {
-      const again = await prove(lean, FULL_HEADER, authored, undefined, true)
-      authored.forEach((statement, i) => outcomes.set(statement, again[i]!))
+      await proveGrouped(FULL_HEADER, authored, s => s, true)
     } catch {
-      for (const statement of authored) {
-        const outcome = outcomes.get(statement)!
+      for (const id of authored) {
+        const outcome = outcomes.get(id)!
         outcome.message += "\n(This Lean installation holds only the part of the library Pudding itself uses. A proof that needs more of it needs a full Lean: run `pudding install-lean --full`, or set PUDDING_LEAN.)"
       }
     }
@@ -771,63 +797,86 @@ export async function run(options: RunOptions = {}): Promise<Report> {
   const counterexamples = new Map<Obligation, ReturnType<typeof findInput>["found"]>()
   const unexplained = new Set<string>()
   for (const { instance, obligation, checks } of pending) {
-    const rejected = checks.filter(c => !outcomes.get(c.statement)!.ok)
+    const rejected = checks.filter(c => !outcomes.get(checkKey(c.statement, c.defs))!.ok)
     if (!rejected.length) continue
-    const { found } = findInput(instance.binders, ir.and(obligation.guard, ir.not(obligation.claim)))
+    if (rejected.some(c => outcomes.get(checkKey(c.statement, c.defs))!.message.startsWith("termination:"))) continue
+    const binders = obligation.extraBinders ? [...obligation.extraBinders, ...instance.binders] : instance.binders
+    const defsMap = instance.defs?.length ? new Map(instance.defs.map(d => [d.name, d])) : undefined
+    const { found } = findInput(binders, ir.and(obligation.guard, ir.not(obligation.claim)), defsMap)
     counterexamples.set(obligation, found)
-    if (!found) for (const check of rejected) unexplained.add(check.statement)
+    if (!found) for (const check of rejected) unexplained.add(checkKey(check.statement, check.defs))
   }
   // What the default automation could not close gets a slower second attempt
   // before the rejection is reported. Lean's first message is kept, because it
   // describes the goal best.
-  const retry = generated.filter((statement, i) => !first[i]!.ok && proofKind(statement) === "automatic" && unexplained.has(statement))
-  const second = await prove(lean, FALLBACK_HEADER, retry.map(withFallback))
-  retry.forEach((statement, i) => {
-    if (second[i]!.ok) outcomes.set(statement, second[i]!)
-  })
-  // Third attempt for nonlinear arithmetic (products of unknowns, division/remainder by an unknown).
-  const obligationByStatement = new Map<string, Obligation>()
-  for (const { obligation, checks } of pending) {
-    for (const check of checks) if (!obligationByStatement.has(check.statement)) obligationByStatement.set(check.statement, obligation)
+  const retry = generated.filter(id => !outcomes.get(id)!.ok && proofKind(uniqueChecks.get(id)!.statement) === "automatic" && unexplained.has(id))
+  if (retry.length) {
+    const firstMessages = new Map(retry.map(id => [id, outcomes.get(id)!]))
+    await proveGrouped(FALLBACK_HEADER, retry, withFallback, false)
+    for (const id of retry) if (!outcomes.get(id)!.ok) outcomes.set(id, firstMessages.get(id)!)
   }
-  const nonLinear: { statement: string; attempt: string }[] = []
-  for (const statement of retry) {
-    if (outcomes.get(statement)!.ok) continue
-    const obligation = obligationByStatement.get(statement)
-    const attempt = obligation ? withNonLinear(statement, obligation.guard, obligation.claim) : undefined
-    if (attempt) nonLinear.push({ statement, attempt })
+  // Third attempt for nonlinear arithmetic (products of unknowns, division/remainder by an unknown).
+  const obligationById = new Map<string, Obligation>()
+  for (const { obligation, checks } of pending) {
+    for (const check of checks) {
+      const id = checkKey(check.statement, check.defs)
+      if (!obligationById.has(id)) obligationById.set(id, obligation)
+    }
+  }
+  const nonLinear: { id: string; attempt: string; defs?: string }[] = []
+  for (const id of retry) {
+    if (outcomes.get(id)!.ok) continue
+    const obligation = obligationById.get(id)
+    const entry = uniqueChecks.get(id)!
+    const attempt = obligation ? withNonLinear(entry.statement, obligation.guard, obligation.claim) : undefined
+    if (attempt) nonLinear.push({ id, attempt, ...(entry.defs ? { defs: entry.defs } : {}) })
   }
   if (nonLinear.length) {
-    const third = await prove(lean, FALLBACK_HEADER, nonLinear.map(entry => entry.attempt))
-    nonLinear.forEach(({ statement }, i) => {
-      if (third[i]!.ok) outcomes.set(statement, third[i]!)
-    })
+    const groups = new Map<string, typeof nonLinear>()
+    for (const item of nonLinear) {
+      const d = item.defs ?? ""
+      let list = groups.get(d)
+      if (!list) groups.set(d, list = [])
+      list.push(item)
+    }
+    await Promise.all([...groups].map(async ([defs, group]) => {
+      const third = await prove(lean, FALLBACK_HEADER, group.map(entry => entry.attempt), undefined, false, defs || undefined)
+      group.forEach(({ id }, i) => {
+        if (third[i]!.ok) outcomes.set(id, third[i]!)
+      })
+    }))
   }
   report.timings.retry = Math.round(performance.now() - retrying)
   report.retried = retry.length
   const used = new Set<string>()
-  for (const statement of statements) if (outcomes.get(statement)!.ok) used.add(keyOf(statement))
+  for (const id of ids) if (outcomes.get(id)!.ok) used.add(keyOf(id))
 
   // Explain each obligation that Lean rejected.
   for (const { law, instance, obligation, checks } of pending) {
     const entry = lawReports.get(law)!
     entry.obligations += checks.length
     entry.cases += checks.reduce((n, c) => n + c.cases, 0)
-    const rejected = checks.map(c => outcomes.get(c.statement)!).find(o => !o.ok)
+    const rejected = checks.map(c => outcomes.get(checkKey(c.statement, c.defs))!).find(o => !o.ok)
     if (!rejected) continue
     const at = { file: obligation.file, line: obligation.line, column: obligation.column, text: obligation.text }
+    if (rejected.message.startsWith("termination:")) {
+      law.problem ??= { kind: "unsupported", message: "Lean could not prove that this recursive function terminates", ...at }
+      continue
+    }
     const found = counterexamples.get(obligation)
     if (found) {
       const assignment = new Map(found)
       for (const [name, value] of instance.fixed) if (!assignment.has(name) && value.t === "lit") assignment.set(name, value.value)
-      const inputs = showInputs(instance.binders, assignment)
+      const binders = obligation.extraBinders ? [...obligation.extraBinders, ...instance.binders] : instance.binders
+      const inputs = showInputs(binders, assignment)
+      const defsMap = instance.defs?.length ? new Map(instance.defs.map(d => [d.name, d])) : undefined
       if (obligation.kind === "expect") {
         const sides = obligation.sides
         const flip: Record<string, string> = { ">": "<=", ">=": "<", "<": ">=", "<=": ">" }
         const prefix = sides?.relation ? `${sides.negated ? flip[sides.relation]! : sides.relation} ` : sides?.negated ? "anything but " : ""
         entry.findings.push({
           kind: "counterexample", message: "the expectation does not hold", ...at, inputs,
-          ...(sides ? { detail: `actual:   ${showValue(sides.actual, found, sides.num)}\nexpected: ${prefix}${showValue(sides.expected, found, sides.num)}` } : {}),
+          ...(sides ? { detail: `actual:   ${showValue(sides.actual, found, sides.num, defsMap)}\nexpected: ${prefix}${showValue(sides.expected, found, sides.num, defsMap)}` } : {}),
         })
       } else {
         // Outside what the model describes, which is not the same as throwing: the code may well return something.
@@ -963,6 +1012,14 @@ export async function run(options: RunOptions = {}): Promise<Report> {
         }
         // Inputs that leave out part of the declared domain are never every input, however few there are.
         if (law.problem && result.executed) executedOnly.set(law, result.exhaustive && !law.narrowed)
+        // If Lean rejected the law late (e.g. termination or kernel depth) after cross-check already ran with
+        // `unproved: false`, `result.modelFails` records an input where both the model and the running code failed.
+        if (law.problem && !result.failure && result.modelFails) {
+          entry.findings.push({
+            kind: "counterexample", inputs: result.modelFails, file: law.file, line: law.line, column: law.column,
+            message: "the law fails when executed",
+          })
+        }
         // Lean accepted every theorem of this law, yet the model those theorems describe fails here.
         if (!law.problem && !entry.findings.length && result.modelFails) {
           entry.findings.push({

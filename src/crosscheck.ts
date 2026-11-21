@@ -21,6 +21,7 @@ interface Instance {
   binders: Binder[]
   arg: ArgShape | undefined
   obligations: { guard: Expr; claim: Expr; inexact: boolean }[]
+  defs?: ir.FnDef[]
 }
 
 export interface Job {
@@ -65,10 +66,16 @@ interface Registered {
 
 const pathOf = (url: string) => fileURLToPath(url.split("?")[0]!)
 
-function compileArgument(shape: ArgShape, numbers: Set<string>): (env: Map<string, Scalar>) => unknown {
+function compileArgument(shape: ArgShape, binders: ReadonlyMap<string, Binder>): (env: Map<string, Scalar>) => unknown {
   const emit = (s: ArgShape): string => {
     switch (s.k) {
-      case "binder": return numbers.has(s.name) ? `Number(env.get(${JSON.stringify(s.name)}))` : `env.get(${JSON.stringify(s.name)})`
+      case "binder": {
+        const b = binders.get(s.name)
+        if (b && ir.isListTy(b.ty)) {
+          return b.num ? `(env.get(${JSON.stringify(s.name)})).map(Number)` : `[...(env.get(${JSON.stringify(s.name)}))]`
+        }
+        return b?.num ? `Number(env.get(${JSON.stringify(s.name)}))` : `env.get(${JSON.stringify(s.name)})`
+      }
       case "const": return s.num ? String(Number(s.value)) : typeof s.value === "bigint" ? `${s.value}n` : JSON.stringify(s.value)
       case "undefined": return "undefined"
       case "null": return "null"
@@ -101,6 +108,7 @@ function modelHolds(obligations: readonly CompiledObligation[], env: Map<string,
     }
     return holds
   } catch (error) {
+    if (error instanceof ir.RecursionLimitError) return "outside"
     if (error instanceof ir.EvaluationError) return false
     throw error
   }
@@ -187,9 +195,10 @@ async function execute(job: Job, report: (outcome: FileOutcome) => void) {
         if (!callback) continue
         const result: LawOutcome = { index: law.index, executed: 0, exhaustive: true }
         for (const instance of law.instances) {
-          const numbers = new Set(instance.binders.filter(b => b.num).map(b => b.name))
-          const buildArg = instance.arg ? compileArgument(instance.arg, numbers) : undefined
-          const compiled = law.unproved ? [] : instance.obligations.map(o => ({ guard: ir.compile(o.guard), claim: ir.compile(o.claim), inexact: o.inexact }))
+          const binderMap = new Map(instance.binders.map(b => [b.name, b]))
+          const buildArg = instance.arg ? compileArgument(instance.arg, binderMap) : undefined
+          const defsMap = instance.defs?.length ? new Map(instance.defs.map(d => [d.name, d])) : undefined
+          const compiled = law.unproved ? [] : instance.obligations.map(o => ({ guard: ir.compile(o.guard, defsMap), claim: ir.compile(o.claim, defsMap), inexact: o.inexact }))
           const space = assignments(instance.binders, valuePool([...instance.obligations.flatMap(o => [o.guard, o.claim]), ...law.mentioned]), law.budget ?? job.budget)
           result.exhaustive &&= space.exhaustive
           space.each(env => {

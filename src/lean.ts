@@ -200,6 +200,57 @@ grind_pattern _p_endsWith_concat => _p_endsWith (s ++ t) suf`.trim()
 
 const usesStringPrelude = (statement: string) => /_p_(?:strLen|startsWith|endsWith|includes)\b/.test(statement)
 
+/**
+ * List length helpers and `@[grind]` lemmas, emitted only when a theorem uses
+ * arbitrary-length `List` operations or recursive `def`s. Uses only `FAST_IMPORTS`.
+ */
+const LIST_PRELUDE = `
+def _p_listLen {α : Type} (xs : List α) : Int := (xs.length : Int)
+
+theorem _p_listLen_nonneg {α : Type} (xs : List α) : 0 ≤ _p_listLen xs := Int.natCast_nonneg _
+grind_pattern _p_listLen_nonneg => _p_listLen xs
+
+@[grind =, simp] theorem _p_listLen_nil {α : Type} : _p_listLen ([] : List α) = 0 := rfl
+@[grind =, simp] theorem _p_listLen_cons {α : Type} (x : α) (xs : List α) : _p_listLen (x :: xs) = 1 + _p_listLen xs := by
+  simp [_p_listLen]; omega
+@[grind =, simp] theorem _p_listLen_append {α : Type} (xs ys : List α) : _p_listLen (xs ++ ys) = _p_listLen xs + _p_listLen ys := by
+  simp [_p_listLen]
+@[grind =, simp] theorem _p_listLen_map {α β : Type} (f : α → β) (xs : List α) : _p_listLen (xs.map f) = _p_listLen xs := by
+  simp [_p_listLen]
+@[grind =, simp] theorem _p_listLen_reverse {α : Type} (xs : List α) : _p_listLen xs.reverse = _p_listLen xs := by
+  simp [_p_listLen]
+
+theorem _p_listLen_filter_le {α : Type} (p : α → Bool) (xs : List α) : _p_listLen (xs.filter p) ≤ _p_listLen xs := by
+  unfold _p_listLen
+  induction xs with
+  | nil => simp
+  | cons h t ih =>
+    simp only [List.filter_cons]
+    split <;> simp <;> omega
+grind_pattern _p_listLen_filter_le => _p_listLen (xs.filter p)
+
+theorem _p_listLen_zero_iff {α : Type} (xs : List α) : _p_listLen xs = 0 ↔ xs = [] := by
+  cases xs with
+  | nil => simp [_p_listLen]
+  | cons h t => simp [_p_listLen]; omega
+grind_pattern _p_listLen_zero_iff => _p_listLen xs
+
+theorem _p_listLen_tail {α : Type} (xs : List α) : _p_listLen xs ≠ 0 → _p_listLen xs.tail = _p_listLen xs - 1 := by
+  cases xs with
+  | nil => intro h; exact absurd rfl h
+  | cons h t => intro _; simp [_p_listLen]
+grind_pattern _p_listLen_tail => _p_listLen xs.tail`.trim()
+
+const usesListPrelude = (statement: string) => /\b_p_listLen\b/.test(statement)
+
+export function printDef(def: ir.FnDef): string {
+  const params = def.params.map(p => `(${p.name} : ${leanType(p.ty)})`).join(" ")
+  const body = printExpr(def.body)
+  const listParam = def.params.find(p => ir.isListTy(p.ty))
+  const listStep = listParam ? ` | (cases ${listParam.name} <;> simp_all [_p_listLen] <;> omega)` : ""
+  return `def ${def.name} ${params} : ${leanType(def.retTy)} :=\n  ${body}\ntermination_by ${def.measure}\ndecreasing_by\n  all_goals (first | (simp_all [_p_listLen]; omega)${listStep})`
+}
+
 export const DEFAULT_TACTIC = "grind"
 const FINITE_TACTIC = "decide +kernel"
 /** Tried, under the fallback imports, on statements the default tactic could not close. */
@@ -577,9 +628,10 @@ function leanString(text: string): string {
 }
 
 function leanScalar(value: Scalar): string {
+  if (Array.isArray(value)) return `[${value.map(leanScalar).join(", ")}]`
   if (typeof value === "boolean") return String(value)
   if (typeof value === "bigint") return `(${value} : Int)`
-  return leanString(value)
+  return leanString(value as string)
 }
 
 /** Minimum printed length before a shared subexpression is bound with `let`. */
@@ -589,7 +641,8 @@ const FINITE_QUANTIFY_THRESHOLD = 256
 /** Max concurrent Lean chunks where `--incr-load` improves wall time without memory contention. */
 const SNAPSHOT_MAX_CHUNKS = 8
 
-function printOp(e: Extract<Expr, { t: "op" }>, a: string, b: string, c: string): string {
+function printOp(e: Extract<Expr, { t: "op" }>, args: string[]): string {
+  const [a = "", b = "", c = ""] = args
   switch (e.op) {
     case "not": return `(!${a})`
     case "and": return `(${a} && ${b})`
@@ -608,6 +661,19 @@ function printOp(e: Extract<Expr, { t: "op" }>, a: string, b: string, c: string)
     case "endsWith": return `(_p_endsWith ${a} ${b})`
     case "includes": return `(_p_includes ${a} ${b})`
     case "ite": return `(if ${a} then ${b} else ${c})`
+    case "listLit": return args.length === 0 ? `([] : ${leanType(e.ty)})` : `[${args.join(", ")}]`
+    case "listLen": return `(_p_listLen ${a})`
+    case "listConcat": return `(${a} ++ ${b})`
+    case "listReverse": return `(${a}.reverse)`
+    case "listElem": return `(${a}.contains ${b})`
+    case "listHead": return `(${a}.headD ${e.ty === "bool" ? "false" : e.ty === "int" ? "(0 : Int)" : '""'})`
+    case "listTail": return `(${a}.tail)`
+    case "listMap": return `(${a}.map fun ${e.param} => ${b})`
+    case "listFilter": return `(${a}.filter fun ${e.param} => ${b})`
+    case "listAny": return `(${a}.any fun ${e.param} => ${b})`
+    case "listAll": return `(${a}.all fun ${e.param} => ${b})`
+    case "listFold": return `(${a}.foldl (fun ${e.acc} ${e.param} => ${c}) ${b})`
+    case "call": return args.length ? `(${e.fn} ${args.join(" ")})` : `(${e.fn})`
     case "fdiv": {
       // Lean's `/` on integers rounds toward minus infinity when the divisor
       // is positive, so a literal divisor needs no case split.
@@ -644,6 +710,7 @@ function printExpr(root: Expr): string {
   const visited = new Set<Expr>()
   const postorder: Expr[] = []
   const stack: [Expr, boolean][] = [[root, false]]
+  const bodyIdxOf = (e: Extract<Expr, { t: "op" }>) => (e.param !== undefined ? (e.op === "listFold" ? 2 : 1) : -1)
   while (stack.length) {
     const [e, expanded] = stack.pop()!
     if (expanded) {
@@ -654,15 +721,30 @@ function printExpr(root: Expr): string {
     visited.add(e)
     if (visited.size > MAX_TERM_SIZE) throw new TooLarge("the translated expression is too large to check")
     stack.push([e, true])
-    if (e.t === "op") for (let i = e.args.length - 1; i >= 0; i--) stack.push([e.args[i]!, false])
+    if (e.t === "op") {
+      const skip = bodyIdxOf(e)
+      for (let i = e.args.length - 1; i >= 0; i--) if (i !== skip) stack.push([e.args[i]!, false])
+    }
   }
   const intern = new Map<string, number>()
   const idOf = new Map<Expr, number>()
   const nodeOf: Expr[] = []
+  const lambdaPrinted = new Map<Expr, string>()
   for (const e of postorder) {
-    const key = e.t === "var" ? `v:${e.ty}:${e.name}`
-      : e.t === "lit" ? `l:${e.ty}:${typeof e.value === "string" ? JSON.stringify(e.value) : String(e.value)}`
-      : `o:${e.op}:${e.args.map(a => idOf.get(a)!).join(",")}`
+    let key: string
+    if (e.t === "var") key = `v:${e.ty}:${e.name}`
+    else if (e.t === "lit") key = `l:${e.ty}:${typeof e.value === "string" ? JSON.stringify(e.value) : String(e.value)}`
+    else {
+      const skip = bodyIdxOf(e)
+      if (skip >= 0) {
+        const bodyStr = printExpr(e.args[skip]!)
+        lambdaPrinted.set(e, bodyStr)
+        const argIds = e.args.map((a, idx) => (idx === skip ? `B:${bodyStr}` : String(idOf.get(a)!))).join(",")
+        key = `o:${e.op}:${e.param ?? ""}:${e.acc ?? ""}:${argIds}`
+      } else {
+        key = `o:${e.op}:${e.fn ?? ""}:${e.ty}:${e.args.map(a => idOf.get(a)!).join(",")}`
+      }
+    }
     let id = intern.get(key)
     if (id === undefined) {
       id = nodeOf.length
@@ -675,7 +757,8 @@ function printExpr(root: Expr): string {
   const refs = new Int32Array(nodeOf.length)
   for (const e of nodeOf) {
     if (e.t !== "op") continue
-    for (const arg of e.args) refs[idOf.get(arg)!]!++
+    const skip = bodyIdxOf(e)
+    e.args.forEach((arg, idx) => { if (idx !== skip) refs[idOf.get(arg)!]!++ })
     if ((e.op === "div" || e.op === "mod") && e.args[1]!.t === "lit" && e.args[1]!.value !== 0n && e.args[0]!.t === "op") {
       refs[idOf.get(e.args[0]!)!]! += 2
     }
@@ -687,8 +770,9 @@ function printExpr(root: Expr): string {
     const e = nodeOf[id]!
     if (e.t === "var") { printed[id] = e.name; continue }
     if (e.t === "lit") { printed[id] = leanScalar(e.value); continue }
-    const [a, b, c] = e.args.map(arg => printed[idOf.get(arg)!]!) as [string, string, string]
-    const text = printOp(e, a, b, c)
+    const skip = bodyIdxOf(e)
+    const args = e.args.map((arg, idx) => (idx === skip ? lambdaPrinted.get(e)! : printed[idOf.get(arg)!]!))
+    const text = printOp(e, args)
     if (refs[id]! >= 2 && text.length >= CSE_MIN_LENGTH && id !== rootId) {
       const name = `_v${lets.length}`
       const binding = `let ${name} := ${text}`
@@ -751,7 +835,7 @@ function longestString(body: Expr, inputs: readonly Binder[]): number {
 }
 
 function leanType(ty: ir.Ty): string {
-  return { bool: "Bool", int: "Int", str: "String" }[ty]
+  return { bool: "Bool", int: "Int", str: "String", list_bool: "List Bool", list_int: "List Int", list_str: "List String" }[ty]
 }
 
 /** The proposition `guard → claim` as a single boolean. */
@@ -764,6 +848,8 @@ export interface Check {
   statement: string
   /** Number of concrete cases the theorem covers when it is decided by evaluation. */
   cases: number
+  /** Printed recursive `def` declarations required by this theorem, if any. */
+  defs?: string
 }
 
 /**
@@ -808,8 +894,42 @@ function nonLinearVars(root: Expr): Set<string> {
   return bad
 }
 
-export function checksFor(binders: readonly Binder[], guard: Expr, claim: Expr, tactic: string | undefined): Check[] {
+function usedDefs(root: Expr, defs: readonly ir.FnDef[] | undefined): string | undefined {
+  if (!defs?.length) return undefined
+  const called = new Set<string>()
+  const seen = new Set<Expr>()
+  const walk = (e: Expr) => {
+    const stack: Expr[] = [e]
+    while (stack.length) {
+      const cur = stack.pop()!
+      if (cur.t !== "op" || seen.has(cur)) continue
+      seen.add(cur)
+      if (cur.op === "call" && cur.fn) called.add(cur.fn)
+      for (const arg of cur.args) stack.push(arg)
+    }
+  }
+  walk(root)
+  if (!called.size) return undefined
+  const byName = new Map(defs.map(d => [d.name, d]))
+  const ordered: ir.FnDef[] = []
+  const added = new Set<string>()
+  const add = (name: string) => {
+    if (added.has(name)) return
+    const def = byName.get(name)
+    if (!def) return
+    added.add(name)
+    const before = new Set(called)
+    walk(def.body)
+    for (const next of called) if (!before.has(next)) add(next)
+    ordered.push(def)
+  }
+  for (const name of [...called]) add(name)
+  return ordered.length ? ordered.map(printDef).join("\n\n") : undefined
+}
+
+export function checksFor(binders: readonly Binder[], guard: Expr, claim: Expr, tactic: string | undefined, defs?: readonly ir.FnDef[]): Check[] {
   const body = implication(guard, claim)
+  const defsText = usedDefs(body, defs)
   const free = ir.freeVariables(body)
   const used = binders.filter(b => free.has(b.name))
   const allFinite = used.every(b => b.domain)
@@ -835,7 +955,7 @@ export function checksFor(binders: readonly Binder[], guard: Expr, claim: Expr, 
     for (const binder of [...used].reverse()) {
       text = `([${binder.domain!.map(leanScalar).join(", ")}].all fun ${binder.name} => ${text})`
     }
-    return [{ statement: ` : ${text} = true := by ${FINITE_TACTIC}`, cases: finiteCases }]
+    return [{ statement: ` : ${text} = true := by ${FINITE_TACTIC}`, cases: finiteCases, ...(defsText ? { defs: defsText } : {}) }]
   }
   if (allFinite && bounded.size === 0) return finiteCheck()
   const finite = used.filter(b => b.domain && !bounded.has(b.name))
@@ -851,8 +971,15 @@ export function checksFor(binders: readonly Binder[], guard: Expr, claim: Expr, 
     throw new TooLarge(`the finite inputs have ${combinations} combinations alongside unbounded ones; the limit is ${MAX_SPECIALIZATIONS}`)
   }
   // An author's script goes inside parentheses, so that it has to be a complete
-  // tactic sequence and nothing after it can be read as part of it.
-  const script = tactic === undefined ? DEFAULT_TACTIC : `(\n  ${tactic.trim().split("\n").join("\n  ")}\n)`
+  // tactic sequence and nothing after it can be read as part of it. Common
+  // leading indentation is stripped so multiline template literals align cleanly.
+  const dedent = (text: string): string => {
+    const raw = text.replace(/^\r?\n/, "").replace(/\r?\n\s*$/, "").split(/\r?\n/)
+    const indents = raw.filter(l => l.trim().length > 0).map(l => /^ */.exec(l)![0].length)
+    const min = indents.length ? Math.min(...indents) : 0
+    return raw.map(l => l.slice(min)).join("\n")
+  }
+  const script = tactic === undefined ? DEFAULT_TACTIC : `(\n  ${dedent(tactic).split("\n").join("\n  ")}\n)`
   const checks: Check[] = []
   const visit = (index: number, values: Map<string, Expr>) => {
     if (index < finite.length) {
@@ -866,7 +993,11 @@ export function checksFor(binders: readonly Binder[], guard: Expr, claim: Expr, 
     const parameters = symbolic.filter(b => remaining.has(b.name)).map(b => ` (${b.name} : ${leanType(b.ty)})`).join("")
     const proposition = g === ir.TRUE ? `${printExpr(c)} = true` : `${printExpr(g)} = true → ${printExpr(c)} = true`
     // Attribute the full covered finite domain once on the first emitted check so skipped trivial specializations stay counted.
-    checks.push({ statement: `${parameters} : ${proposition} := by ${script}`, cases: allFinite && checks.length === 0 ? finiteCases : 0 })
+    checks.push({
+      statement: `${parameters} : ${proposition} := by ${script}`,
+      cases: allFinite && checks.length === 0 ? finiteCases : 0,
+      ...(defsText ? { defs: defsText } : {}),
+    })
   }
   visit(0, new Map())
   return checks
@@ -1079,13 +1210,16 @@ function runFile(lean: string, source: string, directory: string, name: string, 
 /** The axioms of Lean's own logic. A proof that rests on anything else, `sorry` above all, is not a proof. */
 const ACCEPTED_AXIOMS = new Set(["propext", "Classical.choice", "Quot.sound"])
 
-async function runChunk(lean: string, header: string, statements: string[], directory: string, name: string, strict: boolean, timeout: number, snapshot?: string): Promise<LeanOutcome[]> {
+async function runChunk(lean: string, header: string, statements: string[], directory: string, name: string, strict: boolean, timeout: number, snapshot?: string, defs?: string): Promise<LeanOutcome[]> {
   // Each theorem is followed by a question about it: which axioms does it
   // rest on? A theorem counts as proved only when Lean reports no error for
   // it *and* answers that question acceptably. Silence is never taken for
   // success, and neither is an unfinished proof, which Lean only warns about.
   const lines = header.split("\n")
-  if (statements.some(usesStringPrelude)) lines.push("", ...STRING_PRELUDE.split("\n"))
+  if (statements.some(usesStringPrelude) || (defs && usesStringPrelude(defs))) lines.push("", ...STRING_PRELUDE.split("\n"))
+  if (defs || statements.some(usesListPrelude)) lines.push("", ...LIST_PRELUDE.split("\n"))
+  const defsStart = defs ? lines.length + 1 : 0
+  if (defs) lines.push("", ...defs.split("\n"))
   const firstLine: number[] = []
   const askedAt: number[] = []
   for (const [i, statement] of statements.entries()) {
@@ -1118,7 +1252,12 @@ async function runChunk(lean: string, header: string, statements: string[], dire
     if (message.severity === "error") {
       // An error after the last theorem means something in the file disturbed what follows it. Trust none of it.
       if (line >= sentinel) return statements.map(() => ({ ok: false, message: `Lean reported an error after the theorems: ${message.data}` }))
-      if (index < 0) throw new Error(`Lean rejected the generated preamble: ${message.data}`)
+      if (index < 0) {
+        if (defs && line >= defsStart) {
+          return statements.map(() => ({ ok: false, message: `termination: ${message.data}` }))
+        }
+        throw new Error(`Lean rejected the generated preamble: ${message.data}`)
+      }
       // An error on the question itself only repeats that the theorem above it failed.
       if (line !== askedAt[index] || !failed.has(index)) reject(index, message.data)
     } else if (index >= 0 && line === askedAt[index] && message.severity === "information") {
@@ -1137,18 +1276,9 @@ async function runChunk(lean: string, header: string, statements: string[], dire
   return outcomes
 }
 
-/**
- * Check each statement, in parallel across processes when there are many.
- *
- * Statements Pudding generated share files. A statement that carries an
- * author's proof script gets a file of its own (`alone`), with any error in
- * that file counting against it: Lean recovers from a syntax error by reading
- * on from the next command, so text in a script could otherwise define things
- * that change what the theorems after it mean.
- */
-export async function prove(lean: string, header: string, statements: string[], processes = availableParallelism(), alone = false): Promise<LeanOutcome[]> {
+export async function prove(lean: string, header: string, statements: string[], processes = availableParallelism(), alone = false, defs?: string): Promise<LeanOutcome[]> {
   if (!statements.length) return []
-  const effectiveHeader = header === FAST_HEADER && statements.some(usesStringPrelude) ? FALLBACK_HEADER : header
+  const effectiveHeader = header === FAST_HEADER && (statements.some(usesStringPrelude) || (defs && usesStringPrelude(defs))) ? FALLBACK_HEADER : header
   const directory = await mkdtemp(join(tmpdir(), "pudding-"))
   try {
     const chunks: string[][] = []
@@ -1171,7 +1301,7 @@ export async function prove(lean: string, header: string, statements: string[], 
         // The slot is held while Lean runs, never while waiting for another.
         const release = await slot(timeout + 10_000)
         try {
-          return await runChunk(lean, effectiveHeader, chunk, directory, file, alone, timeout, snapshot)
+          return await runChunk(lean, effectiveHeader, chunk, directory, file, alone, timeout, snapshot, defs)
         } finally {
           release()
         }
@@ -1207,11 +1337,14 @@ export async function prove(lean: string, header: string, statements: string[], 
 }
 
 /** The Lean source for a set of statements, for inspection. */
-export function render(header: string, statements: string[], comments?: ReadonlyMap<string, string>): string {
-  const needsStrings = statements.some(usesStringPrelude)
+export function render(header: string, statements: string[], comments?: ReadonlyMap<string, string>, defs?: readonly string[]): string {
+  const uniqueDefs = defs ? [...new Set(defs.filter(Boolean))] : []
+  const defsBlock = uniqueDefs.join("\n\n")
+  const needsStrings = statements.some(usesStringPrelude) || usesStringPrelude(defsBlock)
+  const needsLists = Boolean(defsBlock) || statements.some(usesListPrelude)
   const effectiveHeader = header === FAST_HEADER && needsStrings ? FALLBACK_HEADER : header
-  const prelude = needsStrings ? `\n\n${STRING_PRELUDE}` : ""
-  return effectiveHeader + prelude + "\n\n" + statements.map((statement, i) => {
+  const prelude = [needsStrings ? STRING_PRELUDE : "", needsLists ? LIST_PRELUDE : "", defsBlock].filter(Boolean).join("\n\n")
+  return effectiveHeader + (prelude ? `\n\n${prelude}` : "") + "\n\n" + statements.map((statement, i) => {
     const note = comments?.get(statement)
     const comment = note ? note.split(/\r?\n/).map(line => `-- ${line}`).join("\n") + "\n" : ""
     return `${comment}theorem c${i}${statement}`
