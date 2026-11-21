@@ -157,54 +157,72 @@ function printOp(e: Extract<Expr, { t: "op" }>, a: string, b: string, c: string)
 }
 
 /**
- * Print an expression DAG, sharing repeated subexpressions via `let _vN := ...`
- * so loops and literal `div`/`mod` (which mentions its dividend three times)
- * do not expand exponentially.
+ * Print an expression DAG with value-based CSE (`let _vN := ...`) so loops,
+ * duplicate subtrees from separate branches, and literal `div`/`mod` (which
+ * mentions its dividend three times) do not expand exponentially.
  */
 function printExpr(root: Expr): string {
-  if (ir.dagSize(root) > MAX_TERM_SIZE) throw new TooLarge("the translated expression is too large to check")
-  const refs = new Map<Expr, number>()
   const visited = new Set<Expr>()
   const postorder: Expr[] = []
   const stack: [Expr, boolean][] = [[root, false]]
   while (stack.length) {
     const [e, expanded] = stack.pop()!
-    if (e.t !== "op") continue
     if (expanded) {
       postorder.push(e)
       continue
     }
-    refs.set(e, (refs.get(e) ?? 0) + 1)
-    if (!visited.has(e)) {
-      visited.add(e)
-      if ((e.op === "div" || e.op === "mod") && e.args[1]!.t === "lit" && e.args[1]!.value !== 0n && e.args[0]!.t === "op") {
-        refs.set(e.args[0]!, (refs.get(e.args[0]!) ?? 0) + 2)
-      }
-      stack.push([e, true])
-      for (let i = e.args.length - 1; i >= 0; i--) stack.push([e.args[i]!, false])
+    if (visited.has(e)) continue
+    visited.add(e)
+    if (visited.size > MAX_TERM_SIZE) throw new TooLarge("the translated expression is too large to check")
+    stack.push([e, true])
+    if (e.t === "op") for (let i = e.args.length - 1; i >= 0; i--) stack.push([e.args[i]!, false])
+  }
+  const intern = new Map<string, number>()
+  const idOf = new Map<Expr, number>()
+  const nodeOf: Expr[] = []
+  for (const e of postorder) {
+    const key = e.t === "var" ? `v:${e.ty}:${e.name}`
+      : e.t === "lit" ? `l:${e.ty}:${typeof e.value === "string" ? JSON.stringify(e.value) : String(e.value)}`
+      : `o:${e.op}:${e.args.map(a => idOf.get(a)!).join(",")}`
+    let id = intern.get(key)
+    if (id === undefined) {
+      id = nodeOf.length
+      intern.set(key, id)
+      nodeOf.push(e)
+    }
+    idOf.set(e, id)
+  }
+  const rootId = idOf.get(root)!
+  const refs = new Int32Array(nodeOf.length)
+  for (const e of nodeOf) {
+    if (e.t !== "op") continue
+    for (const arg of e.args) refs[idOf.get(arg)!]!++
+    if ((e.op === "div" || e.op === "mod") && e.args[1]!.t === "lit" && e.args[1]!.value !== 0n && e.args[0]!.t === "op") {
+      refs[idOf.get(e.args[0]!)!]! += 2
     }
   }
   const lets: string[] = []
-  const printed = new Map<Expr, string>()
+  const printed = new Array<string>(nodeOf.length)
   let totalChars = 0
-  const textOf = (e: Expr): string => (e.t === "var" ? e.name : e.t === "lit" ? leanScalar(e.value) : printed.get(e)!)
-  for (const e of postorder) {
-    if (e.t !== "op") continue
-    const [a, b, c] = e.args.map(textOf) as [string, string, string]
+  for (let id = 0; id < nodeOf.length; id++) {
+    const e = nodeOf[id]!
+    if (e.t === "var") { printed[id] = e.name; continue }
+    if (e.t === "lit") { printed[id] = leanScalar(e.value); continue }
+    const [a, b, c] = e.args.map(arg => printed[idOf.get(arg)!]!) as [string, string, string]
     const text = printOp(e, a, b, c)
-    if ((refs.get(e) ?? 0) >= 2 && text.length >= CSE_MIN_LENGTH && e !== root) {
+    if (refs[id]! >= 2 && text.length >= CSE_MIN_LENGTH && id !== rootId) {
       const name = `_v${lets.length}`
       const binding = `let ${name} := ${text}`
       totalChars += binding.length + 2
       if (totalChars > MAX_TERM_TEXT) throw new TooLarge("the translated expression is too large to check")
       lets.push(binding)
-      printed.set(e, name)
+      printed[id] = name
     } else {
       if (text.length > MAX_TERM_TEXT) throw new TooLarge("the translated expression is too large to check")
-      printed.set(e, text)
+      printed[id] = text
     }
   }
-  const body = textOf(root)
+  const body = printed[rootId]!
   const full = lets.length ? `(${lets.join("; ")}; ${body})` : body
   if (full.length > MAX_TERM_TEXT) throw new TooLarge("the translated expression is too large to check")
   return full
@@ -284,22 +302,40 @@ function consecutive(binder: Binder): [bigint, bigint] | undefined {
   return sorted.every((value, i) => i === 0 || value === sorted[i - 1]! + 1n) ? [sorted[0]!, sorted.at(-1)!] : undefined
 }
 
-/** Whether a variable is divided by, multiplied nonlinearly, or formatted as text (which tactics cannot decide). */
-function usedNonLinearly(root: Expr, name: string): boolean {
-  const seen = new Set<Expr>()
-  const stack: Expr[] = [root]
-  const mentions = (part: Expr) => ir.freeVariables(part).has(name)
+/** Variables divided by, multiplied nonlinearly, or formatted as text (which tactics cannot decide), in one O(|DAG|) pass. */
+function nonLinearVars(root: Expr): Set<string> {
+  const postorder: Expr[] = []
+  const visited = new Set<Expr>()
+  const stack: [Expr, boolean][] = [[root, false]]
   while (stack.length) {
-    const e = stack.pop()!
-    if (e.t !== "op" || seen.has(e)) continue
-    seen.add(e)
-    const [a, b] = e.args as [Expr, Expr]
-    if (e.op === "str" && mentions(a)) return true
-    if ((e.op === "div" || e.op === "mod" || e.op === "fdiv") && mentions(b)) return true
-    if (e.op === "mul" && a.t !== "lit" && b.t !== "lit" && (mentions(a) || mentions(b))) return true
-    for (const arg of e.args) stack.push(arg)
+    const [e, expanded] = stack.pop()!
+    if (e.t !== "op") continue
+    if (expanded) { postorder.push(e); continue }
+    if (visited.has(e)) continue
+    visited.add(e)
+    stack.push([e, true])
+    for (let i = e.args.length - 1; i >= 0; i--) stack.push([e.args[i]!, false])
   }
-  return false
+  const vars = new Map<Expr, Set<string>>()
+  const bad = new Set<string>()
+  const mark = (part: Expr) => {
+    if (part.t === "var") bad.add(part.name)
+    else if (part.t === "op") for (const v of vars.get(part)!) bad.add(v)
+  }
+  for (const e of postorder) {
+    if (e.t !== "op") continue
+    const own = new Set<string>()
+    for (const arg of e.args) {
+      if (arg.t === "var") own.add(arg.name)
+      else if (arg.t === "op") for (const v of vars.get(arg)!) own.add(v)
+    }
+    vars.set(e, own)
+    const [a, b] = e.args as [Expr, Expr]
+    if (e.op === "str") mark(a)
+    else if (e.op === "div" || e.op === "mod" || e.op === "fdiv") mark(b)
+    else if (e.op === "mul" && a.t !== "lit" && b.t !== "lit") for (const v of own) bad.add(v)
+  }
+  return bad
 }
 
 export function checksFor(binders: readonly Binder[], guard: Expr, claim: Expr, tactic: string | undefined): Check[] {
@@ -315,12 +351,13 @@ export function checksFor(binders: readonly Binder[], guard: Expr, claim: Expr, 
   // faster than `decide +kernel`.
   const bounded = new Map<string, [bigint, bigint]>()
   if (!allFinite || (tactic === undefined && finiteCases > FINITE_QUANTIFY_THRESHOLD)) {
+    const nonLinear = nonLinearVars(body)
     for (const binder of used) {
       const range = consecutive(binder)
-      if (range && !usedNonLinearly(body, binder.name)) bounded.set(binder.name, range)
+      if (range && !nonLinear.has(binder.name)) bounded.set(binder.name, range)
     }
   }
-  if (allFinite && bounded.size === 0) {
+  const finiteCheck = (): Check[] => {
     if (longestString(body, used) > MAX_STRING_LENGTH) {
       throw new TooLarge(`a string here can grow past ${MAX_STRING_LENGTH} characters, which is too large to check`)
     }
@@ -330,6 +367,7 @@ export function checksFor(binders: readonly Binder[], guard: Expr, claim: Expr, 
     }
     return [{ statement: ` : ${text} = true := by ${FINITE_TACTIC}`, cases: finiteCases }]
   }
+  if (allFinite && bounded.size === 0) return finiteCheck()
   const finite = used.filter(b => b.domain && !bounded.has(b.name))
   const symbolic = used.filter(b => !b.domain || bounded.has(b.name))
   for (const [name, [low, high]] of bounded) {
@@ -339,16 +377,7 @@ export function checksFor(binders: readonly Binder[], guard: Expr, claim: Expr, 
   const combinations = finite.reduce((n, b) => n * b.domain!.length, 1)
   if (combinations > MAX_SPECIALIZATIONS) {
     // When all inputs are actually finite, fall back to direct enumeration if specialization would overflow.
-    if (allFinite) {
-      if (longestString(body, used) > MAX_STRING_LENGTH) {
-        throw new TooLarge(`a string here can grow past ${MAX_STRING_LENGTH} characters, which is too large to check`)
-      }
-      let text = printExpr(body)
-      for (const binder of [...used].reverse()) {
-        text = `([${binder.domain!.map(leanScalar).join(", ")}].all fun ${binder.name} => ${text})`
-      }
-      return [{ statement: ` : ${text} = true := by ${FINITE_TACTIC}`, cases: finiteCases }]
-    }
+    if (allFinite) return finiteCheck()
     throw new TooLarge(`the finite inputs have ${combinations} combinations alongside unbounded ones; the limit is ${MAX_SPECIALIZATIONS}`)
   }
   // An author's script goes inside parentheses, so that it has to be a complete
@@ -477,6 +506,7 @@ function abandoned(file: string): string | undefined {
 
 /** Cached Lean header snapshots per `(lean binary, stdlib, header)`, published atomically as a directory holding both `.snap` and `.snap.deps`. */
 const snapshotPromises = new Map<string, Promise<string | undefined>>()
+const failedSnapshots = new Set<string>()
 
 function headerSnapshotDir(lean: string, header: string): string | undefined {
   if (header === FULL_HEADER) return undefined
@@ -493,7 +523,7 @@ function headerSnapshotDir(lean: string, header: string): string | undefined {
 
 async function ensureHeaderSnapshot(lean: string, header: string, directory: string): Promise<string | undefined> {
   const targetDir = headerSnapshotDir(lean, header)
-  if (!targetDir) return undefined
+  if (!targetDir || failedSnapshots.has(targetDir)) return undefined
   const targetSnap = join(targetDir, "header.snap")
   if (existsSync(targetSnap) && existsSync(`${targetSnap}.deps`)) return targetSnap
   const pending = snapshotPromises.get(targetDir)
@@ -525,8 +555,10 @@ async function ensureHeaderSnapshot(lean: string, header: string, directory: str
         }
         if (existsSync(targetSnap) && existsSync(`${targetSnap}.deps`)) return targetSnap
       }
+      failedSnapshots.add(targetDir)
     } catch {
-      // Snapshots are purely an optimization; fall back to loading imports normally.
+      // Snapshots are purely an optimization; remember failure in-process and fall back to loading imports normally.
+      failedSnapshots.add(targetDir)
     } finally {
       rmSync(stagingDir, { recursive: true, force: true })
       snapshotPromises.delete(targetDir)
@@ -607,8 +639,11 @@ async function runChunk(lean: string, header: string, statements: string[], dire
   }
   for (const message of messages) {
     const line = message.pos?.line ?? 0
-    let index = -1
-    for (let i = 0; i < firstLine.length && firstLine[i]! <= line; i++) index = i
+    let lo = 0, hi = firstLine.length - 1, index = -1
+    while (lo <= hi) {
+      const mid = (lo + hi) >>> 1
+      if (firstLine[mid]! <= line) { index = mid; lo = mid + 1 } else hi = mid - 1
+    }
     if (message.severity === "error") {
       // An error after the last theorem means something in the file disturbed what follows it. Trust none of it.
       if (line >= sentinel) return statements.map(() => ({ ok: false, message: `Lean reported an error after the theorems: ${message.data}` }))

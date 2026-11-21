@@ -41,8 +41,8 @@ export interface Obligation {
   column: number
   /** Source text of the statement that produced the obligation. */
   text: string
-  /** Both sides of an equality assertion, kept for reporting. */
-  sides?: { actual: Expr; expected: Expr; negated: boolean; num: boolean }
+  /** Both sides of an equality or ordering assertion, kept for reporting. */
+  sides?: { actual: Expr; expected: Expr; negated: boolean; num: boolean; relation?: ">" | ">=" | "<" | "<=" }
 }
 
 export const TRUE: Expr = { t: "lit", ty: "bool", value: true }
@@ -67,17 +67,52 @@ export function same(a: Expr, b: Expr): boolean {
   if (a.t !== b.t || a.ty !== b.ty) return false
   if (a.t === "var") return a.name === (b as typeof a).name
   if (a.t === "lit") return a.value === (b as typeof a).value
-  const other = b as typeof a
-  return a.op === other.op && a.args.length === other.args.length && a.args.every((x, i) => same(x, other.args[i]!))
+  const seen = new Map<Expr, Set<Expr>>()
+  const stack: [Expr, Expr][] = [[a, b]]
+  while (stack.length) {
+    const [x, y] = stack.pop()!
+    if (x === y) continue
+    if (x.t !== y.t || x.ty !== y.ty) return false
+    if (x.t === "var") {
+      if (x.name !== (y as typeof x).name) return false
+      continue
+    }
+    if (x.t === "lit") {
+      if (x.value !== (y as typeof x).value) return false
+      continue
+    }
+    const ox = x as Extract<Expr, { t: "op" }>
+    const oy = y as Extract<Expr, { t: "op" }>
+    if (ox.op !== oy.op || ox.args.length !== oy.args.length) return false
+    let partners = seen.get(ox)
+    if (partners?.has(oy)) continue
+    if (!partners) seen.set(ox, partners = new Set())
+    partners.add(oy)
+    for (let i = ox.args.length - 1; i >= 0; i--) stack.push([ox.args[i]!, oy.args[i]!])
+  }
+  return true
 }
 
 function op(o: Op, ty: Ty, ...args: Expr[]): Expr {
   return { t: "op", ty, op: o, args }
 }
 
+function isComplement(a: Expr, b: Expr): boolean {
+  if (a.t === "op" && a.op === "not" && same(a.args[0]!, b)) return true
+  if (b.t === "op" && b.op === "not" && same(b.args[0]!, a)) return true
+  if (a.t === "op" && b.t === "op" && ((a.op === "lt" && b.op === "le") || (a.op === "le" && b.op === "lt"))) {
+    return same(a.args[0]!, b.args[1]!) && same(a.args[1]!, b.args[0]!)
+  }
+  return false
+}
+
 export function not(a: Expr): Expr {
   if (isLit(a)) return lit(!a.value)
-  if (a.t === "op" && a.op === "not") return a.args[0]!
+  if (a.t === "op") {
+    if (a.op === "not") return a.args[0]!
+    if (a.op === "lt") return le(a.args[1]!, a.args[0]!)
+    if (a.op === "le") return lt(a.args[1]!, a.args[0]!)
+  }
   return op("not", "bool", a)
 }
 
@@ -85,6 +120,7 @@ export function and(a: Expr, b: Expr): Expr {
   if (isLit(a)) return a.value ? b : FALSE
   if (isLit(b)) return b.value ? a : FALSE
   if (same(a, b)) return a
+  if (isComplement(a, b)) return FALSE
   return op("and", "bool", a, b)
 }
 
@@ -92,6 +128,7 @@ export function or(a: Expr, b: Expr): Expr {
   if (isLit(a)) return a.value ? TRUE : b
   if (isLit(b)) return b.value ? TRUE : a
   if (same(a, b)) return a
+  if (isComplement(a, b)) return TRUE
   return op("or", "bool", a, b)
 }
 
@@ -127,13 +164,22 @@ export function add(a: Expr, b: Expr): Expr {
   if (isLit(a) && isLit(b)) return lit((a.value as bigint) + (b.value as bigint))
   if (isInt(a, 0n)) return b
   if (isInt(b, 0n)) return a
+  if (isLit(a)) return add(b, a)
+  if (isLit(b)) {
+    const c = b.value as bigint
+    if (a.t === "op" && a.op === "add" && isLit(a.args[1]!)) return add(a.args[0]!, lit((a.args[1]!.value as bigint) + c))
+    if (a.t === "op" && a.op === "sub" && isLit(a.args[1]!)) return add(a.args[0]!, lit(c - (a.args[1]!.value as bigint)))
+    if (c < 0n) return op("sub", "int", a, lit(-c))
+  }
   return op("add", "int", a, b)
 }
 
 export function sub(a: Expr, b: Expr): Expr {
   if (isLit(a) && isLit(b)) return lit((a.value as bigint) - (b.value as bigint))
   if (isInt(b, 0n)) return a
+  if (isInt(a, 0n)) return neg(b)
   if (same(a, b)) return lit(0n)
+  if (isLit(b)) return add(a, lit(-(b.value as bigint)))
   return op("sub", "int", a, b)
 }
 
@@ -142,11 +188,18 @@ export function mul(a: Expr, b: Expr): Expr {
   if (isInt(a, 1n)) return b
   if (isInt(b, 1n)) return a
   if (isInt(a, 0n) || isInt(b, 0n)) return lit(0n)
+  if (isInt(a, -1n)) return neg(b)
+  if (isInt(b, -1n)) return neg(a)
+  if (isLit(a)) return mul(b, a)
+  if (isLit(b) && a.t === "op" && a.op === "mul" && isLit(a.args[1]!)) {
+    return mul(a.args[0]!, lit((a.args[1]!.value as bigint) * (b.value as bigint)))
+  }
   return op("mul", "int", a, b)
 }
 
 export function neg(a: Expr): Expr {
   if (isLit(a)) return lit(-(a.value as bigint))
+  if (a.t === "op" && a.op === "neg") return a.args[0]!
   return op("neg", "int", a)
 }
 
@@ -154,6 +207,7 @@ export function neg(a: Expr): Expr {
 export function div(a: Expr, b: Expr): Expr {
   if (isLit(a) && isLit(b) && b.value !== 0n) return lit((a.value as bigint) / (b.value as bigint))
   if (isInt(b, 1n)) return a
+  if (isInt(b, -1n)) return neg(a)
   // Zero divided by anything is zero; a zero divisor is ruled out separately.
   if (isInt(a, 0n)) return a
   return op("div", "int", a, b)
@@ -165,6 +219,7 @@ const floorDivide = (a: bigint, b: bigint) => (a % b !== 0n && (a < 0n) !== (b <
 export function fdiv(a: Expr, b: Expr): Expr {
   if (isLit(a) && isLit(b) && b.value !== 0n) return lit(floorDivide(a.value as bigint, b.value as bigint))
   if (isInt(b, 1n)) return a
+  if (isInt(b, -1n)) return neg(a)
   if (isInt(a, 0n)) return a
   return op("fdiv", "int", a, b)
 }
@@ -172,26 +227,31 @@ export function fdiv(a: Expr, b: Expr): Expr {
 /** BigInt remainder, which takes the sign of the dividend. */
 export function mod(a: Expr, b: Expr): Expr {
   if (isLit(a) && isLit(b) && b.value !== 0n) return lit((a.value as bigint) % (b.value as bigint))
-  if (isInt(a, 0n)) return a
+  if (isInt(a, 0n) || isInt(b, 1n) || isInt(b, -1n)) return lit(0n)
   return op("mod", "int", a, b)
 }
 
 /** String concatenation, kept flat and left-nested with adjacent literals merged so equal strings look equal. */
 export function concat(a: Expr, b: Expr): Expr {
-  const parts: Expr[] = []
-  const collect = (e: Expr) => {
-    if (e.t === "op" && e.op === "concat") e.args.forEach(collect)
-    else if (isLit(e)) {
-      const last = parts.at(-1)
-      if (e.value === "") return
-      if (last && isLit(last)) parts[parts.length - 1] = lit((last.value as string) + (e.value as string))
-      else parts.push(e)
-    } else parts.push(e)
+  const appendOne = (left: Expr, item: Expr): Expr => {
+    if (isLit(item) && item.value === "") return left
+    if (isLit(left) && left.value === "") return item
+    if (isLit(left) && isLit(item)) return lit((left.value as string) + (item.value as string))
+    if (isLit(item) && left.t === "op" && left.op === "concat" && isLit(left.args[1]!)) {
+      return op("concat", "str", left.args[0]!, lit((left.args[1]!.value as string) + (item.value as string)))
+    }
+    return op("concat", "str", left, item)
   }
-  collect(a)
-  collect(b)
-  if (!parts.length) return lit("")
-  return parts.reduce((left, right) => op("concat", "str", left, right))
+  if (b.t !== "op" || b.op !== "concat") return appendOne(a, b)
+  let result = a
+  const stack: Expr[] = [b]
+  while (stack.length) {
+    const cur = stack.pop()!
+    if (cur.t === "op" && cur.op === "concat") {
+      for (let i = cur.args.length - 1; i >= 0; i--) stack.push(cur.args[i]!)
+    } else result = appendOne(result, cur)
+  }
+  return result
 }
 
 /** The decimal text of a bigint, as `String(n)` gives it. */
@@ -202,7 +262,10 @@ export function toStr(a: Expr): Expr {
 
 export function ite(c: Expr, a: Expr, b: Expr): Expr {
   if (isLit(c)) return c.value ? a : b
+  if (c.t === "op" && c.op === "not") return ite(c.args[0]!, b, a)
   if (same(a, b)) return a
+  if (a.t === "op" && a.op === "ite" && same(a.args[0]!, c)) return ite(c, a.args[1]!, b)
+  if (b.t === "op" && b.op === "ite" && same(b.args[0]!, c)) return ite(c, a, b.args[2]!)
   if (a.ty === "bool") {
     if (isLit(a) && isLit(b)) return a.value ? c : not(c)
     if (isLit(a)) return a.value ? or(c, b) : and(not(c), b)
@@ -271,17 +334,6 @@ export function freeVariables(e: Expr, into = new Set<string>(), seen = new Set<
     }
   }
   return into
-}
-
-/** Size of the expression when printed as a tree. */
-export function treeSize(e: Expr, memo = new Map<Expr, number>()): number {
-  if (e.t !== "op") return 1
-  const seen = memo.get(e)
-  if (seen !== undefined) return seen
-  let size = 1
-  for (const arg of e.args) size += treeSize(arg, memo)
-  memo.set(e, size)
-  return size
 }
 
 /** Number of distinct nodes in the expression DAG. */
