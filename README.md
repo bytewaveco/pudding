@@ -78,16 +78,20 @@ and refactor with the rest of the project.
 npm install --save-dev @bytewaveco/pudding@beta typescript
 ```
 
-Add law files to what Vitest collects.
+Add the Vitest plugin so law files are collected automatically and proved in a single run:
 
 ```ts
 // vitest.config.ts
 import { defineConfig } from "vitest/config"
+import { pudding } from "@bytewaveco/pudding/vitest"
 
 export default defineConfig({
-  test: { include: ["**/*.test.ts", "**/*.law.ts"] },
+  plugins: [pudding()],
 })
 ```
+
+You can also skip the plugin and add `"**/*.law.ts"` to `test.include`; each
+file then runs Pudding on its own when its first law starts.
 
 Write a `*.law.ts` file next to the code and run `npx vitest`. Without Vitest
 there is nothing to configure:
@@ -173,10 +177,13 @@ LawFailed: the expectation does not hold
  ❯ src/pages.law.ts:12:3
 ```
 
-Each file is proved by its own Pudding run when its first law starts, so a
-law file costs a few hundred milliseconds more under Vitest than under
-`pudding`, which reads all of them in one go. Vitest is an optional peer
-dependency, version 3 or newer.
+With the `pudding()` plugin from `@bytewaveco/pudding/vitest`, Pudding runs
+once in Vitest's global setup for all law files, hands each worker its file's
+results, and re-runs only affected law files in watch mode. Without the plugin,
+each file runs Pudding on its own when its first law starts, which costs a few
+hundred milliseconds more per file. Laws that fall back to *checked* or
+*sampled* are annotated and emit a warning so they show up in Vitest's default
+reporter too. Vitest is an optional peer dependency, version 3 or newer.
 
 ## Checked by Lean 4
 

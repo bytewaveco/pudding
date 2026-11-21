@@ -25,12 +25,17 @@
       "types": "./dist/runner.d.ts",
       "default": "./dist/runner.js"
     },
+    "./vitest": {
+      "types": "./dist/vitest-plugin.d.ts",
+      "default": "./dist/vitest-plugin.js"
+    },
     "./package.json": "./package.json"
   },
   "files": [
     "dist/*.js",
     "dist/index.d.ts",
     "dist/runner.d.ts",
+    "dist/vitest-plugin.d.ts",
     "README.md",
     "LICENSE"
   ],

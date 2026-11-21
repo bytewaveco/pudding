@@ -70,8 +70,11 @@ law("FALSE: quantity is ignored", domain<Item>(), item => {
     if (name === "typescript") {
       writeFileSync(join(project, "src", "types-check.ts"), `import type { Config, Integer } from "@bytewaveco/pudding"
 import { createWatchSession, run, type WatchSession } from "@bytewaveco/pudding/runner"
+import { pudding, type PuddingPluginOptions } from "@bytewaveco/pudding/vitest"
 export const session: WatchSession = createWatchSession()
 export const cfg: Config = { strict: true }
+export const pluginOpts: PuddingPluginOptions = { strict: true, lawInclude: ["**/*.law.ts"] }
+export const plugin = pudding(pluginOpts)
 export type Small = Integer<0, 10>
 export const runFn: typeof run = run
 `)

@@ -530,6 +530,40 @@ test("Vitest runs a law file as tests that report the proofs", () => {
   assert.equal(result.status, 1)
 })
 
+test("Vitest plugin proves all law files in one run, keeps unit tests, and warns on sampled/checked laws", () => {
+  const project = mkdtempSync(join(fixtures, ".tmp-vitest-plugin-"))
+  try {
+    cpSync(join(fixtures, "vitest", "coin.law.ts"), join(project, "coin.law.ts"))
+    cpSync(join(fixtures, "vitest", "dice.ts"), join(project, "dice.ts"))
+    cpSync(join(fixtures, "vitest", "dice.law.ts"), join(project, "dice.law.ts"))
+    writeFileSync(join(project, "unit.test.ts"), `import { expect, test } from "vitest"
+test("regular unit test still runs", () => expect(1 + 1).toBe(2))
+`)
+    writeFileSync(join(project, "sampled.law.ts"), `import { domain, expect, law } from "@bytewaveco/pudding"
+law("SAMPLED: regex test is executed not proved", domain<string>(), s => {
+  expect(/^.*$/.test(s)).toBe(true)
+})
+`)
+    writeFileSync(join(project, "vitest.config.ts"), `import { defineConfig } from "vitest/config"
+import { pudding } from "@bytewaveco/pudding/vitest"
+export default defineConfig({
+  plugins: [pudding()],
+})
+`)
+    const result = spawnSync("npx", ["vitest", "run", "--root", project], { encoding: "utf8", cwd: join(import.meta.dirname, "..") })
+    const combined = result.stdout + "\n" + result.stderr
+    // Expect failure from dice.law.ts's intentional FALSE law, while coin.law.ts, unit.test.ts and sampled.law.ts pass.
+    assert.equal(result.status, 1, combined)
+    assert.match(combined, /unit\.test\.ts/)
+    assert.match(combined, /coin\.law\.ts/)
+    assert.match(combined, /sampled\.law\.ts/)
+    assert.match(combined, /\[pudding\] ~ SAMPLED: regex test is executed not proved: executed on sampled inputs, not proved/)
+    assert.match(combined, /the expectation does not hold[\s\S]*with face = 1/)
+  } finally {
+    rmSync(project, { recursive: true, force: true })
+  }
+})
+
 test("DAG sharing proves repeated-division loops, while expressions past the size limit are still refused quickly", async () => {
   const report = await run({ cwd: join(fixtures, "growth"), cache: false })
   assert.equal(law(report, "settling never grows the value").status, "proved")
