@@ -39,7 +39,47 @@ export function assignments(binders: readonly Binder[], pool: Pool, budget: numb
     const edges = low === undefined ? [] : [low, low + 1n, high - 1n, high, (low + high) / 2n]
     return [...new Set([...INTEGERS, ...pool.integers, ...edges].filter(value => low === undefined || (value >= low && value <= high)))]
   }
-  const pools = binders.map(b => b.domain ?? (b.ty === "int" ? integers(b) : b.ty === "bool" ? [true, false] : strings))
+  const elemPool = (b: Binder): readonly Scalar[] =>
+    b.ty === "list_bool" ? [true, false] : b.ty === "list_str" ? strings : integers(b)
+  const listPool = (b: Binder): readonly Scalar[] => {
+    const elems = elemPool(b)
+    const e0 = elems[0]!, e1 = elems[1] ?? e0, e2 = elems[2] ?? e0, e3 = elems[3] ?? e1
+    const base: Scalar[] = [
+      [],
+      [e0],
+      [e1],
+      [e0, e1],
+      [e1, e0],
+      [e0, e0],
+      [e0, e1, e2],
+      [e2, e1, e0],
+      [e0, e1, e2, e3, e0],
+    ]
+    // Include longer arrays so cross-check and search exercise loops and recursion past small lengths.
+    for (const len of [10, 25, 50]) {
+      const long: Scalar[] = []
+      for (let i = 0; i < len; i++) long.push(elems[i % elems.length]!)
+      base.push(long)
+    }
+    return base
+  }
+  const randomList = (b: Binder, random: () => number): Scalar[] => {
+    const elems = elemPool(b)
+    const r = random()
+    const len = r < 0.15 ? 0 : r < 0.65 ? 1 + Math.floor(random() * 5) : r < 0.9 ? 6 + Math.floor(random() * 15) : 20 + Math.floor(random() * 40)
+    const out: Scalar[] = []
+    for (let i = 0; i < len; i++) {
+      if (b.ty === "list_int" && random() >= 0.4) {
+        const v = randomInteger(random)
+        const inside = !b.range || (v >= b.range[0] && v <= b.range[1])
+        out.push(inside ? v : elems[Math.floor(random() * elems.length)]!)
+      } else {
+        out.push(elems[Math.floor(random() * elems.length)]!)
+      }
+    }
+    return out
+  }
+  const pools = binders.map(b => b.domain ?? (ir.isListTy(b.ty) ? listPool(b) : b.ty === "int" ? integers(b) : b.ty === "bool" ? [true, false] : strings))
   const total = pools.reduce((n, pool) => n * pool.length, 1)
   const finite = binders.every(b => b.domain)
   // Keep grid + random draws within `budget`: for unbounded spaces leave room for random exploration.
@@ -72,6 +112,10 @@ export function assignments(binders: readonly Binder[], pool: Pool, budget: numb
       for (let n = 0; n < draws; n++) {
         binders.forEach((b, i) => {
           const pool = pools[i]!
+          if (ir.isListTy(b.ty)) {
+            env.set(b.name, random() < 0.25 ? pool[Math.floor(random() * pool.length)]! : randomList(b, random))
+            return
+          }
           const fromPool = b.domain || b.ty !== "int" || random() < 0.2
           const drawn = fromPool ? pool[Math.floor(random() * pool.length)]! : randomInteger(random)
           // A value outside an input's bounds is not an input at all.
@@ -179,6 +223,24 @@ function shrink(binders: readonly Binder[], holds: (env: Map<string, Scalar>) =>
           else if (tryStr(best.slice(1).join(""))) best = best.slice(1)
           else break
         }
+      } else if (ir.isListTy(b.ty) && Array.isArray(current) && current.length > 0) {
+        let bestList: readonly Scalar[] = current
+        const tryList = (candidate: readonly Scalar[]) => {
+          cur.set(b.name, candidate)
+          if (holds(cur)) { bestList = candidate; improved = true; return true }
+          cur.set(b.name, bestList)
+          return false
+        }
+        if (tryList([])) continue
+        for (let len = Math.floor(bestList.length / 2); len >= 1; len = Math.floor(len / 2)) {
+          if (tryList(bestList.slice(0, len))) continue
+          tryList(bestList.slice(-len))
+        }
+        for (let step = 0; step < 16 && bestList.length > 1; step++) {
+          if (tryList(bestList.slice(0, -1))) continue
+          if (tryList(bestList.slice(1))) continue
+          break
+        }
       }
     }
     if (!improved) break
@@ -186,11 +248,11 @@ function shrink(binders: readonly Binder[], holds: (env: Map<string, Scalar>) =>
   return cur
 }
 
-export function findInput(binders: readonly Binder[], condition: Expr): { found: Map<string, Scalar> | undefined; exhaustive: boolean } {
+export function findInput(binders: readonly Binder[], condition: Expr, defs?: ReadonlyMap<string, ir.FnDef>): { found: Map<string, Scalar> | undefined; exhaustive: boolean } {
   if (condition === ir.TRUE) return { found: new Map(), exhaustive: true }
   const free = ir.freeVariables(condition)
   const used = binders.filter(b => free.has(b.name))
-  const holds = truthyFn(ir.compile(condition))
+  const holds = truthyFn(ir.compile(condition, defs))
   const space = assignments(used, valuePool([condition]), SEARCH_BUDGET)
   let found: Map<string, Scalar> | undefined
   space.each(env => {
@@ -211,9 +273,9 @@ export function showInputs(binders: readonly Binder[], env: Map<string, Scalar>)
   return shown
 }
 
-export function showValue(e: Expr, env: Map<string, Scalar>, num = false): string {
+export function showValue(e: Expr, env: Map<string, Scalar>, num = false, defs?: ReadonlyMap<string, ir.FnDef>): string {
   try {
-    return ir.showScalar(ir.evaluate(e, env), num)
+    return ir.showScalar(ir.evaluate(e, env, defs), num)
   } catch {
     return "(throws)"
   }

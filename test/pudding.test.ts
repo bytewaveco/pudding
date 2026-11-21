@@ -1057,4 +1057,18 @@ law("optional tuple refused", domain<[bigint, bigint?]>(), items => {
       rmSync(project, { recursive: true, force: true })
     }
   })
+
+  test("arbitrary-length arrays, folds and recursive functions prove, refute, and reject non-termination", async () => {
+    const report = await run({ cwd: join(fixtures, "unbounded"), cache: false })
+    assert.deepEqual(report.errors, [])
+    assert.deepEqual(report.warnings, [])
+    for (const entry of report.laws) {
+      assert.equal(entry.status, announced(entry.name), `${entry.name}: ${JSON.stringify(entry.findings)} ${entry.notes.join(" ")}`)
+    }
+    assert.deepEqual(report.laws.flatMap(entry => entry.findings).filter(f => f.kind === "mismatch"), [])
+    assert.deepEqual(law(report, "arbitrary-length arrays and folds > FALSE: countPositive is always strictly positive").findings[0]?.inputs, { xs: "[]" })
+    assert.deepEqual(law(report, "arbitrary-length arrays and folds > FALSE: reversing a list leaves it unchanged").findings[0]?.inputs, { xs: "[0n, 1n]" })
+    assert.deepEqual(law(report, "recursive functions > FALSE: sumToRec is always strictly less than 10").findings[0]?.inputs, { n: "4n" })
+    assert.match(law(report, "recursive functions > SAMPLED: non-terminating recursion is refused by Lean termination checker").notes[0] ?? "", /terminates/)
+  })
 })

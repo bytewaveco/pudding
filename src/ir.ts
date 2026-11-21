@@ -2,18 +2,44 @@
 // types. Everything structured (records, arrays, closures) is resolved by the
 // translator before it reaches this level.
 
-export type Ty = "bool" | "int" | "str"
-export type Scalar = boolean | bigint | string
+export type ScalarTy = "bool" | "int" | "str"
+export type ListTy = "list_bool" | "list_int" | "list_str"
+export type Ty = ScalarTy | ListTy
+export type Scalar = boolean | bigint | string | readonly Scalar[]
+
+export function isListTy(ty: Ty): ty is ListTy {
+  return ty === "list_bool" || ty === "list_int" || ty === "list_str"
+}
+
+export function listTyOf(ty: ScalarTy): ListTy {
+  return ty === "bool" ? "list_bool" : ty === "int" ? "list_int" : "list_str"
+}
+
+export function elemTyOf(ty: ListTy): ScalarTy {
+  return ty === "list_bool" ? "bool" : ty === "list_int" ? "int" : "str"
+}
 
 export type Op =
   | "not" | "and" | "or" | "eq" | "lt" | "le"
   | "add" | "sub" | "mul" | "neg" | "div" | "mod" | "fdiv"
   | "concat" | "str" | "strlen" | "startsWith" | "endsWith" | "includes" | "ite"
+  | "listLit" | "listLen" | "listConcat" | "listReverse" | "listElem" | "listHead" | "listTail"
+  | "listMap" | "listFilter" | "listAny" | "listAll" | "listFold" | "call"
 
 export type Expr =
   | { readonly t: "var"; readonly ty: Ty; readonly name: string }
-  | { readonly t: "lit"; readonly ty: Ty; readonly value: Scalar }
-  | { readonly t: "op"; readonly ty: Ty; readonly op: Op; readonly args: readonly Expr[] }
+  | { readonly t: "lit"; readonly ty: ScalarTy; readonly value: boolean | bigint | string }
+  | { readonly t: "op"; readonly ty: Ty; readonly op: Op; readonly args: readonly Expr[]; readonly param?: string; readonly acc?: string; readonly fn?: string }
+
+/** A pure recursive function compiled to a Lean `def` instead of inlined. */
+export interface FnDef {
+  readonly name: string
+  readonly params: readonly { readonly name: string; readonly ty: Ty; readonly num?: boolean }[]
+  readonly retTy: Ty
+  readonly retNum?: boolean
+  readonly body: Expr
+  readonly measure: string
+}
 
 export interface Binder {
   /** Name of the variable in the IR and in Lean. */
@@ -43,15 +69,18 @@ export interface Obligation {
   text: string
   /** Both sides of an equality or ordering assertion, kept for reporting. */
   sides?: { actual: Expr; expected: Expr; negated: boolean; num: boolean; relation?: ">" | ">=" | "<" | "<=" }
+  /** Extra universally quantified binders (e.g. parameters of a recursive function whose body has safety obligations). */
+  extraBinders?: Binder[]
 }
 
 export const TRUE: Expr = { t: "lit", ty: "bool", value: true }
 export const FALSE: Expr = { t: "lit", ty: "bool", value: false }
 
 export function lit(value: Scalar): Expr {
+  if (Array.isArray(value)) throw new Error("use listLit() for list literals")
   if (value === true) return TRUE
   if (value === false) return FALSE
-  return { t: "lit", ty: typeof value === "bigint" ? "int" : "str", value }
+  return { t: "lit", ty: typeof value === "bigint" ? "int" : "str", value: value as boolean | bigint | string }
 }
 
 export function variable(name: string, ty: Ty): Expr {
@@ -83,7 +112,7 @@ export function same(a: Expr, b: Expr): boolean {
     }
     const ox = x as Extract<Expr, { t: "op" }>
     const oy = y as Extract<Expr, { t: "op" }>
-    if (ox.op !== oy.op || ox.args.length !== oy.args.length) return false
+    if (ox.op !== oy.op || ox.args.length !== oy.args.length || ox.param !== oy.param || ox.acc !== oy.acc || ox.fn !== oy.fn) return false
     let partners = seen.get(ox)
     if (partners?.has(oy)) continue
     if (!partners) seen.set(ox, partners = new Set())
@@ -346,9 +375,79 @@ export function ite(c: Expr, a: Expr, b: Expr): Expr {
   return op("ite", a.ty, c, a, b)
 }
 
-function rebuild(o: Op, args: Expr[]): Expr {
+export function listLit(ty: ListTy, items: readonly Expr[]): Expr {
+  return { t: "op", ty, op: "listLit", args: items }
+}
+
+export function listLen(xs: Expr): Expr {
+  if (xs.t === "op") {
+    if (xs.op === "listLit") return lit(BigInt(xs.args.length))
+    if (xs.op === "listConcat") return add(listLen(xs.args[0]!), listLen(xs.args[1]!))
+    if (xs.op === "listReverse" || xs.op === "listMap") return listLen(xs.args[0]!)
+    if (xs.op === "ite") return ite(xs.args[0]!, listLen(xs.args[1]!), listLen(xs.args[2]!))
+  }
+  return op("listLen", "int", xs)
+}
+
+export function listConcat(a: Expr, b: Expr): Expr {
+  if (a.t === "op" && a.op === "listLit" && a.args.length === 0) return b
+  if (b.t === "op" && b.op === "listLit" && b.args.length === 0) return a
+  if (a.t === "op" && a.op === "listLit" && b.t === "op" && b.op === "listLit") {
+    return listLit(a.ty as ListTy, [...a.args, ...b.args])
+  }
+  return op("listConcat", a.ty, a, b)
+}
+
+export function listReverse(xs: Expr): Expr {
+  if (xs.t === "op") {
+    if (xs.op === "listLit") return listLit(xs.ty as ListTy, [...xs.args].reverse())
+    if (xs.op === "listReverse") return xs.args[0]!
+  }
+  return op("listReverse", xs.ty, xs)
+}
+
+export function listElem(xs: Expr, item: Expr): Expr {
+  if (xs.t === "op" && xs.op === "listLit") return xs.args.map(el => eq(el, item)).reduce(or, FALSE)
+  return op("listElem", "bool", xs, item)
+}
+
+export function listHead(xs: Expr): Expr {
+  if (xs.t === "op" && xs.op === "listLit" && xs.args.length > 0) return xs.args[0]!
+  return op("listHead", elemTyOf(xs.ty as ListTy), xs)
+}
+
+export function listTail(xs: Expr): Expr {
+  if (xs.t === "op" && xs.op === "listLit") return listLit(xs.ty as ListTy, xs.args.slice(1))
+  return op("listTail", xs.ty, xs)
+}
+
+export function listMap(xs: Expr, param: string, body: Expr, outTy: ListTy): Expr {
+  return { t: "op", ty: outTy, op: "listMap", param, args: [xs, body] }
+}
+
+export function listFilter(xs: Expr, param: string, pred: Expr): Expr {
+  return { t: "op", ty: xs.ty, op: "listFilter", param, args: [xs, pred] }
+}
+
+export function listAny(xs: Expr, param: string, pred: Expr): Expr {
+  return { t: "op", ty: "bool", op: "listAny", param, args: [xs, pred] }
+}
+
+export function listAll(xs: Expr, param: string, pred: Expr): Expr {
+  return { t: "op", ty: "bool", op: "listAll", param, args: [xs, pred] }
+}
+
+export function listFold(xs: Expr, init: Expr, acc: string, param: string, body: Expr): Expr {
+  return { t: "op", ty: init.ty, op: "listFold", acc, param, args: [xs, init, body] }
+}
+
+export function callFn(fn: string, retTy: Ty, args: readonly Expr[]): Expr {
+  return { t: "op", ty: retTy, op: "call", fn, args }
+}
+
+function rebuild(e: Extract<Expr, { t: "op" }>, args: Expr[]): Expr {
   const [a, b, c] = args as [Expr, Expr, Expr]
-  switch (o) {
+  switch (e.op) {
     case "not": return not(a)
     case "and": return and(a, b)
     case "or": return or(a, b)
@@ -369,7 +468,33 @@ function rebuild(o: Op, args: Expr[]): Expr {
     case "endsWith": return endsWith(a, b)
     case "includes": return includes(a, b)
     case "ite": return ite(a, b, c)
+    case "listLit": return listLit(e.ty as ListTy, args)
+    case "listLen": return listLen(a)
+    case "listConcat": return listConcat(a, b)
+    case "listReverse": return listReverse(a)
+    case "listElem": return listElem(a, b)
+    case "listHead": return listHead(a)
+    case "listTail": return listTail(a)
+    case "listMap": return listMap(a, e.param!, b, e.ty as ListTy)
+    case "listFilter": return listFilter(a, e.param!, b)
+    case "listAny": return listAny(a, e.param!, b)
+    case "listAll": return listAll(a, e.param!, b)
+    case "listFold": return listFold(a, b, e.acc!, e.param!, c)
+    case "call": return callFn(e.fn!, e.ty, args)
   }
+}
+
+function hasBinderOp(root: Expr): boolean {
+  const seen = new Set<Expr>()
+  const stack: Expr[] = [root]
+  while (stack.length) {
+    const cur = stack.pop()!
+    if (cur.t !== "op" || seen.has(cur)) continue
+    seen.add(cur)
+    if (cur.param !== undefined || cur.acc !== undefined || cur.fn !== undefined || cur.op.startsWith("list")) return true
+    for (const arg of cur.args) stack.push(arg)
+  }
+  return false
 }
 
 /** Replace variables by expressions, folding constants on the way back up. Iterative so deep DAGs never overflow the stack. */
@@ -380,6 +505,15 @@ export function substitute(root: Expr, values: ReadonlyMap<string, Expr>, memo =
   while (stack.length) {
     const [e, expanded] = stack.pop()!
     if (e.t !== "op" || memo.has(e)) continue
+    if (e.param !== undefined && (values.has(e.param) || (e.acc !== undefined && values.has(e.acc)))) {
+      const inner = new Map(values)
+      inner.delete(e.param)
+      if (e.acc !== undefined) inner.delete(e.acc)
+      const bodyIdx = e.op === "listFold" ? 2 : 1
+      const args = e.args.map((arg, idx) => (idx === bodyIdx ? substitute(arg, inner) : substitute(arg, values)))
+      memo.set(e, rebuild(e, args))
+      continue
+    }
     if (expanded) {
       let changed = false
       const args = e.args.map(arg => {
@@ -387,7 +521,7 @@ export function substitute(root: Expr, values: ReadonlyMap<string, Expr>, memo =
         if (next !== arg) changed = true
         return next
       })
-      memo.set(e, changed ? rebuild(e.op, args) : e)
+      memo.set(e, changed ? rebuild(e, args) : e)
     } else {
       stack.push([e, true])
       for (let i = e.args.length - 1; i >= 0; i--) {
@@ -406,7 +540,19 @@ export function freeVariables(e: Expr, into = new Set<string>(), seen = new Set<
     if (cur.t === "var") into.add(cur.name)
     else if (cur.t === "op" && !seen.has(cur)) {
       seen.add(cur)
-      for (const arg of cur.args) stack.push(arg)
+      if (cur.param !== undefined) {
+        const bodyIdx = cur.op === "listFold" ? 2 : 1
+        for (let i = 0; i < cur.args.length; i++) {
+          if (i === bodyIdx) {
+            const inner = freeVariables(cur.args[i]!)
+            inner.delete(cur.param)
+            if (cur.acc !== undefined) inner.delete(cur.acc)
+            for (const name of inner) into.add(name)
+          } else stack.push(cur.args[i]!)
+        }
+      } else {
+        for (const arg of cur.args) stack.push(arg)
+      }
     }
   }
   return into
@@ -453,9 +599,19 @@ export function integerLiterals(e: Expr, into = new Set<bigint>(), seen = new Se
 }
 
 export class EvaluationError extends Error {}
+export class RecursionLimitError extends EvaluationError {}
+
+function scalarEq(a: Scalar, b: Scalar): boolean {
+  if (a === b) return true
+  if (Array.isArray(a) && Array.isArray(b)) return a.length === b.length && a.every((v, i) => scalarEq(v, b[i]!))
+  return false
+}
+
+const MAX_CALL_DEPTH = 2_000
 
 /** Evaluate with JavaScript semantics. Iterative with lazy short-circuiting so deep DAGs never overflow the stack. */
-export function evaluate(root: Expr, env: ReadonlyMap<string, Scalar>): Scalar {
+export function evaluate(root: Expr, env: ReadonlyMap<string, Scalar>, defs?: ReadonlyMap<string, FnDef>, depth = 0): Scalar {
+  if (depth > MAX_CALL_DEPTH) throw new RecursionLimitError("recursion depth exceeded")
   if (root.t === "lit") return root.value
   if (root.t === "var") return evalVar(env, root.name)
   const memo = new Map<Expr, Scalar>()
@@ -502,6 +658,41 @@ export function evaluate(root: Expr, env: ReadonlyMap<string, Scalar>): Scalar {
       }
       continue
     }
+    if (e.op === "listMap" || e.op === "listFilter" || e.op === "listAny" || e.op === "listAll" || e.op === "listFold") {
+      const bodyIdx = e.op === "listFold" ? 2 : 1
+      if (frame.stage === 0) {
+        frame.stage = 1
+        for (let i = bodyIdx - 1; i >= 0; i--) {
+          const arg = e.args[i]!
+          if (arg.t === "op" && !memo.has(arg)) stack.push({ node: arg, stage: 0 })
+        }
+        continue
+      }
+      const list = valueOf(e.args[0]!) as readonly Scalar[]
+      const body = e.args[bodyIdx]!
+      const child = new Map(env)
+      let res: Scalar
+      if (e.op === "listMap") {
+        res = list.map(item => { child.set(e.param!, item); return evaluate(body, child, defs, depth + 1) })
+      } else if (e.op === "listFilter") {
+        res = list.filter(item => { child.set(e.param!, item); return evaluate(body, child, defs, depth + 1) === true })
+      } else if (e.op === "listAny") {
+        res = list.some(item => { child.set(e.param!, item); return evaluate(body, child, defs, depth + 1) === true })
+      } else if (e.op === "listAll") {
+        res = list.every(item => { child.set(e.param!, item); return evaluate(body, child, defs, depth + 1) === true })
+      } else {
+        let accVal = valueOf(e.args[1]!)
+        for (const item of list) {
+          child.set(e.acc!, accVal)
+          child.set(e.param!, item)
+          accVal = evaluate(body, child, defs, depth + 1)
+        }
+        res = accVal
+      }
+      memo.set(e, res)
+      stack.pop()
+      continue
+    }
     if (frame.stage === 0) {
       frame.stage = 1
       for (let i = e.args.length - 1; i >= 0; i--) {
@@ -510,12 +701,12 @@ export function evaluate(root: Expr, env: ReadonlyMap<string, Scalar>): Scalar {
       }
       continue
     }
-    const a0 = valueOf(e.args[0]!)
+    const a0 = e.args.length > 0 ? valueOf(e.args[0]!) : undefined
     const a1 = e.args.length > 1 ? valueOf(e.args[1]!) : undefined
     let result: Scalar
     switch (e.op) {
       case "not": result = !a0; break
-      case "eq": result = a0 === a1; break
+      case "eq": result = scalarEq(a0!, a1!); break
       case "lt": result = (a0 as bigint) < (a1 as bigint); break
       case "le": result = (a0 as bigint) <= (a1 as bigint); break
       case "add": result = (a0 as bigint) + (a1 as bigint); break
@@ -531,6 +722,26 @@ export function evaluate(root: Expr, env: ReadonlyMap<string, Scalar>): Scalar {
       case "startsWith": result = (a0 as string).startsWith(a1 as string); break
       case "endsWith": result = (a0 as string).endsWith(a1 as string); break
       case "includes": result = (a0 as string).includes(a1 as string); break
+      case "listLit": result = e.args.map(valueOf); break
+      case "listLen": result = BigInt((a0 as readonly Scalar[]).length); break
+      case "listConcat": result = [...(a0 as readonly Scalar[]), ...(a1 as readonly Scalar[])]; break
+      case "listReverse": result = [...(a0 as readonly Scalar[])].reverse(); break
+      case "listElem": result = (a0 as readonly Scalar[]).some(el => scalarEq(el, a1!)); break
+      case "listHead": {
+        const list = a0 as readonly Scalar[]
+        if (list.length === 0) result = e.ty === "bool" ? false : e.ty === "int" ? 0n : ""
+        else result = list[0]!
+        break
+      }
+      case "listTail": result = (a0 as readonly Scalar[]).slice(1); break
+      case "call": {
+        const def = defs?.get(e.fn!)
+        if (!def) throw new EvaluationError(`unknown function ${e.fn}`)
+        const child = new Map<string, Scalar>()
+        def.params.forEach((p, idx) => child.set(p.name, valueOf(e.args[idx]!)))
+        result = evaluate(def.body, child, defs, depth + 1)
+        break
+      }
     }
     memo.set(e, result)
     stack.pop()
@@ -566,7 +777,7 @@ function evalVar(env: ReadonlyMap<string, Scalar>, name: string): Scalar {
  * short-circuiting and division-by-zero exceptions. Deep expressions fall back
  * cleanly to the iterative evaluator so JS call stacks never overflow.
  */
-export function compile(root: Expr): (env: ReadonlyMap<string, Scalar>) => Scalar {
+export function compile(root: Expr, fnDefs?: ReadonlyMap<string, FnDef>): (env: ReadonlyMap<string, Scalar>) => Scalar {
   if (root.t === "lit") {
     const value = root.value
     return () => value
@@ -575,6 +786,7 @@ export function compile(root: Expr): (env: ReadonlyMap<string, Scalar>) => Scala
     const name = root.name
     return env => evalVar(env, name)
   }
+  if (fnDefs?.size || hasBinderOp(root)) return env => evaluate(root, env, fnDefs)
   const refs = new Map<Expr, number>()
   const visited = new Set<Expr>()
   const postorder: Expr[] = []
@@ -626,6 +838,7 @@ export function compile(root: Expr): (env: ReadonlyMap<string, Scalar>) => Scala
       case "endsWith": code = `(${a[0]}).endsWith(${a[1]})`; break
       case "includes": code = `(${a[0]}).includes(${a[1]})`; break
       case "ite": code = `(${a[0]}?${a[1]}:${a[2]})`; break
+      default: return env => evaluate(root, env, fnDefs)
     }
     if ((refs.get(e) ?? 0) > 1 && e !== root) {
       const id = defs.length
@@ -646,6 +859,7 @@ export function compile(root: Expr): (env: ReadonlyMap<string, Scalar>) => Scala
 
 /** A value as it is written in TypeScript. `num` marks an integer that stands for a `number`. */
 export function showScalar(value: Scalar, num = false): string {
+  if (Array.isArray(value)) return `[${value.map(item => showScalar(item, num)).join(", ")}]`
   return typeof value === "bigint" ? (num ? String(value) : `${value}n`) : JSON.stringify(value)
 }
 

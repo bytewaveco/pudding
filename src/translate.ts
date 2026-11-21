@@ -58,6 +58,8 @@ export interface LawInstance {
   binders: Binder[]
   arg: ArgShape | undefined
   obligations: Obligation[]
+  /** Pure recursive functions compiled to Lean `def`s for this law instance. */
+  defs?: ir.FnDef[]
 }
 
 export interface Law {
@@ -92,6 +94,8 @@ type Value =
   | { k: "quot"; num: Expr; den: Expr }
   /** A known finite non-dyadic IEEE-754 double (e.g. `0.05`, `0.1`, `1.08`). */
   | { k: "float"; value: number }
+  /** An arbitrary-length symbolic array (`List Bool | List Int | List String`). */
+  | { k: "list"; e: Expr; num?: boolean }
   /** `unordered` marks a record from a law input whose property order is not fixed by its type. */
   | { k: "record"; fields: Map<string, Value>; own?: Ownership; unordered?: boolean }
   | { k: "array"; items: Value[]; own?: Ownership }
@@ -155,6 +159,7 @@ let objectsCreated = 0
 
 type Shape =
   | { k: "scalar"; ty: Ty; values?: Scalar[]; num?: boolean; range?: [bigint, bigint] }
+  | { k: "list"; elem: ir.ScalarTy; num?: boolean; range?: [bigint, bigint] }
   | { k: "record"; fields: [string, Shape][] }
   | { k: "tuple"; items: Shape[] }
   | { k: "union"; alts: Shape[] }
@@ -334,12 +339,13 @@ function sourceText(node: Node): string {
 
 function describe(value: Value): string {
   switch (value.k) {
-    case "scalar": return value.num ? "a number" : { bool: "a boolean", int: "a bigint", str: "a string" }[value.e.ty]
+    case "scalar": return value.num ? "a number" : { bool: "a boolean", int: "a bigint", str: "a string" }[value.e.ty as ir.ScalarTy]
     case "rat":
     case "quot":
     case "float": return "a number"
     case "record": return "an object"
-    case "array": return "an array"
+    case "array":
+    case "list": return "an array"
     case "closure": return "a function"
     case "choice": return "a value that depends on a condition"
     case "bottom": return "a thrown error"
@@ -403,7 +409,15 @@ export class Translator {
   private inThrowCheck = 0
   /** Count of closures created in the current law instance, used to keep escaping mutable cells live. */
   private closuresCreated = 0
-  private readonly facts = new Map<Node, { assigned: Set<string>; mentioned: Set<string>; returnsValue: boolean; usesVar: Node | undefined }>()
+  /** Counter for fresh lambda parameter names (`_elN`, `_accN`). */
+  private lambdaCounter = 0
+  /** Recursive functions currently being compiled into Lean `def`s. */
+  private compilingFns = new Map<N, { name: string; params: { name: string; ty: Ty; num?: boolean }[]; retTy: Ty; retNum?: boolean; calls: Expr[][] }>()
+  /** Recursive functions already compiled in the current law instance, keyed by `node` + signature. */
+  private compiledFns = new Map<string, ir.FnDef>()
+  private fnNodeIds = new WeakMap<object, number>()
+  private nextFnNodeId = 0
+  private readonly facts = new Map<Node, { assigned: Set<string>; mentioned: Set<string>; returnsValue: boolean; usesVar: Node | undefined; isRecursive: boolean }>()
   private instance: LawInstance | undefined
 
   constructor(program: Program, checker: Checker, moduleName: string) {
@@ -612,6 +626,8 @@ export class Translator {
         this.writes = []
         this.freezes = []
         this.closuresCreated = 0
+        this.compilingFns.clear()
+        this.compiledFns.clear()
         this.epoch = ++epochs
         this.steps = 0
         const facts = this.factsOf(callback)
@@ -763,7 +779,23 @@ export class Translator {
       }
       return { k: "tuple", items: this.checker.getTypeArguments(type as N).map(item => this.shapeOf(item, at, depth + 1)) }
     }
-    if (this.checker.isArrayType(type)) throw new Unsupported("arrays of unknown length are not supported as inputs; use a tuple", at)
+    if (this.checker.isArrayType(type)) {
+      const [elemType] = this.checker.getTypeArguments(type as N)
+      if (!elemType) throw new Unsupported("arrays of unknown length are not supported as inputs; use a tuple", at)
+      const elemShape = this.shapeOf(elemType, at, depth + 1)
+      if (elemShape.k !== "scalar") {
+        throw new Unsupported("arrays of unknown length are supported for boolean, bigint, Integer and string elements; use a tuple for other element types", at)
+      }
+      let range = elemShape.range
+      if (!range && elemShape.ty === "int" && elemShape.values?.length) {
+        const sorted = (elemShape.values as bigint[]).toSorted((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+        if (sorted.every((v, i) => i === 0 || v === sorted[i - 1]! + 1n)) range = [sorted[0]!, sorted.at(-1)!]
+        else throw new Unsupported("arrays of non-contiguous literal unions are not supported as inputs; use a tuple", at)
+      } else if (elemShape.values && elemShape.ty !== "bool") {
+        throw new Unsupported("arrays of literal unions are not supported as inputs; use a tuple", at)
+      }
+      return { k: "list", elem: elemShape.ty as ir.ScalarTy, ...(elemShape.num ? { num: true } : {}), ...(range ? { range } : {}) }
+    }
     if (flags & TypeFlags.Object) {
       if (this.checker.getSignaturesOfType(type, SignatureKind.Call).length) throw new Unsupported("functions are not supported as inputs", at)
       if (this.checker.getIndexInfosOfType(type).length) {
@@ -794,6 +826,7 @@ export class Translator {
       }, [[]])
     switch (shape.k) {
       case "scalar":
+      case "list":
       case "void":
       case "null":
       case "absent": return [shape]
@@ -823,6 +856,20 @@ export class Translator {
         }
         return { k: "binder", name }
       }
+      case "list": {
+        const name = `x${instance.binders.length}`
+        const ty = ir.listTyOf(shape.elem)
+        instance.binders.push({
+          name, label: name, ty,
+          ...(shape.num ? { num: true } : {}), ...(shape.range ? { range: shape.range } : {}),
+        })
+        if (shape.range) {
+          const param = `_el${this.lambdaCounter++}`
+          const v = ir.variable(param, "int")
+          instance.assumptions.push(ir.listAll(ir.variable(name, ty), param, ir.and(ir.le(ir.lit(shape.range[0]), v), ir.le(v, ir.lit(shape.range[1])))))
+        }
+        return { k: "binder", name }
+      }
       case "tuple": return { k: "array", items: shape.items.map(item => this.instantiate(item, instance)) }
       case "record": return { k: "record", fields: shape.fields.map(([key, field]) => [key, this.instantiate(field, instance)]) }
       case "void": return { k: "undefined" }
@@ -836,6 +883,7 @@ export class Translator {
     switch (arg.k) {
       case "binder": {
         const binder = this.instance!.binders.find(b => b.name === arg.name)!
+        if (ir.isListTy(binder.ty)) return { k: "list", e: ir.variable(binder.name, binder.ty), ...(binder.num ? { num: true } : {}) }
         return scalar(ir.variable(binder.name, binder.ty), binder.num)
       }
       case "const": return scalar(ir.lit(arg.value), arg.num)
@@ -847,7 +895,7 @@ export class Translator {
   }
 
   private relabel(value: Value, path: string) {
-    if (value.k === "scalar" && value.e.t === "var") {
+    if ((value.k === "scalar" || value.k === "list") && value.e.t === "var") {
       const binder = this.instance?.binders.find(b => b.name === (value.e as { name: string }).name)
       if (binder) binder.label = path
     } else if (value.k === "record") for (const [key, field] of value.fields) this.relabel(field, `${path}.${key}`)
@@ -983,6 +1031,7 @@ export class Translator {
       const actualLen = this.over(actual, value => {
         if (value.k === "bottom") return BOTTOM
         if (value.k === "array") return scalar(ir.lit(BigInt(value.items.length)), true)
+        if (value.k === "list") return scalar(ir.listLen(value.e), true)
         if (value.k === "scalar" && value.e.ty === "str") {
           return scalar(ir.strLen(value.e), true)
         }
@@ -998,6 +1047,7 @@ export class Translator {
     const has = this.over(actual, value => {
       if (value.k === "bottom") return BOTTOM
       if (value.k === "array") return this.arrayContains(value.items, expected, node)
+      if (value.k === "list") return this.listMethod(value, "includes", [expected], node)
       if (value.k === "scalar" && value.e.ty === "str") return this.stringMethod(value.e, "includes", [expected], node)
       throw new Unsupported(`toContain is not supported for ${describe(value)}`, node)
     })
@@ -1015,6 +1065,13 @@ export class Translator {
     // An object is never undefined or null, however the two are compared.
     if (((a.k === "void" || a.k === "null") && isObject(b)) || ((b.k === "void" || b.k === "null") && isObject(a))) return ir.FALSE
     if (identity) throw new Unsupported("toBe compares identity, which is only modeled for booleans, bigints, numbers, strings, null and undefined; use toEqual", at)
+    if (a.k === "list" || b.k === "list") {
+      const ref = (a.k === "list" ? a : b) as Extract<Value, { k: "list" }>
+      const la = this.asListExpr(a, ref.e.ty as ir.ListTy, !!ref.num)
+      const lb = this.asListExpr(b, ref.e.ty as ir.ListTy, !!ref.num)
+      if (la && lb) return ir.eq(la.e, lb.e)
+      throw new Unsupported(`cannot compare ${describe(a)} with ${describe(b)}`, at)
+    }
     if (a.k === "array" && b.k === "array") {
       if (a.items.length !== b.items.length) return ir.FALSE
       return ir.all(a.items.map((item, i) => this.equal(item, b.items[i]!, at)))
@@ -1347,6 +1404,7 @@ export class Translator {
     if (a.k === "bottom") return b
     if (b.k === "bottom") return a
     if (a.k === "scalar" && b.k === "scalar" && a.e.ty === b.e.ty && !!a.num === !!b.num) return scalar(ir.ite(cond, a.e, b.e), a.num)
+    if (a.k === "list" && b.k === "list" && a.e.ty === b.e.ty && !!a.num === !!b.num) return { k: "list", e: ir.ite(cond, a.e, b.e), ...(a.num ? { num: true } : {}) }
     if (a.k === "rat" && b.k === "rat" && a.shift === b.shift) return { k: "rat", num: ir.ite(cond, a.num, b.num), shift: a.shift }
     if (a.k === "float" && b.k === "float" && a.value === b.value) return a
     if (a.k === "closure" && b.k === "closure" && a.node === b.node && a.env === b.env) return a
@@ -1367,6 +1425,7 @@ export class Translator {
     if (a.k === "bottom") return b
     if (b.k === "bottom") return a
     if (a.k === "scalar" && b.k === "scalar" && a.e.ty === b.e.ty && !!a.num === !!b.num) return scalar(ir.ite(cond, a.e, b.e), a.num)
+    if (a.k === "list" && b.k === "list" && a.e.ty === b.e.ty && !!a.num === !!b.num) return { k: "list", e: ir.ite(cond, a.e, b.e), ...(a.num ? { num: true } : {}) }
     if (a.k === "rat" && b.k === "rat" && a.shift === b.shift) return { k: "rat", num: ir.ite(cond, a.num, b.num), shift: a.shift }
     if (a.k === "float" && b.k === "float" && a.value === b.value) return a
     // Two objects merged field by field give a third that is neither of them,
@@ -1407,10 +1466,14 @@ export class Translator {
   private factsOf(fn: N) {
     let facts = this.facts.get(fn)
     if (facts) return facts
-    facts = { assigned: new Set<string>(), mentioned: new Set<string>(), returnsValue: false, usesVar: undefined }
+    facts = { assigned: new Set<string>(), mentioned: new Set<string>(), returnsValue: false, usesVar: undefined, isRecursive: false }
+    const selfName: string | undefined = fn.name?.kind === K.Identifier ? fn.name.text : undefined
     const isFunction = (node: N) => node.kind === K.ArrowFunction || node.kind === K.FunctionExpression || node.kind === K.FunctionDeclaration
     const visit = (node: N, nested: boolean) => {
       if (node.kind === K.Identifier) facts!.mentioned.add(node.text)
+      if (selfName && node.kind === K.CallExpression && node.expression.kind === K.Identifier && node.expression.text === selfName) {
+        facts!.isRecursive = true
+      }
       if (node.kind === K.BinaryExpression && node.operatorToken.kind >= K.FirstAssignment && node.operatorToken.kind <= K.LastAssignment) {
         collectNames(node.left, facts!.assigned)
       }
@@ -1514,16 +1577,238 @@ export class Translator {
     throw new Unsupported("this binding pattern is not supported", pattern)
   }
 
+  private valueFromExpr(e: Expr, num?: boolean): Value {
+    if (ir.isListTy(e.ty)) return { k: "list", e, ...(num ? { num: true } : {}) }
+    return scalar(e, num)
+  }
+
+  private asListExpr(value: Value, wantTy?: ir.ListTy, wantNum?: boolean): { e: Expr; num?: boolean } | undefined {
+    value = this.settled(value)
+    if (value.k === "list") {
+      if (wantTy && value.e.ty !== wantTy) return undefined
+      if (wantNum !== undefined && !!value.num !== wantNum) return undefined
+      return { e: value.e, ...(value.num ? { num: true } : {}) }
+    }
+    if (value.k === "array") {
+      if (value.items.length === 0) {
+        return wantTy ? { e: ir.listLit(wantTy, []), ...(wantNum ? { num: true } : {}) } : undefined
+      }
+      const first = this.settled(value.items[0]!)
+      if (first.k !== "scalar") return undefined
+      const elemTy = first.e.ty as ir.ScalarTy
+      const listTy = ir.listTyOf(elemTy)
+      const num = !!first.num
+      if (wantTy && listTy !== wantTy) return undefined
+      if (wantNum !== undefined && num !== wantNum) return undefined
+      const exprs: Expr[] = []
+      for (const raw of value.items) {
+        const item = this.settled(raw)
+        if (item.k !== "scalar" || item.e.ty !== elemTy || !!item.num !== num) return undefined
+        exprs.push(item.e)
+      }
+      return { e: ir.listLit(listTy, exprs), ...(num ? { num: true } : {}) }
+    }
+    return undefined
+  }
+
+  private irArgOf(value: Value, expectedTy?: Ty, expectedNum?: boolean): { e: Expr; ty: Ty; num?: boolean } | undefined {
+    value = this.settled(value)
+    if (value.k === "scalar") {
+      if (expectedTy && value.e.ty !== expectedTy) return undefined
+      if (expectedNum !== undefined && !!value.num !== expectedNum) return undefined
+      return { e: value.e, ty: value.e.ty, ...(value.num ? { num: true } : {}) }
+    }
+    if (value.k === "list" || value.k === "array") {
+      const list = this.asListExpr(value, expectedTy && ir.isListTy(expectedTy) ? expectedTy : undefined, expectedNum)
+      if (!list) return undefined
+      if (expectedTy && list.e.ty !== expectedTy) return undefined
+      return { e: list.e, ty: list.e.ty, ...(list.num ? { num: true } : {}) }
+    }
+    return undefined
+  }
+
+  private returnIrType(node: N): { ty: Ty; num?: boolean } | undefined {
+    const type = node.type ? this.checker.getTypeFromTypeNode(node.type)
+      : (() => {
+        const sig = this.checker.getSignatureFromDeclaration?.(node)
+        return sig ? this.checker.getReturnTypeOfSignature?.(sig) : undefined
+      })()
+    if (!type) return undefined
+    if (type.flags & (TypeFlags.Boolean | TypeFlags.BooleanLiteral)) return { ty: "bool" }
+    if (type.flags & (TypeFlags.BigInt | TypeFlags.BigIntLiteral)) return { ty: "int" }
+    if (type.flags & (TypeFlags.String | TypeFlags.StringLiteral)) return { ty: "str" }
+    if (type.flags & (TypeFlags.Number | TypeFlags.NumberLiteral)) return { ty: "int", num: true }
+    if (this.checker.isArrayType(type)) {
+      const [elem] = this.checker.getTypeArguments(type as N)
+      if (!elem) return undefined
+      if (elem.flags & (TypeFlags.Boolean | TypeFlags.BooleanLiteral)) return { ty: "list_bool" }
+      if (elem.flags & (TypeFlags.BigInt | TypeFlags.BigIntLiteral)) return { ty: "list_int" }
+      if (elem.flags & (TypeFlags.String | TypeFlags.StringLiteral)) return { ty: "list_str" }
+      if (elem.flags & (TypeFlags.Number | TypeFlags.NumberLiteral)) return { ty: "list_int", num: true }
+    }
+    return undefined
+  }
+
+  private safeLeanDefName(raw: string): string {
+    const reserved = new Set([
+      "def", "theorem", "lemma", "axiom", "example", "let", "in", "if", "then", "else", "match", "with", "fun",
+      "by", "do", "for", "return", "where", "import", "prelude", "true", "false", "Nat", "Int", "Bool", "String", "List",
+    ])
+    const base = /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(raw) && !reserved.has(raw) && !/^(?:c\d+|x\d+|_p_|_v\d+|_el\d+|_acc\d+)/.test(raw)
+      ? raw
+      : `_fn_${raw.replace(/[^a-zA-Z0-9_]/g, "_")}`
+    const used = new Set((this.instance?.defs ?? []).map(d => d.name))
+    if (!used.has(base)) return base
+    let k = 1
+    while (used.has(`${base}_${k}`)) k++
+    return `${base}_${k}`
+  }
+
+  private callRecursive(fn: Extract<Value, { k: "closure" }>, args: Value[], at: N): Value | undefined {
+    const node = fn.node
+    const active = this.compilingFns.get(node)
+    if (active) {
+      if (args.length !== active.params.length) throw new Unsupported("recursive call argument count does not match its parameters", at)
+      const argExprs = active.params.map((p, i) => {
+        const converted = this.irArgOf(args[i]!, p.ty, !!p.num)
+        if (!converted) throw new Unsupported(`recursive call argument ${i + 1} has an incompatible type`, at)
+        return converted.e
+      })
+      active.calls.push(argExprs)
+      return this.valueFromExpr(ir.callFn(active.name, active.retTy, argExprs), active.retNum)
+    }
+    if (!this.instance) return undefined
+    const parameters = parametersOf(node)
+    if (parameters.length === 0 || parameters.length !== args.length) return undefined
+    if (parameters.some(p => p.name.kind !== K.Identifier || p.dotDotDotToken || p.initializer)) return undefined
+    const convertedArgs: { e: Expr; ty: Ty; num?: boolean }[] = []
+    for (const arg of args) {
+      const irArg = this.irArgOf(arg)
+      if (!irArg) return undefined
+      convertedArgs.push(irArg)
+    }
+    let nodeId = this.fnNodeIds.get(node)
+    if (nodeId === undefined) this.fnNodeIds.set(node, nodeId = this.nextFnNodeId++)
+    const sigKey = `${nodeId}:${convertedArgs.map(a => `${a.ty}:${a.num ? 1 : 0}`).join(",")}`
+    const cached = this.compiledFns.get(sigKey)
+    if (cached) return this.valueFromExpr(ir.callFn(cached.name, cached.retTy, convertedArgs.map(a => a.e)), cached.retNum)
+    const ret = this.returnIrType(node)
+    if (!ret) return undefined
+    const rawName = node.name?.kind === K.Identifier ? node.name.text as string : "rec"
+    const defName = this.safeLeanDefName(rawName)
+    const params = parameters.map((p, i) => ({
+      name: `_p${i}`,
+      orig: p.name.text as string,
+      ty: convertedArgs[i]!.ty,
+      ...(convertedArgs[i]!.num ? { num: true } : {}),
+    }))
+    const info = {
+      name: defName,
+      params: params.map(({ name, ty, num }) => ({ name, ty, ...(num ? { num } : {}) })),
+      retTy: ret.ty,
+      ...(ret.num ? { retNum: true } : {}),
+      calls: [] as Expr[][],
+    }
+    const facts = this.factsOf(node)
+    if (facts.usesVar) throw new Unsupported("`var` is not supported; use `const` or `let`", facts.usesVar)
+    this.noteExpectations(node)
+    const savedPc = this.pc
+    const savedFrame = this.frame
+    const savedMerging = this.merging
+    const live = this.cells.length
+    const startObs = this.instance.obligations.length
+    this.compilingFns.set(node, info)
+    this.pc = []
+    this.frame = live
+    this.merging = 0
+    this.assigned.push(facts.assigned)
+    let bodyVal: Value
+    try {
+      bodyVal = this.unchanging(`the recursive function \`${rawName}\``, at, () => {
+        const env = fn.env.child()
+        if (node.kind === K.FunctionExpression && node.name) env.set(node.name.text, fn)
+        params.forEach(p => {
+          const cell = env.set(p.orig, this.valueFromExpr(ir.variable(p.name, p.ty), p.num), facts.assigned.has(p.orig))
+          if (cell.mutable) this.cells.push(cell)
+        })
+        if (node.body.kind !== K.Block) return this.evalExpr(node.body, env)
+        return this.block(node.body.statements, env.child(), {
+          next: () => {
+            if (!facts.returnsValue) return VOID
+            this.emit("falloff", ir.FALSE, node)
+            return BOTTOM
+          },
+        })
+      })
+    } finally {
+      this.compilingFns.delete(node)
+      this.assigned.pop()
+      this.cells.length = live
+      this.pc = savedPc
+      this.frame = savedFrame
+      this.merging = savedMerging
+    }
+    if (!info.calls.length) return undefined
+    const bodyExpr = this.irArgOf(bodyVal, ret.ty, !!ret.num)
+    if (!bodyExpr) throw new Unsupported(`recursive function \`${rawName}\` must return a consistent boolean, bigint, number, string or array`, node)
+    const addedObs = this.instance.obligations.slice(startObs)
+    if (addedObs.some(o => o.kind === "expect")) {
+      throw new Unsupported(`recursive function \`${rawName}\` containing \`expect()\` is not supported`, node)
+    }
+    const extraBinders: Binder[] = params.map(p => ({ name: p.name, label: `${rawName}(${p.orig})`, ty: p.ty, ...(p.num ? { num: true } : {}) }))
+    for (const o of addedObs) o.extraBinders = extraBinders
+    // Pick a termination measure from parameters that actually change across recursive calls.
+    const changing = params.filter((p, idx) => info.calls.some(c => !ir.same(c[idx]!, ir.variable(p.name, p.ty))))
+    const changingLists = changing.filter(p => ir.isListTy(p.ty))
+    const changingInts = changing.filter(p => p.ty === "int")
+    let measure: string
+    if (changingLists.length) {
+      measure = changingLists.map(p => `${p.name}.length`).join(" + ")
+    } else if (changingInts.length === 1) {
+      const p = changingInts[0]!
+      const pIdx = params.indexOf(p)
+      const fixedInt = params.find(q => q !== p && q.ty === "int" && !changing.includes(q))
+      const increases = info.calls.every(c => {
+        const arg = c[pIdx]!
+        return arg.t === "op" && arg.op === "add" && ir.same(arg.args[0]!, ir.variable(p.name, "int")) && arg.args[1]!.t === "lit" && (arg.args[1]!.value as bigint) > 0n
+      })
+      measure = increases && fixedInt ? `(${fixedInt.name} - ${p.name}).toNat` : `${p.name}.natAbs`
+    } else if (changingInts.length > 1) {
+      measure = changingInts.map(p => `${p.name}.natAbs`).join(" + ")
+    } else {
+      const firstList = params.find(p => ir.isListTy(p.ty))
+      const firstInt = params.find(p => p.ty === "int")
+      if (!firstList && !firstInt) return undefined
+      measure = firstList ? `${firstList.name}.length` : `${firstInt!.name}.natAbs`
+    }
+    const def: ir.FnDef = {
+      name: defName,
+      params: info.params,
+      retTy: ret.ty,
+      ...(ret.num ? { retNum: true } : {}),
+      body: bodyExpr.e,
+      measure,
+    }
+    this.instance.defs ??= []
+    this.instance.defs.push(def)
+    this.compiledFns.set(sigKey, def)
+    return this.valueFromExpr(ir.callFn(def.name, def.retTy, convertedArgs.map(a => a.e)), def.retNum)
+  }
+
   private call(fn: Value, args: Value[], at: N): Value {
     if (fn.k === "choice") return this.branch(fn.cond, () => this.call(fn.a, args, at), () => this.call(fn.b, args, at))
     if (fn.k === "void") return this.throwsOnUndefined(at)
     if (fn.k === "null") return this.throwsOnNull(at)
     if (fn.k !== "closure") throw new Unsupported(`cannot call ${describe(fn)}`, at)
     const node = fn.node
-    if (this.stack.includes(node)) throw new Unsupported("recursive functions are not supported", at)
     if (node.asteriskToken || node.modifiers?.some((m: N) => m.kind === K.AsyncKeyword)) throw new Unsupported("async functions and generators are not supported", at)
     if (!node.body) throw new Unsupported("this function has no body to translate", at)
     const facts = this.factsOf(node)
+    if (this.compilingFns.has(node) || (facts.isRecursive && !this.stack.includes(node))) {
+      const rec = this.callRecursive(fn, args, at)
+      if (rec) return rec
+    }
+    if (this.stack.includes(node)) throw new Unsupported("recursive functions are not supported", at)
     if (facts.usesVar) throw new Unsupported("`var` is not supported; use `const` or `let`", facts.usesVar)
     this.noteExpectations(node)
     const env = fn.env.child()
@@ -1716,6 +2001,10 @@ export class Translator {
             throw new Unsupported("leaving a loop over a Map or Set iterator early is not supported", statement)
           }
           const items = this.listed(source, statement.expression)
+          if (items.k === "list") {
+            this.foldListForOf(items, declared[0].name, reassignable, body, env, statement)
+            return after()
+          }
           if (items.k !== "array") throw new Unsupported(`a loop needs an array whose length is known here, but this is ${describe(items)}`, statement.expression)
           const activeIter = source.k === "iterator" ? source.state : undefined
           const collection = source.k === "iterator" ? source.source : source.k === "map" || source.k === "set" ? source : undefined
@@ -2012,7 +2301,7 @@ export class Translator {
 
   // ----------------------------------------------------------- expressions
 
-  private scalarOf(value: Value, at: Node, ty?: Ty): Expr {
+  private scalarOf(value: Value, at: Node, ty?: ir.ScalarTy): Expr {
     if (value.k !== "scalar") throw new Unsupported(`expected ${ty ? { bool: "a boolean", int: "a bigint", str: "a string" }[ty] : "a boolean, bigint or string"} here but found ${describe(value)}`, at)
     if (ty && value.e.ty !== ty) throw new Unsupported(`expected ${{ bool: "a boolean", int: "a bigint", str: "a string" }[ty]} here but found ${describe(value)}`, at)
     return value.e
@@ -2038,6 +2327,7 @@ export class Translator {
       case "null": return ir.FALSE
       case "record":
       case "array":
+      case "list":
       case "closure":
       case "infinite":
       case "map":
@@ -2071,6 +2361,7 @@ export class Translator {
         case "null":
         case "record":
         case "array":
+        case "list":
         case "map":
         case "set":
         case "iterator": return scalar(ir.lit("object"))
@@ -2079,7 +2370,7 @@ export class Translator {
         case "rat":
         case "quot":
         case "float": return scalar(ir.lit("number"))
-        case "scalar": return scalar(ir.lit(part.num ? "number" : { bool: "boolean", int: "bigint", str: "string" }[part.e.ty]))
+        case "scalar": return scalar(ir.lit(part.num ? "number" : { bool: "boolean", int: "bigint", str: "string" }[part.e.ty as ir.ScalarTy]))
         default: throw new Unsupported(`typeof ${describe(part)} is not supported`, at)
       }
     })
@@ -2247,10 +2538,42 @@ export class Translator {
             if (val.k === "bottom") return BOTTOM
             parts.push({ spread: false, value: val })
           } else {
-            const val = this.copied(this.evalExpr(element.expression, env), element, "cannot spread", "into an array")
+            const raw = this.evalExpr(element.expression, env)
+            const val = this.settled(raw).k === "list" ? raw : this.copied(raw, element, "cannot spread", "into an array")
             if (val.k === "bottom") return BOTTOM
             parts.push({ spread: true, value: val })
           }
+        }
+        const hasSymList = (v: Value): boolean => v.k === "list" || (v.k === "choice" && (hasSymList(v.a) || hasSymList(v.b)))
+        if (parts.some(p => p.spread && hasSymList(p.value))) {
+          const buildSym = (from: number, acc: Extract<Value, { k: "list" }> | undefined, pending: Value[]): Value => {
+            if (from === parts.length) {
+              if (!acc) return this.fresh({ k: "array", items: pending })
+              if (!pending.length) return acc
+              const tail = this.asListExpr({ k: "array", items: pending }, acc.e.ty as ir.ListTy, !!acc.num)
+              if (!tail) throw new Unsupported("spreading an arbitrary-length array with elements of a different type is not supported", node)
+              return { k: "list", e: ir.listConcat(acc.e, tail.e), ...(acc.num ? { num: true } : {}) }
+            }
+            const part = parts[from]!
+            if (!part.spread) return buildSym(from + 1, acc, [...pending, part.value])
+            return this.over(part.value, spread => {
+              if (spread.k === "bottom") return BOTTOM
+              if (spread.k === "array") return buildSym(from + 1, acc, [...pending, ...spread.items])
+              if (spread.k !== "list") return BOTTOM
+              let next: Extract<Value, { k: "list" }> = spread
+              if (pending.length) {
+                const head = this.asListExpr({ k: "array", items: pending }, spread.e.ty as ir.ListTy, !!spread.num)
+                if (!head) throw new Unsupported("spreading an arbitrary-length array with elements of a different type is not supported", node)
+                next = { k: "list", e: ir.listConcat(head.e, next.e), ...(spread.num ? { num: true } : {}) }
+              }
+              if (acc) {
+                if (acc.e.ty !== next.e.ty || !!acc.num !== !!next.num) throw new Unsupported("spreading arbitrary-length arrays of different element types is not supported", node)
+                next = { k: "list", e: ir.listConcat(acc.e, next.e), ...(acc.num ? { num: true } : {}) }
+              }
+              return buildSym(from + 1, next, [])
+            })
+          }
+          return buildSym(0, undefined, [])
         }
         // Elements and lists that are one thing are joined in a row; only a list that depends on a condition forks.
         const join = (from: number, before: Value[]): Value => {
@@ -2813,6 +3136,7 @@ export class Translator {
     if (object.k === "void") return this.throwsOnUndefined(node)
     if (object.k === "null") return this.throwsOnNull(node)
     if (name === "length" && object.k === "array") return scalar(ir.lit(BigInt(object.items.length)), true)
+    if (name === "length" && object.k === "list") return scalar(ir.listLen(object.e), true)
     if (name === "length" && object.k === "scalar" && object.e.ty === "str") {
       return scalar(ir.strLen(object.e), true)
     }
@@ -2893,6 +3217,17 @@ export class Translator {
       const refusal = () => new Unsupported("an array can only be indexed by a position that is known here", node)
       if (!isNumber(keyVal) || keyVal.k !== "scalar") throw refusal()
       return this.indexArray(object.items, keyVal.e, node, false, refusal)
+    }
+    if (object.k === "list") {
+      const refusal = () => new Unsupported("an arbitrary-length array can only be indexed at position 0", node)
+      if (!isNumber(keyVal) || keyVal.k !== "scalar") throw refusal()
+      const pos = this.settle(keyVal.e, refusal).value as bigint
+      if (pos !== 0n) throw refusal()
+      const nonEmpty = ir.lt(ir.lit(0n), ir.listLen(object.e))
+      const head = scalar(ir.listHead(object.e), object.num)
+      if (this.allowsUndefined(node)) return this.merge(nonEmpty, head, this.absent(undefined, node))
+      this.emit("missing", nonEmpty, node)
+      return head
     }
     if (object.k !== "record") throw new Unsupported(`indexing ${describe(object)} is not supported`, node)
     return this.over(keyVal, k => {
@@ -3019,7 +3354,7 @@ export class Translator {
       if (host === "Array" && name === "isArray") {
         this.assertBuiltinsIntact(node)
         const [first] = args()
-        return this.over(first ?? VOID, v => (v.k === "bottom" ? BOTTOM : scalar(ir.lit(v.k === "array"))))
+        return this.over(first ?? VOID, v => (v.k === "bottom" ? BOTTOM : scalar(ir.lit(v.k === "array" || v.k === "list"))))
       }
       if (host === "Number" && (name === "isInteger" || name === "isFinite" || name === "isNaN" || name === "isSafeInteger")) {
         this.assertBuiltinsIntact(node)
@@ -3190,6 +3525,10 @@ export class Translator {
     if (receiver.k === "array") {
       this.assertBuiltinsIntact(node)
       return this.arrayMethod(receiver, method, args(), node)
+    }
+    if (receiver.k === "list") {
+      this.assertBuiltinsIntact(node)
+      return this.listMethod(receiver, method, args(), node)
     }
     if (receiver.k === "map" || receiver.k === "set") {
       this.assertBuiltinsIntact(node)
@@ -3641,6 +3980,209 @@ export class Translator {
   private isBuiltin(node: N): boolean {
     const declaration = this.checker.getSymbolAtLocation(node)?.declarations[0]?.resolve()
     return !!declaration && this.program.isSourceFileDefaultLibrary(declaration.getSourceFile())
+  }
+
+  private foldListForOf(
+    list: Extract<Value, { k: "list" }>,
+    pattern: N,
+    reassignable: boolean,
+    body: N,
+    env: Env,
+    statement: N,
+  ) {
+    if (canExit(body)) throw new Unsupported("leaving a `for...of` loop over an arbitrary-length array early is not supported", statement)
+    if (pattern.kind !== K.Identifier) throw new Unsupported("destructuring in a `for...of` loop over an arbitrary-length array is not supported", statement)
+    const bodyAssigned = new Set<string>()
+    const scanAssign = (n: N) => {
+      if (n.kind === K.ArrowFunction || n.kind === K.FunctionExpression || n.kind === K.FunctionDeclaration) return
+      if (n.kind === K.BinaryExpression && n.operatorToken.kind >= K.FirstAssignment && n.operatorToken.kind <= K.LastAssignment) collectNames(n.left, bodyAssigned)
+      if ((n.kind === K.PrefixUnaryExpression || n.kind === K.PostfixUnaryExpression) && (n.operator === K.PlusPlusToken || n.operator === K.MinusMinusToken)) collectNames(n.operand, bodyAssigned)
+      n.forEachChild(scanAssign)
+    }
+    scanAssign(body)
+    const outerCells = [...new Set([...bodyAssigned].map(n => env.cell(n)).filter((c): c is Cell => !!c && this.cells.includes(c)))]
+    if (outerCells.length > 1) throw new Unsupported("a `for...of` loop over an arbitrary-length array may update at most one outer variable", statement)
+    const elemTy = ir.elemTyOf(list.e.ty as ir.ListTy)
+    const elName = `_el${this.lambdaCounter++}`
+    const accCell = outerCells[0]
+    const initIr = accCell ? this.irArgOf(accCell.value) : undefined
+    if (accCell && !initIr) throw new Unsupported("a `for...of` loop over an arbitrary-length array requires a boolean, bigint, number, string or array accumulator", statement)
+    const accName = accCell ? `_acc${this.lambdaCounter++}` : undefined
+    const savedVal = accCell?.value
+    const objects = objectsCreated
+    const existingCells = new Set(this.cells)
+    const outerAssigned = this.assignedTo
+    const outerWritten = this.writtenTo
+    const assigned = this.assignedTo = new Set()
+    const written = this.writtenTo = new Set()
+    const startObs = this.instance?.obligations.length ?? 0
+    const savedPc = this.pc
+    this.pc = []
+    if (accCell && initIr && accName) accCell.value = this.valueFromExpr(ir.variable(accName, initIr.ty), initIr.num)
+    try {
+      const scope = env.child()
+      scope.set(pattern.text, scalar(ir.variable(elName, elemTy), list.num), reassignable)
+      this.block(body.kind === K.Block ? body.statements : [body], scope.child(), { next: () => VOID })
+    } catch (error) {
+      if (accCell && savedVal) accCell.value = savedVal
+      throw error
+    } finally {
+      this.pc = savedPc
+      this.assignedTo = outerAssigned
+      this.writtenTo = outerWritten
+      if (outerWritten) for (const t of written) outerWritten.add(t)
+    }
+    for (const target of written) {
+      if (target.own && target.own.born < objects) {
+        if (accCell && savedVal) accCell.value = savedVal
+        throw new Unsupported("a `for...of` loop over an arbitrary-length array cannot mutate an outer object", statement)
+      }
+    }
+    for (const cell of assigned) {
+      if (cell !== accCell && existingCells.has(cell)) {
+        if (accCell && savedVal) accCell.value = savedVal
+        throw new Unsupported("a `for...of` loop over an arbitrary-length array may update at most one outer variable", statement)
+      }
+    }
+    if (accCell && outerAssigned) outerAssigned.add(accCell)
+    const addedObs = this.instance ? this.instance.obligations.splice(startObs) : []
+    for (const o of addedObs) {
+      if (accName && (ir.freeVariables(o.guard).has(accName) || ir.freeVariables(o.claim).has(accName))) {
+        if (accCell && savedVal) accCell.value = savedVal
+        throw new Unsupported("a `for...of` loop over an arbitrary-length array whose body can throw or overflow depending on the accumulator is not supported", statement)
+      }
+      const perElem = ir.or(ir.not(o.guard), o.claim)
+      const allClaim = ir.listAll(list.e, elName, perElem)
+      if (this.instance) {
+        const guard = ir.all(this.pc)
+        if (!(guard.t === "lit" && guard.value === false) && !(o.kind !== "expect" && allClaim.t === "lit" && allClaim.value === true)) {
+          this.instance.obligations.push({ ...o, guard, claim: allClaim })
+        }
+      }
+    }
+    if (accCell && initIr && accName) {
+      const stepIr = this.irArgOf(accCell.value, initIr.ty, !!initIr.num)
+      if (!stepIr) {
+        accCell.value = savedVal!
+        throw new Unsupported("the accumulator of a `for...of` loop over an arbitrary-length array must keep the same type", statement)
+      }
+      accCell.value = this.valueFromExpr(ir.listFold(list.e, initIr.e, accName, elName, stepIr.e), initIr.num)
+    }
+  }
+
+  private listMethod(list: Extract<Value, { k: "list" }>, method: string, args: Value[], node: N): Value {
+    const elemTy = ir.elemTyOf(list.e.ty as ir.ListTy)
+    if (method === "toReversed") {
+      if (args.length !== 0) throw new Unsupported("`.toReversed` takes no arguments", node)
+      return { k: "list", e: ir.listReverse(list.e), ...(list.num ? { num: true } : {}) }
+    }
+    if (method === "includes") {
+      if (args.length !== 1) throw new Unsupported("`.includes` on an arbitrary-length array takes one argument", node)
+      return this.over(args[0]!, needle => {
+        if (needle.k === "bottom") return BOTTOM
+        if (needle.k === "scalar" && needle.e.ty === elemTy && !!needle.num === !!list.num) {
+          return scalar(ir.listElem(list.e, needle.e))
+        }
+        if (this.isPlain(needle)) return scalar(ir.FALSE)
+        throw new Unsupported(`\`.includes\` on an arbitrary-length array is not supported with ${describe(needle)}`, node)
+      })
+    }
+    if (method === "concat") {
+      const join = (index: number, acc: Expr): Value => {
+        if (index === args.length) return { k: "list", e: acc, ...(list.num ? { num: true } : {}) }
+        return this.over(args[index]!, arg => {
+          if (arg.k === "bottom") return BOTTOM
+          const asList = this.asListExpr(arg, list.e.ty as ir.ListTy, !!list.num)
+          if (asList) return join(index + 1, ir.listConcat(acc, asList.e))
+          if (arg.k === "scalar" && arg.e.ty === elemTy && !!arg.num === !!list.num) {
+            return join(index + 1, ir.listConcat(acc, ir.listLit(list.e.ty as ir.ListTy, [arg.e])))
+          }
+          throw new Unsupported(`\`.concat\` on an arbitrary-length array cannot append ${describe(arg)}`, node)
+        })
+      }
+      return join(0, list.e)
+    }
+    if (method === "slice") {
+      if (args.length > 2) throw new Unsupported("`.slice` takes at most two arguments", node)
+      const [startArg, endArg] = args
+      if (endArg && endArg.k !== "void") throw new Unsupported("`.slice` with an end index on an arbitrary-length array is not supported", node)
+      if (!startArg || startArg.k === "void") return list
+      const refusal = () => new Unsupported("`.slice` on an arbitrary-length array requires a known non-negative start index (up to 8)", node)
+      const s = this.settled(startArg)
+      if (!isNumber(s) || s.k !== "scalar") throw refusal()
+      const start = Number(this.settle(s.e, refusal).value)
+      if (start < 0 || start > 8) throw refusal()
+      let cur = list.e
+      for (let i = 0; i < start; i++) cur = ir.listTail(cur)
+      return { k: "list", e: cur, ...(list.num ? { num: true } : {}) }
+    }
+    if (method === "at") {
+      if (args.length !== 1) throw new Unsupported("`.at` takes one argument", node)
+      const refusal = () => new Unsupported("`.at` on an arbitrary-length array is only supported at index 0", node)
+      const s = this.settled(args[0]!)
+      if (!isNumber(s) || s.k !== "scalar") throw refusal()
+      const pos = this.settle(s.e, refusal).value as bigint
+      if (pos !== 0n) throw refusal()
+      return this.merge(ir.lt(ir.lit(0n), ir.listLen(list.e)), scalar(ir.listHead(list.e), list.num), VOID)
+    }
+    if (method === "map" || method === "filter" || method === "some" || method === "every" || method === "reduce") {
+      const isReduce = method === "reduce"
+      if (isReduce ? args.length !== 2 : args.length !== 1) {
+        throw new Unsupported(isReduce ? "`.reduce` on an arbitrary-length array requires a callback and an initial value" : `\`.${method}\` takes one callback`, node)
+      }
+      const cb = this.settled(args[0]!)
+      if (cb.k !== "closure") throw new Unsupported(`\`.${method}\` needs a function, but this is ${describe(cb)}`, node)
+      const params = parametersOf(cb.node)
+      const maxParams = isReduce ? 2 : 1
+      if (params.length > maxParams || params.some(p => p.dotDotDotToken)) {
+        throw new Unsupported(`a callback of \`.${method}\` on an arbitrary-length array cannot use the index, array or rest parameters`, node)
+      }
+      const elName = `_el${this.lambdaCounter++}`
+      const elVal = scalar(ir.variable(elName, elemTy), list.num)
+      const initIr = isReduce ? this.irArgOf(args[1]!) : undefined
+      if (isReduce && !initIr) throw new Unsupported("`.reduce` on an arbitrary-length array requires a boolean, bigint, number, string or array initial value", node)
+      const accName = isReduce ? `_acc${this.lambdaCounter++}` : undefined
+      const cbArgs = isReduce ? [this.valueFromExpr(ir.variable(accName!, initIr!.ty), initIr!.num), elVal] : [elVal]
+      const startObs = this.instance?.obligations.length ?? 0
+      const savedPc = this.pc
+      this.pc = []
+      let result: Value
+      try {
+        result = this.unchanging(`a callback of \`.${method}\``, node, () => this.call(cb, cbArgs, node))
+      } finally {
+        this.pc = savedPc
+      }
+      if (result.k === "bottom") {
+        this.refuseFallOff(startObs, node)
+        throw new Unsupported(`a callback of \`.${method}\` on an arbitrary-length array that always throws is not supported`, node)
+      }
+      const addedObs = this.instance ? this.instance.obligations.splice(startObs) : []
+      for (const o of addedObs) {
+        if (o.kind === "expect") throw new Unsupported(`calling \`expect()\` inside \`.${method}\` on an arbitrary-length array is not supported`, node)
+        if (accName && (ir.freeVariables(o.guard).has(accName) || ir.freeVariables(o.claim).has(accName))) {
+          throw new Unsupported(`a callback of \`.${method}\` on an arbitrary-length array that can throw or overflow depending on the accumulator is not supported`, node)
+        }
+        const allClaim = ir.listAll(list.e, elName, ir.or(ir.not(o.guard), o.claim))
+        if (this.instance) {
+          const guard = ir.all(this.pc)
+          if (!(guard.t === "lit" && guard.value === false) && !(allClaim.t === "lit" && allClaim.value === true)) {
+            this.instance.obligations.push({ ...o, guard, claim: allClaim })
+          }
+        }
+      }
+      if (method === "map") {
+        const res = this.settled(result)
+        if (res.k !== "scalar") throw new Unsupported("`.map` on an arbitrary-length array must return a boolean, bigint, number or string", node)
+        return { k: "list", e: ir.listMap(list.e, elName, res.e, ir.listTyOf(res.e.ty as ir.ScalarTy)), ...(res.num ? { num: true } : {}) }
+      }
+      if (method === "filter") return { k: "list", e: ir.listFilter(list.e, elName, this.truthy(result, node)), ...(list.num ? { num: true } : {}) }
+      if (method === "some") return scalar(ir.listAny(list.e, elName, this.truthy(result, node)))
+      if (method === "every") return scalar(ir.listAll(list.e, elName, this.truthy(result, node)))
+      const stepIr = this.irArgOf(result, initIr!.ty, !!initIr!.num)
+      if (!stepIr) throw new Unsupported("`.reduce` on an arbitrary-length array must return the same type as its initial value", node)
+      return this.valueFromExpr(ir.listFold(list.e, initIr!.e, accName!, elName, stepIr.e), initIr!.num)
+    }
+    throw new Unsupported(`the array method \`.${method}\` is not supported on an array of unknown length`, node)
   }
 
   private arrayMethod(array: Extract<Value, { k: "array" }>, method: string, args: Value[], node: N): Value {
@@ -4691,7 +5233,7 @@ export class Translator {
 
 /** Whether a value is an object of some kind, which is never equal to undefined and always counts as true. */
 function isObject(value: Value): boolean {
-  return value.k === "record" || value.k === "array" || value.k === "closure" || value.k === "map" || value.k === "set" || value.k === "iterator"
+  return value.k === "record" || value.k === "array" || value.k === "list" || value.k === "closure" || value.k === "map" || value.k === "set" || value.k === "iterator"
 }
 
 /**
