@@ -29,7 +29,7 @@ export interface Binder {
   range?: [bigint, bigint]
 }
 
-export type ObligationKind = "expect" | "unreachable" | "falloff" | "missing" | "inherited" | "undefined" | "null" | "nothrow" | "overflow" | "nan" | "round"
+export type ObligationKind = "expect" | "unreachable" | "falloff" | "missing" | "inherited" | "undefined" | "null" | "tdz" | "nothrow" | "overflow" | "nan" | "round"
 
 export interface Obligation {
   kind: ObligationKind

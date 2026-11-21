@@ -142,7 +142,9 @@ describe("imperative code", () => {
 
   test("what cannot be modeled exactly is refused by name", () => {
     const note = (name: string) => law(report, name).notes[0] ?? ""
-    assert.match(note("SAMPLED: a closure that outlives the variable it assigns"), /uses `count`, a variable that is reassigned, after the function that declared it has returned/)
+    assert.equal(law(report, "a closure that outlives the variable it assigns is proved").status, "proved")
+    assert.equal(law(report, "a closure reading a later-declared const succeeds when the early call is unreachable").status, "proved")
+    assert.equal(law(report, "FALSE: a reachable call before declaration throws").findings[0]?.kind, "throws")
     assert.match(note("SAMPLED: assignment used as a value"), /assignment used as a value/)
     assert.match(note("counted loops > SAMPLED: a loop bounded by a large input cannot be unrolled"), /how many times this loop runs depends on a value that is not known here/)
   })
@@ -632,10 +634,10 @@ describe("everyday idioms: undefined, defaults, rounding, lists, Maps and runnin
     const note = (name: string) => law(report, name).notes[0] ?? ""
     const finding = (name: string) => law(report, name).findings[0]
     assert.match(note("callbacks with a running total > SAMPLED: a callback of .some that updates a variable"), /a callback of `\.some` assigns to a variable outside it/)
-    assert.match(note("callbacks with a running total > SAMPLED: a closure that outlives the variable it updates"), /after the function that declared it has returned/)
+    assert.equal(law(report, "callbacks with a running total > a closure that outlives the variable it updates").status, "proved")
     assert.match(note("callbacks with a running total > SAMPLED: an update on the right side of &&"), /the right side of `&&` assigns to a variable outside it/)
     assert.match(note("lists > SAMPLED: sorting by keys that are not known"), /sorting is supported where the order of the elements is known here/)
-    assert.match(note("Map and Set > SAMPLED: a callback that uses the variable of a for loop around it"), /uses `i`, the variable of a `for` loop around it/)
+    assert.equal(law(report, "Map and Set > a callback that uses the variable of a for loop around it").status, "proved")
     assert.equal(finding("values that may be undefined > FALSE: there is always a second node")?.kind, "throws")
     assert.match(finding("values that may be undefined > FALSE: what follows a ?. never throws")?.message ?? "", /reads a property of undefined/)
     assert.deepEqual(finding("rounding > FALSE: a half rounds away from zero")?.inputs, { n: "-1" })
