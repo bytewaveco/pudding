@@ -203,7 +203,10 @@ async function execute(job: Job, report: (outcome: FileOutcome) => void) {
           result.exhaustive &&= space.exhaustive
           space.each(env => {
             const expected = law.unproved ? true : modelHolds(compiled, env)
-            if (expected === "outside") return false
+            if (expected === "outside") {
+              result.exhaustive = false
+              return false
+            }
             if (expected === false) result.modelFails ??= showInputs(instance.binders, env)
             result.executed++
             const actual = runtimeHolds(callback, buildArg ? buildArg(env) : undefined)

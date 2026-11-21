@@ -128,4 +128,9 @@ describe("fractions", () => {
   law("SAMPLED: non-dyadic decimal arithmetic on a large range is refused", domain<Integer<0, 10000>>(), cents => {
     expect(withSmallTax(cents)).toBeGreaterThanOrEqual(cents)
   })
+
+  law("CHECKED: Map.has with a dyadic fraction key is refused instead of falsely returning false", domain<Integer<0, 10>>(), n => {
+    const m = new Map<number, string>([[1, "one"]])
+    expect(m.has(n / 2)).toEqual(n === 2)
+  })
 })

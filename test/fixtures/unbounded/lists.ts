@@ -34,3 +34,36 @@ export function nonTerminating(n: bigint): bigint {
   if (n === 0n) return 0n
   return 1n + nonTerminating(n - 1n)
 }
+
+export function divergesOnPos(n: bigint): bigint {
+  if (n <= 0n) return 0n
+  return divergesOnPos(n + 1n)
+}
+
+export function calleeB(n: bigint): bigint {
+  if (n <= 0n) return 0n
+  return 1n + calleeB(n - 1n)
+}
+
+export function callerA(n: bigint): bigint {
+  if (n <= 0n) return calleeB(0n)
+  return calleeB(n) + callerA(n - 1n)
+}
+
+export function makeRecAdder(k: bigint): (n: bigint) => bigint {
+  return function rec(n: bigint): bigint {
+    if (n <= 0n) return k
+    return rec(n - 1n) + 1n
+  }
+}
+
+export function shadowSelf(n: number): number {
+  const shadowSelf = (x: number) => x + 1
+  return shadowSelf(n)
+}
+
+export function throwingRec(n: bigint): bigint {
+  if (n < 0n) throw new Error("neg")
+  if (n === 0n) return 0n
+  return 1n + throwingRec(n - 1n)
+}

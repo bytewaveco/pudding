@@ -821,7 +821,10 @@ export function compile(root: Expr, fnDefs?: ReadonlyMap<string, FnDef>): (env: 
       case "not": code = `(!${a[0]})`; break
       case "and": code = `(${a[0]}&&${a[1]})`; break
       case "or": code = `(${a[0]}||${a[1]})`; break
-      case "eq": code = `(${a[0]}===${a[1]})`; break
+      case "eq":
+        if (isListTy(e.args[0]!.ty) || isListTy(e.args[1]!.ty)) return env => evaluate(root, env, fnDefs)
+        code = `(${a[0]}===${a[1]})`
+        break
       case "lt": code = `(${a[0]}<${a[1]})`; break
       case "le": code = `(${a[0]}<=${a[1]})`; break
       case "add": code = `(${a[0]} + ${a[1]})`; break
