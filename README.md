@@ -34,7 +34,7 @@ Its unit test passes, because 25 is not a multiple of 10.
 
 ```ts
 // pages.test.ts
-test("25 items at 10 a page take 3 pages", () => {
+test('25 items at 10 a page take 3 pages', () => {
   expect(pageCount(25, 10)).toBe(3)
 })
 ```
@@ -43,17 +43,18 @@ A law says what must hold for any number of items at any page size.
 
 ```ts
 // pages.law.ts
-import { domain, expect, law, type Integer } from "@bytewaveco/pudding"
-import { pageCount } from "./pages"
+import { domain, expect, law, type Integer } from '@bytewaveco/pudding'
+
+import { pageCount } from './pages'
 
 type Items = Integer<1, 1_000_000>
 type PerPage = Integer<1, 100>
 
-law("every item is on a page", domain<[Items, PerPage]>(), ([items, perPage]) => {
+law('every item is on a page', domain<[Items, PerPage]>(), ([items, perPage]) => {
   expect(pageCount(items, perPage) * perPage >= items).toBe(true)
 })
 
-law("the last page is never empty", domain<[Items, PerPage]>(), ([items, perPage]) => {
+law('the last page is never empty', domain<[Items, PerPage]>(), ([items, perPage]) => {
   expect((pageCount(items, perPage) - 1) * perPage < items).toBe(true)
 })
 ```
@@ -81,9 +82,9 @@ npm install --save-dev @bytewaveco/pudding@beta typescript
 Add the Vitest plugin so law files are collected automatically and proved in a single run:
 
 ```ts
+import { pudding } from '@bytewaveco/pudding/vitest'
 // vitest.config.ts
-import { defineConfig } from "vitest/config"
-import { pudding } from "@bytewaveco/pudding/vitest"
+import { defineConfig } from 'vitest/config'
 
 export default defineConfig({
   plugins: [pudding()],
@@ -181,8 +182,8 @@ With the `pudding()` plugin from `@bytewaveco/pudding/vitest`, Pudding runs
 once in Vitest's global setup for all law files, hands each worker its file's
 results, and re-runs only affected law files in watch mode. Without the plugin,
 each file runs Pudding on its own when its first law starts, which costs a few
-hundred milliseconds more per file. Laws that fall back to *checked* or
-*sampled* are annotated and emit a warning so they show up in Vitest's default
+hundred milliseconds more per file. Laws that fall back to _checked_ or
+_sampled_ are annotated and emit a warning so they show up in Vitest's default
 reporter too. Vitest is an optional peer dependency, version 3 or newer.
 
 ## Checked by Lean 4
@@ -192,7 +193,7 @@ into a theorem and gives it to Lean, a proof assistant whose kernel checks
 every proof. This law
 
 ```ts
-law("abs is never negative", domain<bigint>(), x => {
+law('abs is never negative', domain<bigint>(), (x) => {
   expect(abs(x) >= 0n).toBe(true)
 })
 ```
@@ -221,9 +222,14 @@ standard axioms, so an unfinished proof (`sorry`) is rejected.
 When `grind` is not enough, pass a Lean tactic script:
 
 ```ts
-law("a product of positives is positive", domain<[bigint, bigint]>(), ([a, b]) => {
-  if (a > 0n && b > 0n) expect(a * b > 0n).toBe(true)
-}, { proof: "intro h; simp_all; exact Int.mul_pos h.1 h.2" })
+law(
+  'a product of positives is positive',
+  domain<[bigint, bigint]>(),
+  ([a, b]) => {
+    if (a > 0n && b > 0n) expect(a * b > 0n).toBe(true)
+  },
+  { proof: 'intro h; simp_all; exact Int.mul_pos h.1 h.2' },
+)
 ```
 
 You or an agent can work on a proof with ordinary Lean tooling, starting from
@@ -245,16 +251,16 @@ describe(name, () => { ... })               // also describe.skip, describe.only
 
 `domain<T>()` describes the inputs by type.
 
-| Type | Inputs covered |
-|---|---|
-| `boolean`, a union of string, bigint or number literals | every member |
-| `bigint`, `string` | every value |
-| `Integer` | every whole number a `number` holds exactly |
-| `Integer<Min, Max>` | every whole number from `Min` to `Max` |
-| an object type | every plain object with exactly its properties, in every combination of their values |
-| a tuple | every combination of its elements |
-| a union of types (objects, mixed scalars, `null`, `undefined`) | every alternative |
-| an optional property | the property with every value, and the object without it |
+| Type                                                           | Inputs covered                                                                       |
+| -------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| `boolean`, a union of string, bigint or number literals        | every member                                                                         |
+| `bigint`, `string`                                             | every value                                                                          |
+| `Integer`                                                      | every whole number a `number` holds exactly                                          |
+| `Integer<Min, Max>`                                            | every whole number from `Min` to `Max`                                               |
+| an object type                                                 | every plain object with exactly its properties, in every combination of their values |
+| a tuple                                                        | every combination of its elements                                                    |
+| a union of types (objects, mixed scalars, `null`, `undefined`) | every alternative                                                                    |
+| an optional property                                           | the property with every value, and the object without it                             |
 
 A plain `number` cannot be an input, because it also covers fractions, NaN and
 infinities. Functions that take a `number` accept an `Integer`. An object type
@@ -297,7 +303,7 @@ queues and leave requests.
 
 A refused law is not lost. Pudding executes it against the real code, on every
 input of a finite domain or a sample of an unbounded one, and reports it as
-*checked* or *sampled*, never as proved. It is promoted to *proved* when the
+_checked_ or _sampled_, never as proved. It is promoted to _proved_ when the
 subset grows. [The supported subset](docs/supported-subset.md) lists every
 construct, with the limits worth knowing.
 
@@ -321,13 +327,13 @@ $ npx pudding --reporter verbose
   Time    353 ms (ts 48 ms, prove 266 ms, cross-check 33 ms)
 ```
 
-| State | Meaning |
-|---|---|
-| **proved** | Lean accepted a proof for every input. |
-| **checked** | The code is outside the supported subset, so the law was executed against the real code for every input of a finite domain. |
-| **sampled** | As above, but the domain is unbounded, so the law was executed on a sample. |
-| **failed** | The law is false, proves nothing, or could not be verified at all. |
-| **skipped**, **todo** | Marked that way, or filtered out. |
+| State                 | Meaning                                                                                                                     |
+| --------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| **proved**            | Lean accepted a proof for every input.                                                                                      |
+| **checked**           | The code is outside the supported subset, so the law was executed against the real code for every input of a finite domain. |
+| **sampled**           | As above, but the domain is unbounded, so the law was executed on a sample.                                                 |
+| **failed**            | The law is false, proves nothing, or could not be verified at all.                                                          |
+| **skipped**, **todo** | Marked that way, or filtered out.                                                                                           |
 
 A failed law says why:
 
@@ -340,7 +346,7 @@ A failed law says why:
 - **No proof and no counterexample.** The law may be true but beyond the automation. [Supply a proof](#supplying-a-proof).
 - **A disagreement between the model and the running code.** See [What a proof means](#what-a-proof-means).
 
-`--strict` turns *checked* and *sampled* into failures, for CI on modules where
+`--strict` turns _checked_ and _sampled_ into failures, for CI on modules where
 only a proof will do.
 
 ## Command line and configuration
@@ -351,16 +357,16 @@ pudding watch [filters...]  check again whenever a file changes
 pudding install-lean        download the Lean runtime
 ```
 
-| Option | Effect |
-|---|---|
+| Option                 | Effect                                                   |
+| ---------------------- | -------------------------------------------------------- |
 | `-t, --name <pattern>` | only laws whose full name matches the regular expression |
-| `-w, --watch` | same as the `watch` command |
-| `--strict` | fail when a law was only executed, not proved |
-| `--reporter <name>` | `default`, `verbose`, `json` or `github` |
-| `--no-cache` | ignore results from earlier runs |
-| `--no-cross-check` | do not execute laws against the real code |
-| `--emit <file>` | also write the generated Lean source |
-| `--cwd <dir>` | project directory |
+| `-w, --watch`          | same as the `watch` command                              |
+| `--strict`             | fail when a law was only executed, not proved            |
+| `--reporter <name>`    | `default`, `verbose`, `json` or `github`                 |
+| `--no-cache`           | ignore results from earlier runs                         |
+| `--no-cross-check`     | do not execute laws against the real code                |
+| `--emit <file>`        | also write the generated Lean source                     |
+| `--cwd <dir>`          | project directory                                        |
 
 The `github` reporter is chosen automatically inside GitHub Actions and
 annotates the lines that failed. The same run is available from code as
@@ -369,15 +375,15 @@ annotates the lines that failed. The same run is available from code as
 A `pudding.config.ts` is optional, and applies under Vitest too.
 
 ```ts
-import { defineConfig } from "@bytewaveco/pudding"
+import { defineConfig } from '@bytewaveco/pudding'
 
 export default defineConfig({
-  include: ["src/**/*.law.ts"],        // default: **/*.law.ts
-  exclude: ["src/legacy/**"],
-  tsconfig: ".nuxt/tsconfig.app.json", // whose paths and options to read the laws with
-  strict: false,                       // fail laws that were only executed
-  crossCheck: true,                    // execute laws against the real code
-  reporter: "default",
+  include: ['src/**/*.law.ts'], // default: **/*.law.ts
+  exclude: ['src/legacy/**'],
+  tsconfig: '.nuxt/tsconfig.app.json', // whose paths and options to read the laws with
+  strict: false, // fail laws that were only executed
+  crossCheck: true, // execute laws against the real code
+  reporter: 'default',
 })
 ```
 
@@ -411,7 +417,7 @@ without it.
 
 ## What a proof means
 
-A *proved* law is a theorem about a model of your code. These are the main
+A _proved_ law is a theorem about a model of your code. These are the main
 things that stand between that theorem and the code that runs.
 
 - The translator is trusted, so every law is also executed against the real

@@ -1,24 +1,56 @@
-// Orchestrates a run: read the laws with the TypeScript compiler, prove the
-// resulting obligations in Lean, explain what failed, and compare the proved
-// model with the real code.
+import { execFileSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
+import {
+  appendFileSync,
+  existsSync,
+  globSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs'
+import { createRequire } from 'node:module'
+import { homedir } from 'node:os'
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
+import { threadId, Worker } from 'node:worker_threads'
 
-import { execFileSync } from "node:child_process"
-import { createHash } from "node:crypto"
-import { createRequire } from "node:module"
-import { appendFileSync, existsSync, globSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs"
-import { homedir } from "node:os"
-import { dirname, isAbsolute, join, relative, resolve } from "node:path"
-import { fileURLToPath, pathToFileURL } from "node:url"
-import { threadId, Worker } from "node:worker_threads"
-import { API, compiler, compilerProblem, DiagnosticCategory, ensureCompiler, SymbolFlags, SyntaxKind as K, type Checker, type Program } from "./compiler.ts"
-import type { Config } from "./index.ts"
-import { cacheDirectory, toolchainName } from "./install.ts"
-import * as ir from "./ir.ts"
-import type { Obligation } from "./ir.ts"
-import type { FileOutcome, Job, RuntimeMap } from "./crosscheck.ts"
-import { findInput, showInputs, showValue } from "./search.ts"
-import { checksFor, describeNonLinearOps, FALLBACK_HEADER, FAST_HEADER, FULL_HEADER, proofKind, prove, render, scriptProblem, TooLarge, withFallback, withNonLinear, type Check } from "./lean.ts"
-import { Translator, type Law, type LawInstance } from "./translate.ts"
+import {
+  API,
+  compiler,
+  compilerProblem,
+  DiagnosticCategory,
+  ensureCompiler,
+  SymbolFlags,
+  SyntaxKind as K,
+  type Checker,
+  type Program,
+} from './compiler.ts'
+import { cacheDirectory, toolchainName } from './install.ts'
+import * as ir from './ir.ts'
+import {
+  checksFor,
+  describeNonLinearOps,
+  FALLBACK_HEADER,
+  FAST_HEADER,
+  FULL_HEADER,
+  proofKind,
+  prove,
+  render,
+  scriptProblem,
+  TooLarge,
+  withFallback,
+  withNonLinear,
+  type Check,
+} from './lean.ts'
+import { findInput, showInputs, showValue } from './search.ts'
+import { Translator, type Law, type LawInstance } from './translate.ts'
+
+import type { FileOutcome, Job, RuntimeMap } from './crosscheck.ts'
+import type { Config } from './index.ts'
+import type { Obligation } from './ir.ts'
 
 export const MINIMUM_LEAN = [4, 36, 0] as const
 const CACHE_VERSION = 3
@@ -26,11 +58,8 @@ const PROVED_RUNTIME_BUDGET = 1_000
 const FALLBACK_RUNTIME_BUDGET = 4_000
 const RUNTIME_TIMEOUT_MS = 30_000
 
-/** Dependency-tracking and compiler session for watch mode so edits incrementally re-check affected law files. */
 export interface WatchSession {
-  /** Clear tracked dependency state and close any open compiler instance. */
   close(): void
-  /** Law files affected by a change to `changedFile`, or `undefined` when a full run is needed. */
   affected(changedFile: string): string[] | undefined
 }
 
@@ -55,9 +84,11 @@ export function createWatchSession(): WatchSession {
       if (!state.dependencies.size) return undefined
       const target = resolve(changedFile)
       const hit: string[] = []
+
       for (const [lawFile, reached] of state.dependencies) {
         if (lawFile === target || reached.has(target)) hit.push(lawFile)
       }
+
       return hit
     },
   }
@@ -65,88 +96,123 @@ export function createWatchSession(): WatchSession {
   return session
 }
 
-/** Collect every project file transitively imported or re-exported by `entry`, including type-only imports and `.d.ts` files. */
 function collectDependencies(program: Program, checker: Checker, entry: string): Set<string> {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   type N = any
   const visited = new Set<string>([resolve(entry)])
   const queue = [entry]
+
   while (queue.length) {
     const current = queue.pop()!
     const source = program.getSourceFile(current)
     if (!source) continue
+
     const addFile = (fileName: string) => {
       const full = resolve(fileName)
       if (visited.has(full)) return
       const target = program.getSourceFile(fileName) ?? program.getSourceFile(full)
-      if (target && (program.isSourceFileFromExternalLibrary(target) || program.isSourceFileDefaultLibrary(target))) return
+
+      if (
+        target &&
+        (program.isSourceFileFromExternalLibrary(target) ||
+          program.isSourceFileDefaultLibrary(target))
+      )
+        return
+
       visited.add(full)
       queue.push(target ? target.fileName : full)
     }
+
     const addSpecifier = (specifier: N) => {
       if (!specifier || specifier.kind !== K.StringLiteral) return
       const symbol = checker.getSymbolAtLocation(specifier)
-      const target = (symbol?.valueDeclaration ?? symbol?.declarations[0])?.resolve()?.getSourceFile()
-      if (!target || program.isSourceFileFromExternalLibrary(target) || program.isSourceFileDefaultLibrary(target)) return
+      const target = (symbol?.valueDeclaration ?? symbol?.declarations[0])
+        ?.resolve()
+        ?.getSourceFile()
+
+      if (
+        !target ||
+        program.isSourceFileFromExternalLibrary(target) ||
+        program.isSourceFileDefaultLibrary(target)
+      )
+        return
+
       addFile(target.fileName)
     }
+
     const visit = (node: N) => {
-      if ((node.kind === K.ImportDeclaration || node.kind === K.ExportDeclaration) && node.moduleSpecifier) {
+      if (
+        (node.kind === K.ImportDeclaration || node.kind === K.ExportDeclaration) &&
+        node.moduleSpecifier
+      ) {
         addSpecifier(node.moduleSpecifier)
-      } else if (K.ImportType !== undefined && node.kind === K.ImportType && node.argument?.kind === K.LiteralType && node.argument.literal?.kind === K.StringLiteral) {
+      } else if (
+        K.ImportType !== undefined &&
+        node.kind === K.ImportType &&
+        node.argument?.kind === K.LiteralType &&
+        node.argument.literal?.kind === K.StringLiteral
+      ) {
         addSpecifier(node.argument.literal)
-      } else if (K.ImportEqualsDeclaration !== undefined && node.kind === K.ImportEqualsDeclaration && node.moduleReference?.kind === K.ExternalModuleReference) {
+      } else if (
+        K.ImportEqualsDeclaration !== undefined &&
+        node.kind === K.ImportEqualsDeclaration &&
+        node.moduleReference?.kind === K.ExternalModuleReference
+      ) {
         addSpecifier(node.moduleReference.expression)
       }
+
       node.forEachChild(visit)
     }
+
     visit(source)
-    // Also track triple-slash `/// <reference path="..." />` directives (e.g. local `.d.ts` files).
-    const referenced = (source as { referencedFiles?: readonly { fileName: string }[] }).referencedFiles
+    const referenced = (source as { referencedFiles?: readonly { fileName: string }[] })
+      .referencedFiles
+
     if (referenced) {
       for (const ref of referenced) {
         const target = resolve(dirname(current), ref.fileName)
         if (existsSync(target) || program.getSourceFile(target)) addFile(target)
       }
     }
-    for (const match of source.text.matchAll(/^[ \t]*\/\/\/[ \t]*<reference[ \t]+path[ \t]*=[ \t]*["']([^"']+)["']/gm)) {
+
+    for (const match of source.text.matchAll(
+      /^[ \t]*\/\/\/[ \t]*<reference[ \t]+path[ \t]*=[ \t]*["']([^"']+)["']/gm,
+    )) {
       const target = resolve(dirname(current), match[1]!)
       if (existsSync(target) || program.getSourceFile(target)) addFile(target)
     }
   }
+
   return visited
 }
 
 export interface RunOptions extends Config {
-  /** Project directory. Default: the current directory. */
   cwd?: string
-  /** Only check law files whose path contains one of these. */
   files?: string[]
-  /** Check exactly these files, whatever the configuration includes. */
   lawFiles?: string[]
-  /** Only check laws whose full name matches this regular expression. */
   name?: string
-  /** Write the generated Lean source to this file. */
   emit?: string
-  /** Optional watch session that tracks file dependencies and reuses the compiler across edits. */
   session?: WatchSession
-  /** Files known to have changed on disk since the last run in `session`, enabling incremental snapshot updates. */
   changedFiles?: string[]
 }
 
-export type Status = "proved" | "checked" | "sampled" | "failed" | "skipped" | "todo"
+export type Status = 'proved' | 'checked' | 'sampled' | 'failed' | 'skipped' | 'todo'
 
 export interface Finding {
-  kind: "counterexample" | "unproved" | "vacuous" | "throws" | "inexact" | "mismatch" | "unsupported" | "invalid"
+  kind:
+    | 'counterexample'
+    | 'unproved'
+    | 'vacuous'
+    | 'throws'
+    | 'inexact'
+    | 'mismatch'
+    | 'unsupported'
+    | 'invalid'
   message: string
   file: string
   line: number
   column: number
-  /** Source text of the statement concerned. */
   text?: string
-  /** The inputs that show the problem, by the name they have in the law. */
   inputs?: Record<string, string>
-  /** Extra lines, such as the two sides of a failed equality or Lean's output. */
   detail?: string
 }
 
@@ -165,132 +231,138 @@ export interface LawReport {
 export interface Report {
   ok: boolean
   laws: LawReport[]
-  /** Problems that prevented checking, such as TypeScript errors. */
   errors: string[]
-  /** Things that weakened the run without failing it, such as a law file that could not be executed. */
   warnings: string[]
   counts: Record<Status, number>
   obligations: number
   cachedObligations: number
   cases: number
   durationMs: number
-  /** Theorems the default automation could not close under the fast header. */
   retried: number
-  /** Milliseconds spent in each phase. */
   timings: { typescript: number; prove: number; retry: number; crossCheck: number }
-  /** The reporter the project's configuration asks for, if any. */
-  reporter?: Config["reporter"]
+  reporter?: Config['reporter']
   lean: string
-  /** The compiler that read the project, such as `TypeScript 7.0.2`. */
   compiler: string
 }
 
-/**
- * What a project remembers between runs: which Lean binary is which version.
- * The theorems Lean has accepted are remembered for the whole machine, in
- * the proof log.
- */
 interface Cache {
   version: number
   lean: Record<string, string>
 }
 
-/** A path as shown to the user: relative inside the project, absolute outside it. */
 export function displayPath(cwd: string, file: string): string {
   const path = relative(cwd, file)
-  return path === "" || path.startsWith("..") ? file : path
+  return path === '' || path.startsWith('..') ? file : path
 }
 
 const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)))
-/** The name law files import from, read from this package so a rename needs no code change. */
-export const packageName = (JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8")) as { name: string }).name
+export const packageName = (
+  JSON.parse(readFileSync(join(packageRoot, 'package.json'), 'utf8')) as { name: string }
+).name
 
-const hash = (text: string) => createHash("sha256").update(text).digest("hex").slice(0, 32)
+const hash = (text: string) => createHash('sha256').update(text).digest('hex').slice(0, 32)
+
 async function loadConfig(cwd: string): Promise<{ config: Config; file: string | undefined }> {
-  for (const name of ["pudding.config.ts", "pudding.config.mts", "pudding.config.js", "pudding.config.mjs"]) {
+  for (const name of [
+    'pudding.config.ts',
+    'pudding.config.mts',
+    'pudding.config.js',
+    'pudding.config.mjs',
+  ]) {
     const file = join(cwd, name)
     if (!existsSync(file)) continue
-    // The query makes a changed file load again when one process runs several times, as watch mode does.
-    const module = (await import(`${pathToFileURL(file).href}?changed=${statSync(file).mtimeMs}`)) as { default?: Config }
+    const module = (await import(
+      `${pathToFileURL(file).href}?changed=${statSync(file).mtimeMs}`
+    )) as { default?: Config }
     return { config: module.default ?? {}, file }
   }
+
   return { config: {}, file: undefined }
 }
 
-/** Raised when no Lean binary can be found, so the CLI can offer to install one. */
 export class LeanMissing extends Error {}
 
-/**
- * Find the Lean binary. In order: the configuration, `PUDDING_LEAN`, the
- * runtime package for this platform, a `.toolchain` directory in the project
- * or in this package, the machine-wide cache `install-lean` fills, elan, and
- * finally `lean` on the PATH.
- */
 export function locateLean(config: Config, cwd: string): string {
-  const explicit = config.lean ?? process.env["PUDDING_LEAN"]
+  const explicit = config.lean ?? process.env['PUDDING_LEAN']
   if (explicit) return isAbsolute(explicit) ? explicit : resolve(cwd, explicit)
-  const suffix = process.platform === "win32" ? ".exe" : ""
+  const suffix = process.platform === 'win32' ? '.exe' : ''
   const name = toolchainName()
-  // What `install-lean` left behind: in the project, next to Pudding itself, or in the shared cache.
   const installed = [
-    ...[cwd, packageRoot].flatMap(root => existsSync(join(root, ".toolchain")) ? globSync(".toolchain/lean-*/bin/lean" + suffix, { cwd: root }).sort().slice(-1).map(found => join(root, found)) : []),
-    ...(name ? [join(cacheDirectory(), name, "bin", "lean" + suffix)] : []),
-  ].filter(candidate => existsSync(candidate))
-  // A whole Lean is only there because someone asked for one, so that a proof
-  // of their own can use more of the library. It goes before the trimmed
-  // runtime package for that reason.
-  const whole = installed.find(candidate => existsSync(join(dirname(dirname(candidate)), "lib", "lean", "Lean.olean")))
+    ...[cwd, packageRoot].flatMap((root) =>
+      existsSync(join(root, '.toolchain'))
+        ? globSync('.toolchain/lean-*/bin/lean' + suffix, { cwd: root })
+            .sort()
+            .slice(-1)
+            .map((found) => join(root, found))
+        : [],
+    ),
+    ...(name ? [join(cacheDirectory(), name, 'bin', 'lean' + suffix)] : []),
+  ].filter((candidate) => existsSync(candidate))
+  const whole = installed.find((candidate) =>
+    existsSync(join(dirname(dirname(candidate)), 'lib', 'lean', 'Lean.olean')),
+  )
   if (whole) return whole
+
   try {
-    const manifest = createRequire(import.meta.url).resolve(`${packageName}-lean-${process.platform}-${process.arch}/package.json`)
-    const bundled = join(dirname(manifest), "bin", "lean" + suffix)
+    const manifest = createRequire(import.meta.url).resolve(
+      `${packageName}-lean-${process.platform}-${process.arch}/package.json`,
+    )
+    const bundled = join(dirname(manifest), 'bin', 'lean' + suffix)
     if (existsSync(bundled)) return bundled
-  } catch {
-    // The runtime package is optional.
-  }
-  const elan = join(homedir(), ".elan", "bin", "lean" + suffix)
-  return installed[0] ?? (existsSync(elan) ? elan : "lean")
+  } catch {}
+
+  const elan = join(homedir(), '.elan', 'bin', 'lean' + suffix)
+  return installed[0] ?? (existsSync(elan) ? elan : 'lean')
 }
 
 const leanVersionCache = new Map<string, string>()
 
 function leanVersion(lean: string, cache: Cache): string {
   let key = lean
+
   try {
     const stat = statSync(lean)
     key = `${lean}:${stat.mtimeMs}:${stat.size}`
-  } catch {
-    // Resolved through PATH; ask the binary every time.
-  }
+  } catch {}
+
   let version = key === lean ? undefined : (cache.lean[key] ?? leanVersionCache.get(key))
+
   if (!version) {
     try {
-      version = execFileSync(lean, ["--version"], { encoding: "utf8" }).trim()
+      version = execFileSync(lean, ['--version'], { encoding: 'utf8' }).trim()
     } catch {
-      throw new LeanMissing(lean === "lean"
-        ? `Lean is not installed. Run \`npx pudding install-lean\`, or set PUDDING_LEAN to a Lean ${MINIMUM_LEAN.join(".")} binary.`
-        : `Lean could not be run at \`${lean}\`. Run \`npx pudding install-lean\`, or set PUDDING_LEAN to a Lean ${MINIMUM_LEAN.join(".")} binary.`)
+      throw new LeanMissing(
+        lean === 'lean'
+          ? `Lean is not installed. Run \`npx pudding install-lean\`, or set PUDDING_LEAN to a Lean ${MINIMUM_LEAN.join('.')} binary.`
+          : `Lean could not be run at \`${lean}\`. Run \`npx pudding install-lean\`, or set PUDDING_LEAN to a Lean ${MINIMUM_LEAN.join('.')} binary.`,
+      )
     }
+
     if (key !== lean) leanVersionCache.set(key, version)
     cache.lean = { [key]: version }
   }
+
   const match = /version (\d+)\.(\d+)\.(\d+)/.exec(version)
   const found = match ? match.slice(1, 4).map(Number) : [0, 0, 0]
   const tooOld = MINIMUM_LEAN.findIndex((part, i) => found[i]! !== part)
+
   if (tooOld >= 0 && found[tooOld]! < MINIMUM_LEAN[tooOld]!) {
-    throw new Error(`Pudding needs Lean ${MINIMUM_LEAN.join(".")} or newer, but \`${lean}\` is ${found.join(".")}.`)
+    throw new Error(
+      `Pudding needs Lean ${MINIMUM_LEAN.join('.')} or newer, but \`${lean}\` is ${found.join('.')}.`,
+    )
   }
+
   return version
 }
 
-/** The most proofs the log keeps when it is rewritten. It is rewritten when it holds twice as many. */
 const CACHE_LIMIT = 50_000
 
 function cachePath(cwd: string): string {
-  return existsSync(join(cwd, "node_modules")) ? join(cwd, "node_modules", ".cache", "pudding", "cache.json") : join(cwd, ".pudding", "cache.json")
+  return existsSync(join(cwd, 'node_modules'))
+    ? join(cwd, 'node_modules', '.cache', 'pudding', 'cache.json')
+    : join(cwd, '.pudding', 'cache.json')
 }
 
-/** Write a file so that another run reading it at the same moment never sees half of it. */
 function replaceFile(file: string, text: string): void {
   const partial = `${file}.${process.pid}.${threadId}.tmp`
   writeFileSync(partial, text)
@@ -299,86 +371,86 @@ function replaceFile(file: string, text: string): void {
 
 function loadCache(file: string): Cache {
   try {
-    const cache = JSON.parse(readFileSync(file, "utf8")) as Cache
+    const cache = JSON.parse(readFileSync(file, 'utf8')) as Cache
     if (cache.version === CACHE_VERSION) return cache
-  } catch {
-    // Missing or unreadable: start fresh.
-  }
+  } catch {}
+
   return { version: CACHE_VERSION, lean: {} }
 }
 
-/**
- * The theorems Lean has accepted, shared by every project on the machine, so
- * that a new worktree or a second project does not prove them again. Each
- * line is a key made from a theorem's full text, the Lean version and this
- * build of Pudding, so reusing one cannot be wrong: a build that judges Lean's
- * answers differently, released or not, never trusts another build's keys.
- * Whole results are deliberately not reused: knowing that nothing relevant
- * changed would mean second-guessing TypeScript's module resolution. Runs
- * append to the log, so runs going at once, as Vitest's workers do, keep each
- * other's proofs. Only rewriting a log grown to twice its limit can drop a
- * proof, which then costs time again.
- */
-const proofLog = () => join(cacheDirectory(), "proved")
+const proofLog = () => join(cacheDirectory(), 'proved')
 const KEY = /^[0-9a-f]{32}$/
 
 let cachedBuildDigest: string | undefined
 
-/** A digest of the code running now: every module next to this one. */
 function buildDigest(): string {
   if (cachedBuildDigest !== undefined) return cachedBuildDigest
   const directory = dirname(fileURLToPath(import.meta.url))
-  const digest = createHash("sha256")
+  const digest = createHash('sha256')
+
   for (const file of readdirSync(directory).sort()) {
-    if (/\.(js|ts)$/.test(file) && !file.endsWith(".d.ts")) digest.update(file + "\0").update(readFileSync(join(directory, file)))
+    if (/\.(js|ts)$/.test(file) && !file.endsWith('.d.ts'))
+      digest.update(file + '\0').update(readFileSync(join(directory, file)))
   }
-  return (cachedBuildDigest = digest.digest("hex"))
+
+  return (cachedBuildDigest = digest.digest('hex'))
 }
 
 function loadProofs(): { keys: Set<string>; lines: number } {
   try {
-    const lines = readFileSync(proofLog(), "utf8").split("\n")
-    return { keys: new Set(lines.filter(line => KEY.test(line))), lines: lines.length }
+    const lines = readFileSync(proofLog(), 'utf8').split('\n')
+    return { keys: new Set(lines.filter((line) => KEY.test(line))), lines: lines.length }
   } catch {
     return { keys: new Set(), lines: 0 }
   }
 }
 
-/** A cache that cannot be written only costs time, so a failure here is ignored. */
 function saveProofs(known: { keys: Set<string>; lines: number }, added: string[]): void {
   if (!added.length) return
+
   try {
     mkdirSync(dirname(proofLog()), { recursive: true })
-    if (known.lines + added.length > 2 * CACHE_LIMIT) replaceFile(proofLog(), [...known.keys, ...added].slice(-CACHE_LIMIT).join("\n") + "\n")
-    else appendFileSync(proofLog(), added.map(key => key + "\n").join(""))
-  } catch {
-    // Read-only or missing cache directory.
-  }
+
+    if (known.lines + added.length > 2 * CACHE_LIMIT)
+      replaceFile(proofLog(), [...known.keys, ...added].slice(-CACHE_LIMIT).join('\n') + '\n')
+    else appendFileSync(proofLog(), added.map((key) => key + '\n').join(''))
+  } catch {}
 }
 
-/**
- * Write the TypeScript project Pudding reads the laws through: the law files
- * as roots, on top of the project's own compiler options. This is why law
- * files need no entry in anyone's `include`, and why a project without a
- * tsconfig still works.
- */
-function writeProject(directory: string, base: string | undefined, lawFiles: string[], partial: boolean): string {
-  const defaults = join(directory, "tsconfig.defaults.json")
-  // A run over some of the law files gets a project of its own, because
-  // several of them can be going at once: Vitest proves each file in its own worker.
-  const subset = createHash("sha256").update(lawFiles.join("\0")).digest("hex").slice(0, 12)
-  const project = join(directory, partial ? `tsconfig.${subset}.json` : "tsconfig.json")
+function writeProject(
+  directory: string,
+  base: string | undefined,
+  lawFiles: string[],
+  partial: boolean,
+): string {
+  const defaults = join(directory, 'tsconfig.defaults.json')
+  const subset = createHash('sha256').update(lawFiles.join('\0')).digest('hex').slice(0, 12)
+  const project = join(directory, partial ? `tsconfig.${subset}.json` : 'tsconfig.json')
+
   const write = (file: string, value: unknown) => {
-    const text = JSON.stringify(value, null, 2) + "\n"
-    if (!existsSync(file) || readFileSync(file, "utf8") !== text) replaceFile(file, text)
+    const text = JSON.stringify(value, null, 2) + '\n'
+    if (!existsSync(file) || readFileSync(file, 'utf8') !== text) replaceFile(file, text)
   }
+
   mkdirSync(directory, { recursive: true })
   write(defaults, {
-    compilerOptions: { target: "ESNext", module: "Preserve", moduleResolution: "Bundler", strict: true, skipLibCheck: true },
+    compilerOptions: {
+      target: 'ESNext',
+      module: 'Preserve',
+      moduleResolution: 'Bundler',
+      strict: true,
+      skipLibCheck: true,
+    },
   })
   write(project, {
     extends: base ? [defaults, base] : [defaults],
-    compilerOptions: { noEmit: true, allowImportingTsExtensions: true, composite: false, incremental: false, declaration: false },
+    compilerOptions: {
+      noEmit: true,
+      allowImportingTsExtensions: true,
+      composite: false,
+      incremental: false,
+      declaration: false,
+    },
     files: lawFiles,
     include: [],
     exclude: [],
@@ -386,39 +458,38 @@ function writeProject(directory: string, base: string | undefined, lawFiles: str
   return project
 }
 
-// ----------------------------------------------------------------- runtime
-
-/**
- * What Node needs to execute the law files the way TypeScript reads them:
- * where each import resolves, and which imported or exported names are types
- * only. Node erases type syntax but neither resolves `./cart` to `./cart.ts`
- * nor drops an imported interface, and bundler-style code relies on both.
- */
-function runtimeMap(program: Program, checker: Checker, ambiguous: (message: string) => void): RuntimeMap {
+function runtimeMap(
+  program: Program,
+  checker: Checker,
+  ambiguous: (message: string) => void,
+): RuntimeMap {
   const map: RuntimeMap = { resolutions: new Map(), edits: new Map() }
-  // The compiler's nodes are handled untyped, as in the translator.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   type N = any
+
   for (const name of program.getSourceFileNames()) {
-    if (!isAbsolute(name) || name.replaceAll("\\", "/").includes("/node_modules/")) continue
+    if (!isAbsolute(name) || name.replaceAll('\\', '/').includes('/node_modules/')) continue
     const source = program.getSourceFile(name)
     if (!source || source.isDeclarationFile) continue
     const text = source.text
     const resolutions = new Map<string, string>()
     const edits: [number, number, string][] = []
-    /** The range of a binding, widened over one neighbouring comma (skipping trivia/comments). */
+
     const withComma = (node: N): [number, number, string] => {
       let start = node.getStart(source) as number
       let end = node.end as number
       const after = /^(?:\s|\/\/[^\n]*|\/\*[\s\S]*?\*\/)*,/.exec(text.slice(end))
+
       if (after) end += after[0].length
       else {
         const before = /,(?:\s|\/\*[\s\S]*?\*\/)*$/.exec(text.slice(0, start))
         if (before) start -= before[0].length
       }
-      return [start, end, ""]
+
+      return [start, end, '']
     }
+
     const seenEnums = new Set<string>()
+
     for (const statement of source.statements as readonly N[]) {
       if (statement.kind === K.EnumDeclaration && statement.name?.kind === K.Identifier) {
         if (statement.modifiers?.some((m: N) => m.kind === K.DeclareKeyword)) continue
@@ -426,81 +497,137 @@ function runtimeMap(program: Program, checker: Checker, ambiguous: (message: str
         const isExport = statement.modifiers?.some((m: N) => m.kind === K.ExportKeyword) === true
         const entries: string[] = []
         let ok = true
+
         for (const member of statement.members as readonly N[]) {
-          if (member.name.kind !== K.Identifier && member.name.kind !== K.StringLiteral) { ok = false; break }
+          if (member.name.kind !== K.Identifier && member.name.kind !== K.StringLiteral) {
+            ok = false
+            break
+          }
+
           const val = checker.getConstantValue(member)
-          if (typeof val !== "string" && (typeof val !== "number" || !Number.isSafeInteger(val))) { ok = false; break }
+
+          if (typeof val !== 'string' && (typeof val !== 'number' || !Number.isSafeInteger(val))) {
+            ok = false
+            break
+          }
+
           const key = member.name.text as string
-          if (key === "__proto__") { ok = false; break }
+
+          if (key === '__proto__') {
+            ok = false
+            break
+          }
+
           entries.push(`${JSON.stringify(key)}:${JSON.stringify(val)}`)
-          if (!isConst && typeof val === "number") entries.push(`${JSON.stringify(String(val))}:${JSON.stringify(key)}`)
+
+          if (!isConst && typeof val === 'number')
+            entries.push(`${JSON.stringify(String(val))}:${JSON.stringify(key)}`)
         }
+
         if (ok) {
           const enumName = statement.name.text as string
           const emitted = seenEnums.has(enumName)
-            ? `Object.assign(${enumName}, {${entries.join(",")}});`
-            : `${isExport ? "export " : ""}const ${enumName} = {${entries.join(",")}};`
+            ? `Object.assign(${enumName}, {${entries.join(',')}});`
+            : `${isExport ? 'export ' : ''}const ${enumName} = {${entries.join(',')}};`
           seenEnums.add(enumName)
           edits.push([statement.getStart(source), statement.end, emitted])
         }
+
         continue
       }
+
       const isImport = statement.kind === K.ImportDeclaration
       if (!isImport && statement.kind !== K.ExportDeclaration) continue
       const specifier = statement.moduleSpecifier
+
       if (specifier?.kind === K.StringLiteral) {
         const symbol = checker.getSymbolAtLocation(specifier)
-        const target = (symbol?.valueDeclaration ?? symbol?.declarations[0])?.resolve()?.getSourceFile()
-        if (target && !target.isDeclarationFile && !program.isSourceFileFromExternalLibrary(target)) {
-          // `./x.js` normally means the TypeScript file `./x.ts`. If a real
-          // `./x.js` also exists, Node runs that one, and it may not be what
-          // TypeScript read. Leave the import to Node and say so.
-          const literal = /^\.{1,2}\//.test(specifier.text) ? resolve(dirname(name), specifier.text) : undefined
-          if (literal && literal !== target.fileName && existsSync(literal) && statSync(literal).isFile()) {
-            ambiguous(`${name} imports \`${specifier.text}\`, and both that file and ${target.fileName} exist: TypeScript reads one and Node runs the other, so a proof about the first says nothing certain about the second. Remove one of them or import the TypeScript file by its own name`)
+        const target = (symbol?.valueDeclaration ?? symbol?.declarations[0])
+          ?.resolve()
+          ?.getSourceFile()
+
+        if (
+          target &&
+          !target.isDeclarationFile &&
+          !program.isSourceFileFromExternalLibrary(target)
+        ) {
+          const literal = /^\.{1,2}\//.test(specifier.text)
+            ? resolve(dirname(name), specifier.text)
+            : undefined
+
+          if (
+            literal &&
+            literal !== target.fileName &&
+            existsSync(literal) &&
+            statSync(literal).isFile()
+          ) {
+            ambiguous(
+              `${name} imports \`${specifier.text}\`, and both that file and ${target.fileName} exist: TypeScript reads one and Node runs the other, so a proof about the first says nothing certain about the second. Remove one of them or import the TypeScript file by its own name`,
+            )
           } else resolutions.set(specifier.text, target.fileName)
         }
       }
-      if (isImport ? statement.importClause?.phaseModifier === K.TypeKeyword : statement.isTypeOnly) continue
+
+      if (isImport ? statement.importClause?.phaseModifier === K.TypeKeyword : statement.isTypeOnly)
+        continue
+
       const isTypeSymbol = (nameNode: N): boolean => {
         let symbol = checker.getSymbolAtLocation(nameNode)
         if (symbol && symbol.flags & SymbolFlags.Alias) symbol = checker.getAliasedSymbol(symbol)
-        return !!symbol && !checker.isUnknownSymbol(symbol) && (symbol.flags & SymbolFlags.Value) === 0
+        return (
+          !!symbol && !checker.isUnknownSymbol(symbol) && (symbol.flags & SymbolFlags.Value) === 0
+        )
       }
+
       const defaultName = isImport ? statement.importClause?.name : undefined
       const defaultIsType = !!defaultName && isTypeSymbol(defaultName)
       const bindings: N[] = isImport
-        ? statement.importClause?.namedBindings?.kind === K.NamedImports ? [...statement.importClause.namedBindings.elements] : []
-        : statement.exportClause?.kind === K.NamedExports ? [...statement.exportClause.elements] : []
-      const hasNamespace = isImport && statement.importClause?.namedBindings?.kind === K.NamespaceImport
-      const typeOnly = bindings.filter(binding => !binding.isTypeOnly && isTypeSymbol(binding.name))
+        ? statement.importClause?.namedBindings?.kind === K.NamedImports
+          ? [...statement.importClause.namedBindings.elements]
+          : []
+        : statement.exportClause?.kind === K.NamedExports
+          ? [...statement.exportClause.elements]
+          : []
+      const hasNamespace =
+        isImport && statement.importClause?.namedBindings?.kind === K.NamespaceImport
+      const typeOnly = bindings.filter(
+        (binding) => !binding.isTypeOnly && isTypeSymbol(binding.name),
+      )
       const typeOnlySet = new Set(typeOnly)
-      const allNamedType = bindings.every(binding => binding.isTypeOnly || typeOnlySet.has(binding))
-      // TypeScript drops an import whose names are all types; so must we, or Node would load a module for nothing.
-      const whole = isImport && !hasNamespace && (typeOnly.length > 0 || defaultIsType) && allNamedType && (!defaultName || defaultIsType)
-      if (whole) edits.push([statement.getStart(source), statement.end, ""])
+      const allNamedType = bindings.every(
+        (binding) => binding.isTypeOnly || typeOnlySet.has(binding),
+      )
+      const whole =
+        isImport &&
+        !hasNamespace &&
+        (typeOnly.length > 0 || defaultIsType) &&
+        allNamedType &&
+        (!defaultName || defaultIsType)
+
+      if (whole) edits.push([statement.getStart(source), statement.end, ''])
       else {
         if (defaultIsType) edits.push(withComma(defaultName))
         for (const binding of typeOnly) edits.push(withComma(binding))
       }
     }
+
     if (resolutions.size) map.resolutions.set(name, resolutions)
     if (edits.length) map.edits.set(name, edits)
   }
+
   return map
 }
 
-/**
- * Execute the laws in a worker thread: fresh module state on every run, no
- * way for the project's code to disturb this process, and a time limit.
- */
-function executeLaws(job: Job): Promise<{ outcomes: Map<string, FileOutcome>; timedOut: boolean; workerError?: string }> {
-  return new Promise(resolve => {
+function executeLaws(
+  job: Job,
+): Promise<{ outcomes: Map<string, FileOutcome>; timedOut: boolean; workerError?: string }> {
+  return new Promise((resolve) => {
     const outcomes = new Map<string, FileOutcome>()
-    const entry = new URL(import.meta.url.replace(/runner\.(ts|js)$/, "crosscheck.$1"))
+    const entry = new URL(import.meta.url.replace(/runner\.(ts|js)$/, 'crosscheck.$1'))
     const worker = new Worker(entry, { workerData: job, stdout: true, stderr: true })
     let settled = false
     let workerError: string | undefined
+
     const finish = (timedOut: boolean) => {
       if (settled) return
       settled = true
@@ -508,20 +635,19 @@ function executeLaws(job: Job): Promise<{ outcomes: Map<string, FileOutcome>; ti
       void worker.terminate()
       resolve({ outcomes, timedOut, ...(workerError ? { workerError } : {}) })
     }
+
     const timer = setTimeout(() => finish(true), RUNTIME_TIMEOUT_MS)
-    worker.on("message", (message: FileOutcome | "done") => {
-      if (message === "done") finish(false)
+    worker.on('message', (message: FileOutcome | 'done') => {
+      if (message === 'done') finish(false)
       else outcomes.set(message.file, message)
     })
-    worker.on("error", error => {
+    worker.on('error', (error) => {
       workerError = error instanceof Error ? `${error.name}: ${error.message}` : String(error)
       finish(false)
     })
-    worker.on("exit", () => finish(false))
+    worker.on('exit', () => finish(false))
   })
 }
-
-// --------------------------------------------------------------------- run
 
 interface Pending {
   law: Law
@@ -532,9 +658,19 @@ interface Pending {
 
 function emptyReport(lean: string): Report {
   return {
-    ok: false, laws: [], errors: [], warnings: [], counts: { proved: 0, checked: 0, sampled: 0, failed: 0, skipped: 0, todo: 0 },
-    obligations: 0, cachedObligations: 0, cases: 0, durationMs: 0, lean, compiler,
-    retried: 0, timings: { typescript: 0, prove: 0, retry: 0, crossCheck: 0 },
+    ok: false,
+    laws: [],
+    errors: [],
+    warnings: [],
+    counts: { proved: 0, checked: 0, sampled: 0, failed: 0, skipped: 0, todo: 0 },
+    obligations: 0,
+    cachedObligations: 0,
+    cases: 0,
+    durationMs: 0,
+    lean,
+    compiler,
+    retried: 0,
+    timings: { typescript: 0, prove: 0, retry: 0, crossCheck: 0 },
   }
 }
 
@@ -543,41 +679,66 @@ export async function run(options: RunOptions = {}): Promise<Report> {
   const cwd = resolve(options.cwd ?? process.cwd())
   await ensureCompiler(cwd)
   const loaded = await loadConfig(cwd)
-  const given = Object.fromEntries(Object.entries(options).filter(([, value]) => value !== undefined)) as RunOptions
+  const given = Object.fromEntries(
+    Object.entries(options).filter(([, value]) => value !== undefined),
+  ) as RunOptions
   const config: RunOptions = { ...loaded.config, ...given }
   const filters = config.files ?? []
-  const lawFiles = config.lawFiles?.map(file => resolve(cwd, file)) ?? globSync(config.include ?? ["**/*.law.ts"], {
-    cwd, exclude: ["**/node_modules/**", "**/.toolchain/**", ...(config.exclude ?? [])],
-  }).sort().map(file => resolve(cwd, file)).filter(file => !filters.length || filters.some(filter => displayPath(cwd, file).includes(filter)))
-  const base = resolve(cwd, config.tsconfig ?? "tsconfig.json")
+  const lawFiles =
+    config.lawFiles?.map((file) => resolve(cwd, file)) ??
+    globSync(config.include ?? ['**/*.law.ts'], {
+      cwd,
+      exclude: ['**/node_modules/**', '**/.toolchain/**', ...(config.exclude ?? [])],
+    })
+      .sort()
+      .map((file) => resolve(cwd, file))
+      .filter(
+        (file) =>
+          !filters.length || filters.some((filter) => displayPath(cwd, file).includes(filter)),
+      )
+  const base = resolve(cwd, config.tsconfig ?? 'tsconfig.json')
   const cacheFile = cachePath(cwd)
-  const cache = config.cache === false ? loadCache("") : loadCache(cacheFile)
+  const cache = config.cache === false ? loadCache('') : loadCache(cacheFile)
   const lean = locateLean(config, cwd)
   const version = leanVersion(lean, cache)
   const report = emptyReport(version)
   if (config.reporter) report.reporter = config.reporter
+
   const finish = () => {
     report.durationMs = Math.round(performance.now() - started)
     return report
   }
+
   if (compilerProblem) {
     report.errors.push(compilerProblem)
     return finish()
   }
+
   if (!lawFiles.length) {
-    if (options.session && config.lawFiles === undefined && !filters.length && !config.name) sessionStates.get(options.session)?.dependencies.clear()
-    report.errors.push(filters.length ? `no law file matches ${filters.map(f => `\`${f}\``).join(" or ")}` : "no law files were found")
+    if (options.session && config.lawFiles === undefined && !filters.length && !config.name)
+      sessionStates.get(options.session)?.dependencies.clear()
+
+    report.errors.push(
+      filters.length
+        ? `no law file matches ${filters.map((f) => `\`${f}\``).join(' or ')}`
+        : 'no law files were found',
+    )
     return finish()
   }
+
   if (config.tsconfig && !existsSync(base)) {
-    report.errors.push(`the tsconfig \`${config.tsconfig}\` named in the configuration was not found`)
+    report.errors.push(
+      `the tsconfig \`${config.tsconfig}\` named in the configuration was not found`,
+    )
     return finish()
   }
+
   let selected: (name: string) => boolean = () => true
+
   if (config.name) {
     try {
       const pattern = new RegExp(config.name)
-      selected = name => pattern.test(name)
+      selected = (name) => pattern.test(name)
     } catch {
       report.errors.push(`\`${config.name}\` is not a valid regular expression`)
       return finish()
@@ -585,510 +746,848 @@ export async function run(options: RunOptions = {}): Promise<Report> {
   }
 
   const partial = config.lawFiles !== undefined || filters.length > 0 || config.name !== undefined
-  const tsconfig = writeProject(dirname(cacheFile), existsSync(base) ? base : undefined, lawFiles, partial)
+  const tsconfig = writeProject(
+    dirname(cacheFile),
+    existsSync(base) ? base : undefined,
+    lawFiles,
+    partial,
+  )
 
-  // Read and translate the laws.
   const reading = performance.now()
   const session = options.session ? sessionStates.get(options.session) : undefined
-  const changed = config.changedFiles?.map(file => resolve(cwd, file))
+  const changed = config.changedFiles?.map((file) => resolve(cwd, file))
   const reuseApi = !!(session && changed?.length && session.api && session.apiCwd === cwd)
   let api: InstanceType<typeof API>
+
   if (reuseApi) {
     api = session!.api!
     api.clearSourceFileCache?.()
   } else {
     session?.api?.close()
     api = new API({ cwd })
+
     if (session) {
       session.api = api
       session.apiCwd = cwd
     }
   }
+
   let laws: Law[] = []
   let executable: RuntimeMap | undefined
+
   try {
-    // TypeScript 7.1 and tsrs open projects with `createSnapshot`; 7.0 uses `updateSnapshot`.
-    const open = { openProjects: [tsconfig], ...(reuseApi && changed?.length ? { fileChanges: { changed } } : {}) }
-    const snapshot = "createSnapshot" in api && typeof api.createSnapshot === "function"
-      ? api.createSnapshot(open)
-      : api.updateSnapshot(open)
+    const open = {
+      openProjects: [tsconfig],
+      ...(reuseApi && changed?.length ? { fileChanges: { changed } } : {}),
+    }
+    const snapshot =
+      'createSnapshot' in api && typeof api.createSnapshot === 'function'
+        ? api.createSnapshot(open)
+        : api.updateSnapshot(open)
     const project = snapshot.getProject(tsconfig) ?? snapshot.getProjects()[0]
+
     if (!project) {
-      report.errors.push("TypeScript could not open the project Pudding generated for the law files")
+      report.errors.push(
+        'TypeScript could not open the project Pudding generated for the law files',
+      )
       return finish()
     }
+
     const { program, checker } = project
+
     const diagnose = (file: string) => {
       const source = program.getSourceFile(file)
-      for (const diagnostic of [...program.getSyntacticDiagnostics(file), ...program.getSemanticDiagnostics(file)]) {
+
+      for (const diagnostic of [
+        ...program.getSyntacticDiagnostics(file),
+        ...program.getSemanticDiagnostics(file),
+      ]) {
         if (diagnostic.category !== DiagnosticCategory.Error) continue
         const at = source?.getLineAndCharacterOfPosition(diagnostic.pos)
-        report.errors.push(`${displayPath(cwd, file)}:${at ? `${at.line + 1}:${at.character + 1}` : "?"} TS${diagnostic.code}: ${diagnostic.text}`)
+        report.errors.push(
+          `${displayPath(cwd, file)}:${at ? `${at.line + 1}:${at.character + 1}` : '?'} TS${diagnostic.code}: ${diagnostic.text}`,
+        )
       }
     }
-    const readable = lawFiles.filter(file => {
+
+    const readable = lawFiles.filter((file) => {
       if (program.getSourceFile(file)) return true
       report.errors.push(`${displayPath(cwd, file)} could not be read by TypeScript`)
       return false
     })
     readable.forEach(diagnose)
+
     if (report.errors.length) {
       session?.dependencies.clear()
       return finish()
     }
+
     const translator = new Translator(program, checker, packageName)
     if (session && !partial) session.dependencies.clear()
+
     for (const file of readable) {
       laws.push(...translator.translateFile(program.getSourceFile(file)!, selected))
+
       if (session) {
         const deps = collectDependencies(program, checker, file)
         for (const reached of translator.fileReached.get(file) ?? []) deps.add(resolve(reached))
         session.dependencies.set(resolve(file), deps)
       }
     }
+
     for (const file of translator.reached) if (!readable.includes(file)) diagnose(file)
+
     if (report.errors.length) {
       session?.dependencies.clear()
       return finish()
     }
-    const map = runtimeMap(program, checker, message => report.errors.push(message.replaceAll(cwd + "/", "").replaceAll(cwd + "\\", "")))
+
+    const map = runtimeMap(program, checker, (message) =>
+      report.errors.push(message.replaceAll(cwd + '/', '').replaceAll(cwd + '\\', '')),
+    )
+
     if (report.errors.length) {
       session?.dependencies.clear()
       return finish()
     }
+
     if (config.crossCheck !== false) executable = map
   } finally {
     if (!session) api.close()
     report.timings.typescript = Math.round(performance.now() - reading)
   }
 
-  // Turn obligations into Lean theorems.
   const lawReports = new Map<Law, LawReport>()
   const pending: Pending[] = []
+
   for (const law of laws) {
     const entry: LawReport = {
-      name: law.name, file: law.file, line: law.line, column: law.column, status: "proved", findings: [], notes: [], obligations: 0, cases: 0,
+      name: law.name,
+      file: law.file,
+      line: law.line,
+      column: law.column,
+      status: 'proved',
+      findings: [],
+      notes: [],
+      obligations: 0,
+      cases: 0,
     }
     lawReports.set(law, entry)
-    if (law.problem || law.mode !== "run") continue
+    if (law.problem || law.mode !== 'run') continue
     const unusable = law.proof === undefined ? undefined : scriptProblem(law.proof)
+
     if (unusable) {
-      law.problem = { kind: "invalid", message: unusable, file: law.file, line: law.line, column: law.column }
+      law.problem = {
+        kind: 'invalid',
+        message: unusable,
+        file: law.file,
+        line: law.line,
+        column: law.column,
+      }
       continue
     }
+
     try {
       const batch: Pending[] = []
+
       for (const instance of law.instances) {
         for (const obligation of instance.obligations) {
-          const binders = obligation.extraBinders ? [...obligation.extraBinders, ...instance.binders] : instance.binders
+          const binders = obligation.extraBinders
+            ? [...obligation.extraBinders, ...instance.binders]
+            : instance.binders
           const proof = obligation.extraBinders ? undefined : law.proof
-          batch.push({ law, instance, obligation, checks: checksFor(binders, obligation.guard, obligation.claim, proof, instance.defs) })
+          batch.push({
+            law,
+            instance,
+            obligation,
+            checks: checksFor(binders, obligation.guard, obligation.claim, proof, instance.defs),
+          })
         }
       }
+
       pending.push(...batch)
     } catch (error) {
       if (!(error instanceof TooLarge)) throw error
-      law.problem = { kind: "unsupported", message: error.message, file: law.file, line: law.line, column: law.column }
+      law.problem = {
+        kind: 'unsupported',
+        message: error.message,
+        file: law.file,
+        line: law.line,
+        column: law.column,
+      }
       for (const instance of law.instances) instance.obligations = []
     }
   }
 
-  // Start executing the laws against the real code now; it runs alongside
-  // the proving and is compared with the model once both are done.
   const executing = performance.now()
-  const candidates = laws.filter(law => law.index >= 0)
+  const candidates = laws.filter((law) => law.index >= 0)
   const job: Job | undefined = executable && {
     map: executable,
     budget: FALLBACK_RUNTIME_BUDGET,
-    files: lawFiles.map(file => ({
+    files: lawFiles.map((file) => ({
       file,
-      registered: candidates.filter(law => law.file === file).length,
-      laws: candidates.filter(law => law.file === file && law.mode === "run" && law.problem?.kind !== "invalid").map(law => ({
-        index: law.index,
-        unproved: law.problem !== undefined,
-        budget: law.problem ? FALLBACK_RUNTIME_BUDGET : PROVED_RUNTIME_BUDGET,
-        mentioned: law.mentioned,
-        instances: law.instances.map(instance => ({
-          binders: instance.binders, arg: instance.arg, ...(instance.defs ? { defs: instance.defs } : {}),
-          obligations: instance.obligations.filter(o => !o.extraBinders).map(o => ({ guard: o.guard, claim: o.claim, inexact: o.kind === "overflow" || o.kind === "nan" || o.kind === "round" || o.kind === "inherited" })),
+      registered: candidates.filter((law) => law.file === file).length,
+      laws: candidates
+        .filter((law) => law.file === file && law.mode === 'run' && law.problem?.kind !== 'invalid')
+        .map((law) => ({
+          index: law.index,
+          unproved: law.problem !== undefined,
+          budget: law.problem ? FALLBACK_RUNTIME_BUDGET : PROVED_RUNTIME_BUDGET,
+          mentioned: law.mentioned,
+          instances: law.instances.map((instance) => ({
+            binders: instance.binders,
+            arg: instance.arg,
+            ...(instance.defs ? { defs: instance.defs } : {}),
+            obligations: instance.obligations
+              .filter((o) => !o.extraBinders)
+              .map((o) => ({
+                guard: o.guard,
+                claim: o.claim,
+                inexact:
+                  o.kind === 'overflow' ||
+                  o.kind === 'nan' ||
+                  o.kind === 'round' ||
+                  o.kind === 'inherited',
+              })),
+          })),
         })),
-      })),
     })),
   }
-  const execution = job && executeLaws(job).then(result => {
-    report.timings.crossCheck = Math.round(performance.now() - executing)
-    return result
-  })
+  const execution =
+    job &&
+    executeLaws(job).then((result) => {
+      report.timings.crossCheck = Math.round(performance.now() - executing)
+      return result
+    })
 
-  // Prove what the cache does not already hold.
   const known = config.cache === false ? { keys: new Set<string>(), lines: 0 } : loadProofs()
   const proved = known.keys
   const build = buildDigest()
-  const checkKey = (statement: string, defs?: string) => (defs ? `${defs}\0${statement}` : statement)
-  const keyOf = (id: string) => hash(build + "\0" + version + "\0" + id)
+
+  const checkKey = (statement: string, defs?: string) =>
+    defs ? `${defs}\0${statement}` : statement
+
+  const keyOf = (id: string) => hash(build + '\0' + version + '\0' + id)
   const uniqueChecks = new Map<string, { statement: string; defs?: string }>()
+
   for (const p of pending) {
     for (const c of p.checks) {
       const id = checkKey(c.statement, c.defs)
-      if (!uniqueChecks.has(id)) uniqueChecks.set(id, { statement: c.statement, ...(c.defs ? { defs: c.defs } : {}) })
+
+      if (!uniqueChecks.has(id))
+        uniqueChecks.set(id, { statement: c.statement, ...(c.defs ? { defs: c.defs } : {}) })
     }
   }
+
   const ids = [...uniqueChecks.keys()]
   const outcomes = new Map<string, { ok: boolean; message: string }>()
   const fresh: string[] = []
+
   for (const id of ids) {
-    if (proved.has(keyOf(id))) outcomes.set(id, { ok: true, message: "" })
+    if (proved.has(keyOf(id))) outcomes.set(id, { ok: true, message: '' })
     else fresh.push(id)
   }
+
   report.obligations = ids.length
   report.cachedObligations = ids.length - fresh.length
+
   if (config.emit) {
     const comments = new Map<string, string>()
+
     for (const { law, instance, obligation, checks } of pending) {
-      const mapping = instance.binders.filter(b => b.label !== b.name).map(b => `${b.name} = ${b.label}`).join(", ")
-      const note = `${displayPath(cwd, obligation.file)}:${obligation.line} "${law.name.replace(/\r?\n/g, "\\n")}"${mapping ? ` (${mapping})` : ""}`
+      const mapping = instance.binders
+        .filter((b) => b.label !== b.name)
+        .map((b) => `${b.name} = ${b.label}`)
+        .join(', ')
+      const note = `${displayPath(cwd, obligation.file)}:${obligation.line} "${law.name.replace(/\r?\n/g, '\\n')}"${mapping ? ` (${mapping})` : ''}`
+
       for (const check of checks) {
         const id = checkKey(check.statement, check.defs)
         if (!comments.has(id)) comments.set(id, note)
       }
     }
+
     mkdirSync(dirname(resolve(cwd, config.emit)), { recursive: true })
     writeFileSync(
       resolve(cwd, config.emit),
       render(
         FAST_HEADER,
-        ids.map(id => uniqueChecks.get(id)!.statement),
+        ids.map((id) => uniqueChecks.get(id)!.statement),
         comments,
-        ids.map(id => uniqueChecks.get(id)!.defs),
+        ids.map((id) => uniqueChecks.get(id)!.defs),
       ),
     )
   }
-  // Everything starts under the fast imports. Statements sharing a recursive `defs`
-  // block run together in their own group so termination errors stay isolated.
+
   const proving = performance.now()
-  const proveGrouped = async (header: string, targetIds: string[], transform: (s: string) => string, alone: boolean) => {
+
+  const proveGrouped = async (
+    header: string,
+    targetIds: string[],
+    transform: (s: string) => string,
+    alone: boolean,
+  ) => {
     const groups = new Map<string, string[]>()
+
     for (const id of targetIds) {
-      const defs = uniqueChecks.get(id)!.defs ?? ""
+      const defs = uniqueChecks.get(id)!.defs ?? ''
       let list = groups.get(defs)
-      if (!list) groups.set(defs, list = [])
+      if (!list) groups.set(defs, (list = []))
       list.push(id)
     }
-    await Promise.all([...groups].map(async ([defs, groupIds]) => {
-      const res = await prove(lean, header, groupIds.map(id => transform(uniqueChecks.get(id)!.statement)), undefined, alone, defs || undefined)
-      groupIds.forEach((id, i) => outcomes.set(id, res[i]!))
-    }))
+
+    await Promise.all(
+      [...groups].map(async ([defs, groupIds]) => {
+        const res = await prove(
+          lean,
+          header,
+          groupIds.map((id) => transform(uniqueChecks.get(id)!.statement)),
+          undefined,
+          alone,
+          defs || undefined,
+        )
+        groupIds.forEach((id, i) => outcomes.set(id, res[i]!))
+      }),
+    )
   }
-  const generated = fresh.filter(id => proofKind(uniqueChecks.get(id)!.statement) !== "authored")
-  const scripted = fresh.filter(id => proofKind(uniqueChecks.get(id)!.statement) === "authored")
+
+  const generated = fresh.filter((id) => proofKind(uniqueChecks.get(id)!.statement) !== 'authored')
+  const scripted = fresh.filter((id) => proofKind(uniqueChecks.get(id)!.statement) === 'authored')
   await Promise.all([
-    proveGrouped(FAST_HEADER, generated, s => s, false),
-    proveGrouped(FAST_HEADER, scripted, s => s, true),
+    proveGrouped(FAST_HEADER, generated, (s) => s, false),
+    proveGrouped(FAST_HEADER, scripted, (s) => s, true),
   ])
-  const authored = scripted.filter(id => !outcomes.get(id)!.ok)
+  const authored = scripted.filter((id) => !outcomes.get(id)!.ok)
+
   if (authored.length) {
     try {
-      await proveGrouped(FULL_HEADER, authored, s => s, true)
+      await proveGrouped(FULL_HEADER, authored, (s) => s, true)
     } catch {
       for (const id of authored) {
         const outcome = outcomes.get(id)!
-        outcome.message += "\n(This Lean installation holds only the part of the library Pudding itself uses. A proof that needs more of it needs a full Lean: run `pudding install-lean --full`, or set PUDDING_LEAN.)"
+        outcome.message +=
+          '\n(This Lean installation holds only the part of the library Pudding itself uses. A proof that needs more of it needs a full Lean: run `pudding install-lean --full`, or set PUDDING_LEAN.)'
       }
     }
   }
+
   report.timings.prove = Math.round(performance.now() - proving)
-  // An obligation with a counterexample is false, so trying harder to prove
-  // it would only waste time. The search is cheap and its result is reused
-  // when the failure is explained.
   const retrying = performance.now()
-  const counterexamples = new Map<Obligation, ReturnType<typeof findInput>["found"]>()
+  const counterexamples = new Map<Obligation, ReturnType<typeof findInput>['found']>()
   const unexplained = new Set<string>()
+
   for (const { instance, obligation, checks } of pending) {
-    const rejected = checks.filter(c => !outcomes.get(checkKey(c.statement, c.defs))!.ok)
+    const rejected = checks.filter((c) => !outcomes.get(checkKey(c.statement, c.defs))!.ok)
     if (!rejected.length) continue
-    if (rejected.some(c => outcomes.get(checkKey(c.statement, c.defs))!.message.startsWith("termination:"))) continue
-    const binders = obligation.extraBinders ? [...obligation.extraBinders, ...instance.binders] : instance.binders
-    const defsMap = instance.defs?.length ? new Map(instance.defs.map(d => [d.name, d])) : undefined
-    const { found } = findInput(binders, ir.and(obligation.guard, ir.not(obligation.claim)), defsMap)
+
+    if (
+      rejected.some((c) =>
+        outcomes.get(checkKey(c.statement, c.defs))!.message.startsWith('termination:'),
+      )
+    )
+      continue
+
+    const binders = obligation.extraBinders
+      ? [...obligation.extraBinders, ...instance.binders]
+      : instance.binders
+    const defsMap = instance.defs?.length
+      ? new Map(instance.defs.map((d) => [d.name, d]))
+      : undefined
+    const { found } = findInput(
+      binders,
+      ir.and(obligation.guard, ir.not(obligation.claim)),
+      defsMap,
+    )
     counterexamples.set(obligation, found)
     if (!found) for (const check of rejected) unexplained.add(checkKey(check.statement, check.defs))
   }
-  // What the default automation could not close gets a slower second attempt
-  // before the rejection is reported. Lean's first message is kept, because it
-  // describes the goal best.
-  const retry = generated.filter(id => !outcomes.get(id)!.ok && proofKind(uniqueChecks.get(id)!.statement) === "automatic" && unexplained.has(id))
+
+  const retry = generated.filter(
+    (id) =>
+      !outcomes.get(id)!.ok &&
+      proofKind(uniqueChecks.get(id)!.statement) === 'automatic' &&
+      unexplained.has(id),
+  )
+
   if (retry.length) {
-    const firstMessages = new Map(retry.map(id => [id, outcomes.get(id)!]))
+    const firstMessages = new Map(retry.map((id) => [id, outcomes.get(id)!]))
     await proveGrouped(FALLBACK_HEADER, retry, withFallback, false)
     for (const id of retry) if (!outcomes.get(id)!.ok) outcomes.set(id, firstMessages.get(id)!)
   }
-  // Third attempt for nonlinear arithmetic (products of unknowns, division/remainder by an unknown).
+
   const obligationById = new Map<string, Obligation>()
+
   for (const { obligation, checks } of pending) {
     for (const check of checks) {
       const id = checkKey(check.statement, check.defs)
       if (!obligationById.has(id)) obligationById.set(id, obligation)
     }
   }
+
   const nonLinear: { id: string; attempt: string; defs?: string }[] = []
+
   for (const id of retry) {
     if (outcomes.get(id)!.ok) continue
     const obligation = obligationById.get(id)
     const entry = uniqueChecks.get(id)!
-    const attempt = obligation ? withNonLinear(entry.statement, obligation.guard, obligation.claim) : undefined
+    const attempt = obligation
+      ? withNonLinear(entry.statement, obligation.guard, obligation.claim)
+      : undefined
     if (attempt) nonLinear.push({ id, attempt, ...(entry.defs ? { defs: entry.defs } : {}) })
   }
+
   if (nonLinear.length) {
     const groups = new Map<string, typeof nonLinear>()
+
     for (const item of nonLinear) {
-      const d = item.defs ?? ""
+      const d = item.defs ?? ''
       let list = groups.get(d)
-      if (!list) groups.set(d, list = [])
+      if (!list) groups.set(d, (list = []))
       list.push(item)
     }
-    await Promise.all([...groups].map(async ([defs, group]) => {
-      const third = await prove(lean, FALLBACK_HEADER, group.map(entry => entry.attempt), undefined, false, defs || undefined)
-      group.forEach(({ id }, i) => {
-        if (third[i]!.ok) outcomes.set(id, third[i]!)
-      })
-    }))
+
+    await Promise.all(
+      [...groups].map(async ([defs, group]) => {
+        const third = await prove(
+          lean,
+          FALLBACK_HEADER,
+          group.map((entry) => entry.attempt),
+          undefined,
+          false,
+          defs || undefined,
+        )
+        group.forEach(({ id }, i) => {
+          if (third[i]!.ok) outcomes.set(id, third[i]!)
+        })
+      }),
+    )
   }
+
   report.timings.retry = Math.round(performance.now() - retrying)
   report.retried = retry.length
   const used = new Set<string>()
   for (const id of ids) if (outcomes.get(id)!.ok) used.add(keyOf(id))
 
-  // Explain each obligation that Lean rejected.
   for (const { law, instance, obligation, checks } of pending) {
     const entry = lawReports.get(law)!
     entry.obligations += checks.length
     entry.cases += checks.reduce((n, c) => n + c.cases, 0)
-    const rejected = checks.map(c => outcomes.get(checkKey(c.statement, c.defs))!).find(o => !o.ok)
+    const rejected = checks
+      .map((c) => outcomes.get(checkKey(c.statement, c.defs))!)
+      .find((o) => !o.ok)
     if (!rejected) continue
-    const at = { file: obligation.file, line: obligation.line, column: obligation.column, text: obligation.text }
-    if (rejected.message.startsWith("termination:")) {
-      law.problem ??= { kind: "unsupported", message: "Lean could not prove that this recursive function terminates", ...at }
+    const at = {
+      file: obligation.file,
+      line: obligation.line,
+      column: obligation.column,
+      text: obligation.text,
+    }
+
+    if (rejected.message.startsWith('termination:')) {
+      law.problem ??= {
+        kind: 'unsupported',
+        message: 'Lean could not prove that this recursive function terminates',
+        ...at,
+      }
       continue
     }
+
     const found = counterexamples.get(obligation)
+
     if (found) {
       const assignment = new Map(found)
-      for (const [name, value] of instance.fixed) if (!assignment.has(name) && value.t === "lit") assignment.set(name, value.value)
-      const binders = obligation.extraBinders ? [...obligation.extraBinders, ...instance.binders] : instance.binders
+
+      for (const [name, value] of instance.fixed)
+        if (!assignment.has(name) && value.t === 'lit') assignment.set(name, value.value)
+
+      const binders = obligation.extraBinders
+        ? [...obligation.extraBinders, ...instance.binders]
+        : instance.binders
       const inputs = showInputs(binders, assignment)
-      const defsMap = instance.defs?.length ? new Map(instance.defs.map(d => [d.name, d])) : undefined
-      if (obligation.kind === "expect") {
+      const defsMap = instance.defs?.length
+        ? new Map(instance.defs.map((d) => [d.name, d]))
+        : undefined
+
+      if (obligation.kind === 'expect') {
         const sides = obligation.sides
-        const flip: Record<string, string> = { ">": "<=", ">=": "<", "<": ">=", "<=": ">" }
-        const prefix = sides?.relation ? `${sides.negated ? flip[sides.relation]! : sides.relation} ` : sides?.negated ? "anything but " : ""
+        const flip: Record<string, string> = { '>': '<=', '>=': '<', '<': '>=', '<=': '>' }
+        const prefix = sides?.relation
+          ? `${sides.negated ? flip[sides.relation]! : sides.relation} `
+          : sides?.negated
+            ? 'anything but '
+            : ''
         entry.findings.push({
-          kind: "counterexample", message: "the expectation does not hold", ...at, inputs,
-          ...(sides ? { detail: `actual:   ${showValue(sides.actual, found, sides.num, defsMap)}\nexpected: ${prefix}${showValue(sides.expected, found, sides.num, defsMap)}` } : {}),
+          kind: 'counterexample',
+          message: 'the expectation does not hold',
+          ...at,
+          inputs,
+          ...(sides
+            ? {
+                detail: `actual:   ${showValue(sides.actual, found, sides.num, defsMap)}\nexpected: ${prefix}${showValue(sides.expected, found, sides.num, defsMap)}`,
+              }
+            : {}),
         })
       } else {
-        // Outside what the model describes, which is not the same as throwing: the code may well return something.
-        entry.findings.push(obligation.kind === "overflow" || obligation.kind === "nan" || obligation.kind === "round" || obligation.kind === "inherited" ? {
-          kind: "inexact", ...at, inputs,
-          message: obligation.kind === "nan" ? "this divides a number by zero, which does not give a whole number"
-            : obligation.kind === "inherited" ? "this reads a property that every object inherits, which is not modeled"
-            : obligation.kind === "round" ? "this number is too large for Math.round to round its quotient exactly (2^52 or beyond)"
-            : "this result is too large for a number to hold exactly (beyond 2^53 - 1)",
-        } : {
-          kind: "throws", ...at, inputs,
-          message: obligation.kind === "nothrow" ? "this divides by zero"
-            : obligation.kind === "falloff" ? "this function reaches its end without returning a value"
-            : obligation.kind === "missing" ? "this reads a property the object does not have"
-            : obligation.kind === "null" ? "this reads a property of null, or calls it"
-            : obligation.kind === "undefined" ? "this reads a property of undefined, or calls it"
-            : obligation.kind === "tdz" ? `\`${obligation.text}\` is read before its declaration has run, which throws` : "this throw is reached",
-        })
+        entry.findings.push(
+          obligation.kind === 'overflow' ||
+            obligation.kind === 'nan' ||
+            obligation.kind === 'round' ||
+            obligation.kind === 'inherited'
+            ? {
+                kind: 'inexact',
+                ...at,
+                inputs,
+                message:
+                  obligation.kind === 'nan'
+                    ? 'this divides a number by zero, which does not give a whole number'
+                    : obligation.kind === 'inherited'
+                      ? 'this reads a property that every object inherits, which is not modeled'
+                      : obligation.kind === 'round'
+                        ? 'this number is too large for Math.round to round its quotient exactly (2^52 or beyond)'
+                        : 'this result is too large for a number to hold exactly (beyond 2^53 - 1)',
+              }
+            : {
+                kind: 'throws',
+                ...at,
+                inputs,
+                message:
+                  obligation.kind === 'nothrow'
+                    ? 'this divides by zero'
+                    : obligation.kind === 'falloff'
+                      ? 'this function reaches its end without returning a value'
+                      : obligation.kind === 'missing'
+                        ? 'this reads a property the object does not have'
+                        : obligation.kind === 'null'
+                          ? 'this reads a property of null, or calls it'
+                          : obligation.kind === 'undefined'
+                            ? 'this reads a property of undefined, or calls it'
+                            : obligation.kind === 'tdz'
+                              ? `\`${obligation.text}\` is read before its declaration has run, which throws`
+                              : 'this throw is reached',
+              },
+        )
       }
-    } else if (rejected.message.includes("(kernel) deep recursion detected")) {
-      // Lean gave up on the size of the values, which says nothing about the
-      // law. It is reported as not proved, with what executing it showed.
-      law.problem ??= { kind: "unsupported", message: "the values here are too large to check: Lean ran out of depth on them", ...at }
+    } else if (rejected.message.includes('(kernel) deep recursion detected')) {
+      law.problem ??= {
+        kind: 'unsupported',
+        message: 'the values here are too large to check: Lean ran out of depth on them',
+        ...at,
+      }
     } else {
-      const message = obligation.kind === "expect" ? "Lean could not prove this, and no counterexample was found"
-        : obligation.kind === "nothrow" || obligation.kind === "nan" ? "Lean could not prove that the divisor is never zero"
-        : obligation.kind === "overflow" ? "Lean could not prove that this result stays small enough for a number to hold exactly"
-        : obligation.kind === "round" ? "Lean could not prove that this number stays small enough for Math.round to round its quotient exactly"
-        : obligation.kind === "null" ? "Lean could not prove that this value is never null"
-        : obligation.kind === "undefined" ? "Lean could not prove that this value is never undefined"
-        : obligation.kind === "tdz" ? `Lean could not prove that \`${obligation.text}\` is initialized before it is read`
-        : obligation.kind === "falloff" ? "Lean could not prove that this function always returns a value"
-        : obligation.kind === "missing" ? "Lean could not prove that this key is always a property of the object"
-        : obligation.kind === "inherited" ? "Lean could not prove that this key never names a property every object inherits"
-        : "Lean could not prove that this throw is never reached"
-      const mapping = instance.binders.filter(b => b.label !== b.name).map(b => `${b.name} = ${b.label}`).join(", ")
+      const message =
+        obligation.kind === 'expect'
+          ? 'Lean could not prove this, and no counterexample was found'
+          : obligation.kind === 'nothrow' || obligation.kind === 'nan'
+            ? 'Lean could not prove that the divisor is never zero'
+            : obligation.kind === 'overflow'
+              ? 'Lean could not prove that this result stays small enough for a number to hold exactly'
+              : obligation.kind === 'round'
+                ? 'Lean could not prove that this number stays small enough for Math.round to round its quotient exactly'
+                : obligation.kind === 'null'
+                  ? 'Lean could not prove that this value is never null'
+                  : obligation.kind === 'undefined'
+                    ? 'Lean could not prove that this value is never undefined'
+                    : obligation.kind === 'tdz'
+                      ? `Lean could not prove that \`${obligation.text}\` is initialized before it is read`
+                      : obligation.kind === 'falloff'
+                        ? 'Lean could not prove that this function always returns a value'
+                        : obligation.kind === 'missing'
+                          ? 'Lean could not prove that this key is always a property of the object'
+                          : obligation.kind === 'inherited'
+                            ? 'Lean could not prove that this key never names a property every object inherits'
+                            : 'Lean could not prove that this throw is never reached'
+      const mapping = instance.binders
+        .filter((b) => b.label !== b.name)
+        .map((b) => `${b.name} = ${b.label}`)
+        .join(', ')
       const stopped = describeNonLinearOps(obligation.guard, obligation.claim, instance.binders)
-      const leanDetail = rejected.message.split("\n").slice(0, 8).join("\n")
+      const leanDetail = rejected.message.split('\n').slice(0, 8).join('\n')
       const hints = [
-        mapping ? `where ${mapping}` : "",
-        stopped ? `stopped by: ${stopped} (bound an input with Integer<Min, Max> or pass { proof })` : "",
-      ].filter(Boolean).join("\n")
-      entry.findings.push({ kind: "unproved", message, ...at, detail: hints ? `${hints}\n${leanDetail}` : leanDetail })
+        mapping ? `where ${mapping}` : '',
+        stopped
+          ? `stopped by: ${stopped} (bound an input with Integer<Min, Max> or pass { proof })`
+          : '',
+      ]
+        .filter(Boolean)
+        .join('\n')
+      entry.findings.push({
+        kind: 'unproved',
+        message,
+        ...at,
+        detail: hints ? `${hints}\n${leanDetail}` : leanDetail,
+      })
     }
   }
 
-  // An expectation whose condition can never be true proves nothing.
-  const vacuityChecks: { entry: LawReport; site: { file: string; line: number; column: number; text: string }; law: Law; checks: Check[] }[] = []
+  const vacuityChecks: {
+    entry: LawReport
+    site: { file: string; line: number; column: number; text: string }
+    law: Law
+    checks: Check[]
+  }[] = []
+
   for (const law of laws) {
-    if (law.problem || law.mode !== "run") continue
+    if (law.problem || law.mode !== 'run') continue
     const entry = lawReports.get(law)!
+
     for (const [key, site] of law.expectSites) {
-      const reaching = law.instances.flatMap(instance => instance.obligations
-        .filter(o => o.kind === "expect" && `${o.file}:${o.line}:${o.column}` === key).map(obligation => ({ instance, obligation })))
-      const vacuous = () => entry.findings.push({
-        kind: "vacuous", message: "this expectation is never reached, so it proves nothing", ...site,
-      })
+      const reaching = law.instances.flatMap((instance) =>
+        instance.obligations
+          .filter((o) => o.kind === 'expect' && `${o.file}:${o.line}:${o.column}` === key)
+          .map((obligation) => ({ instance, obligation })),
+      )
+
+      const vacuous = () =>
+        entry.findings.push({
+          kind: 'vacuous',
+          message: 'this expectation is never reached, so it proves nothing',
+          ...site,
+        })
+
       if (!reaching.length) {
         vacuous()
         continue
       }
+
       const searches = reaching.map(({ instance, obligation }) => {
-        const defsMap = instance.defs?.length ? new Map(instance.defs.map(d => [d.name, d])) : undefined
+        const defsMap = instance.defs?.length
+          ? new Map(instance.defs.map((d) => [d.name, d]))
+          : undefined
         return findInput(instance.binders, obligation.guard, defsMap)
       })
-      if (searches.some(s => s.found)) continue
-      if (searches.every(s => s.exhaustive)) vacuous()
+      if (searches.some((s) => s.found)) continue
+
+      if (searches.every((s) => s.exhaustive)) vacuous()
       else {
         try {
-          const checks = reaching.flatMap(({ instance, obligation }) => checksFor(instance.binders, obligation.guard, ir.FALSE, undefined, instance.defs))
+          const checks = reaching.flatMap(({ instance, obligation }) =>
+            checksFor(instance.binders, obligation.guard, ir.FALSE, undefined, instance.defs),
+          )
           vacuityChecks.push({ entry, site, law, checks })
         } catch (error) {
           if (!(error instanceof TooLarge)) throw error
-          entry.notes.push(`line ${site.line}: no input satisfying the condition was found by sampling`)
+          entry.notes.push(
+            `line ${site.line}: no input satisfying the condition was found by sampling`,
+          )
         }
       }
     }
   }
+
   if (vacuityChecks.length) {
     const uniqueVacuity = new Map<string, { statement: string; defs?: string }>()
+
     for (const v of vacuityChecks) {
       for (const c of v.checks) {
         const id = checkKey(c.statement, c.defs)
-        if (!uniqueVacuity.has(id)) uniqueVacuity.set(id, { statement: c.statement, ...(c.defs ? { defs: c.defs } : {}) })
+
+        if (!uniqueVacuity.has(id))
+          uniqueVacuity.set(id, { statement: c.statement, ...(c.defs ? { defs: c.defs } : {}) })
       }
     }
+
     const neverTrue = new Set<string>()
     const freshVacuity: { id: string; statement: string; defs?: string }[] = []
+
     for (const [id, item] of uniqueVacuity) {
       if (proved.has(keyOf(id))) neverTrue.add(id)
       else freshVacuity.push({ id, ...item })
     }
+
     if (freshVacuity.length) {
       const vacuityStart = performance.now()
       const groups = new Map<string, typeof freshVacuity>()
+
       for (const item of freshVacuity) {
-        const d = item.defs ?? ""
+        const d = item.defs ?? ''
         let list = groups.get(d)
-        if (!list) groups.set(d, list = [])
+        if (!list) groups.set(d, (list = []))
         list.push(item)
       }
-      await Promise.all([...groups].map(async ([defs, group]) => {
-        const results = await prove(lean, FAST_HEADER, group.map(item => item.statement), undefined, false, defs || undefined)
-        group.forEach(({ id }, i) => {
-          if (results[i]!.ok) {
-            neverTrue.add(id)
-            used.add(keyOf(id))
-          }
-        })
-      }))
+
+      await Promise.all(
+        [...groups].map(async ([defs, group]) => {
+          const results = await prove(
+            lean,
+            FAST_HEADER,
+            group.map((item) => item.statement),
+            undefined,
+            false,
+            defs || undefined,
+          )
+          group.forEach(({ id }, i) => {
+            if (results[i]!.ok) {
+              neverTrue.add(id)
+              used.add(keyOf(id))
+            }
+          })
+        }),
+      )
       report.timings.prove += Math.round(performance.now() - vacuityStart)
     }
+
     for (const { entry, site, checks } of vacuityChecks) {
-      if (checks.every(c => neverTrue.has(checkKey(c.statement, c.defs)))) {
-        entry.findings.push({ kind: "vacuous", message: "the condition guarding this expectation is never true, so it proves nothing", ...site })
-      } else entry.notes.push(`line ${site.line}: no input satisfying the condition was found by sampling`)
+      if (checks.every((c) => neverTrue.has(checkKey(c.statement, c.defs)))) {
+        entry.findings.push({
+          kind: 'vacuous',
+          message: 'the condition guarding this expectation is never true, so it proves nothing',
+          ...site,
+        })
+      } else
+        entry.notes.push(
+          `line ${site.line}: no input satisfying the condition was found by sampling`,
+        )
     }
   }
 
-  // Compare the model that was proved with what the real code did.
   const executedOnly = new Map<Law, boolean>()
+
   if (job && execution) {
     const { outcomes, timedOut, workerError } = await execution
+
     for (const { file } of job.files) {
       const outcome = outcomes.get(file)
+
       for (const note of outcome?.rerouted ?? []) {
-        report.warnings.push(`the laws ran against the files TypeScript read, which are not the ones Node would load: ${note.replaceAll(cwd + "/", "").replaceAll(cwd + "\\", "")}`)
+        report.warnings.push(
+          `the laws ran against the files TypeScript read, which are not the ones Node would load: ${note.replaceAll(cwd + '/', '').replaceAll(cwd + '\\', '')}`,
+        )
       }
-      const reason = outcome?.error ?? (outcome ? undefined : timedOut ? `executing the laws took longer than ${RUNTIME_TIMEOUT_MS / 1000} s` : workerError ?? "the worker that executes laws stopped unexpectedly")
+
+      const reason =
+        outcome?.error ??
+        (outcome
+          ? undefined
+          : timedOut
+            ? `executing the laws took longer than ${RUNTIME_TIMEOUT_MS / 1000} s`
+            : (workerError ?? 'the worker that executes laws stopped unexpectedly'))
+
       if (outcome?.throws) {
-        // The file itself fails when it is loaded, so nothing in it holds at run time, whatever was proved about the model.
-        for (const law of candidates.filter(candidate => candidate.file === file && candidate.mode === "run")) {
+        for (const law of candidates.filter(
+          (candidate) => candidate.file === file && candidate.mode === 'run',
+        )) {
           lawReports.get(law)!.findings.push({
-            kind: "throws", message: `the law file throws when it is loaded (${reason})`, file: law.file, line: law.line, column: law.column,
+            kind: 'throws',
+            message: `the law file throws when it is loaded (${reason})`,
+            file: law.file,
+            line: law.line,
+            column: law.column,
           })
         }
       } else if (outcome?.miscounted) {
-        // Laws that exist at run time but were never read would otherwise go unchecked without a word.
-        report.errors.push(`${displayPath(cwd, file)} registers ${outcome.miscounted.ran} ${outcome.miscounted.ran === 1 ? "law" : "laws"} when it runs, but Pudding read ${outcome.miscounted.read} from it; write each law as a plain law() or describe() call`)
-      } else if (reason) report.warnings.push(`${displayPath(cwd, file)} was not compared with the running code: ${reason}`)
+        report.errors.push(
+          `${displayPath(cwd, file)} registers ${outcome.miscounted.ran} ${outcome.miscounted.ran === 1 ? 'law' : 'laws'} when it runs, but Pudding read ${outcome.miscounted.read} from it; write each law as a plain law() or describe() call`,
+        )
+      } else if (reason)
+        report.warnings.push(
+          `${displayPath(cwd, file)} was not compared with the running code: ${reason}`,
+        )
+
       for (const result of outcome?.laws ?? []) {
-        const law = candidates.find(candidate => candidate.file === file && candidate.index === result.index)!
+        const law = candidates.find(
+          (candidate) => candidate.file === file && candidate.index === result.index,
+        )!
         const entry = lawReports.get(law)!
+
         if (result.failure) {
           const { kind, inputs, actual, expected } = result.failure
           entry.findings.push({
-            kind, inputs, file: law.file, line: law.line, column: law.column,
-            message: kind === "counterexample" ? "the law fails when executed"
-              : `the running code ${actual ? "satisfies" : "violates"} the law for this input, but the model Pudding proved things about ${expected ? "satisfies" : "violates"} it; the proof cannot be trusted`,
+            kind,
+            inputs,
+            file: law.file,
+            line: law.line,
+            column: law.column,
+            message:
+              kind === 'counterexample'
+                ? 'the law fails when executed'
+                : `the running code ${actual ? 'satisfies' : 'violates'} the law for this input, but the model Pudding proved things about ${expected ? 'satisfies' : 'violates'} it; the proof cannot be trusted`,
           })
         }
-        // Inputs that leave out part of the declared domain are never every input, however few there are.
-        if (law.problem && result.executed) executedOnly.set(law, result.exhaustive && !law.narrowed)
-        // If Lean rejected the law late (e.g. termination or kernel depth) after cross-check already ran with
-        // `unproved: false`, `result.modelFails` records an input where both the model and the running code failed.
+
+        if (law.problem && result.executed)
+          executedOnly.set(law, result.exhaustive && !law.narrowed)
+
         if (law.problem && !result.failure && result.modelFails) {
           entry.findings.push({
-            kind: "counterexample", inputs: result.modelFails, file: law.file, line: law.line, column: law.column,
-            message: "the law fails when executed",
+            kind: 'counterexample',
+            inputs: result.modelFails,
+            file: law.file,
+            line: law.line,
+            column: law.column,
+            message: 'the law fails when executed',
           })
         }
-        // Lean accepted every theorem of this law, yet the model those theorems describe fails here.
+
         if (!law.problem && !entry.findings.length && result.modelFails) {
           entry.findings.push({
-            kind: "mismatch", inputs: result.modelFails, file: law.file, line: law.line, column: law.column,
-            message: "Lean accepted the proof, but evaluating the same model on this input says the law fails; the proof cannot be trusted",
+            kind: 'mismatch',
+            inputs: result.modelFails,
+            file: law.file,
+            line: law.line,
+            column: law.column,
+            message:
+              'Lean accepted the proof, but evaluating the same model on this input says the law fails; the proof cannot be trusted',
           })
         }
       }
     }
   }
 
-  // Settle each law's status.
   for (const law of laws) {
     const entry = lawReports.get(law)!
-    if (law.mode !== "run") entry.status = law.mode === "todo" ? "todo" : "skipped"
+    if (law.mode !== 'run') entry.status = law.mode === 'todo' ? 'todo' : 'skipped'
+
     if (law.problem) {
       const { kind, message, file, line, column } = law.problem
-      if (kind === "invalid") entry.findings.push({ kind, message, file, line, column })
+
+      if (kind === 'invalid') entry.findings.push({ kind, message, file, line, column })
       else if (!executedOnly.has(law)) {
-        entry.findings.push({ kind, message: `${message}; the law could not be executed instead, so nothing was checked`, file, line, column })
+        entry.findings.push({
+          kind,
+          message: `${message}; the law could not be executed instead, so nothing was checked`,
+          file,
+          line,
+          column,
+        })
       } else {
-        entry.status = executedOnly.get(law) ? "checked" : "sampled"
+        entry.status = executedOnly.get(law) ? 'checked' : 'sampled'
         entry.notes.unshift(`not proved: ${message} (${displayPath(cwd, file)}:${line}:${column})`)
       }
     }
-    if (entry.findings.length) entry.status = "failed"
-    if (config.strict && (entry.status === "checked" || entry.status === "sampled")) {
-      entry.status = "failed"
-      entry.findings.push({ kind: "unsupported", message: "strict mode requires a proof, and this law was only executed", file: law.file, line: law.line, column: law.column })
+
+    if (entry.findings.length) entry.status = 'failed'
+
+    if (config.strict && (entry.status === 'checked' || entry.status === 'sampled')) {
+      entry.status = 'failed'
+      entry.findings.push({
+        kind: 'unsupported',
+        message: 'strict mode requires a proof, and this law was only executed',
+        file: law.file,
+        line: law.line,
+        column: law.column,
+      })
     }
+
     report.counts[entry.status]++
     report.cases += entry.cases
     report.laws.push(entry)
   }
+
   report.ok = report.counts.failed === 0 && report.errors.length === 0
   finish()
 
   if (config.cache !== false) {
-    saveProofs(known, [...used].filter(key => !proved.has(key)))
+    saveProofs(
+      known,
+      [...used].filter((key) => !proved.has(key)),
+    )
     const saved: Cache = { version: CACHE_VERSION, lean: cache.lean }
+
     if (JSON.stringify(saved) !== JSON.stringify(loadCache(cacheFile))) {
       mkdirSync(dirname(cacheFile), { recursive: true })
       replaceFile(cacheFile, JSON.stringify(saved))
     }
   }
+
   return report
 }

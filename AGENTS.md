@@ -26,7 +26,7 @@ run `npm test` again with `PUDDING_COMPILER=tsrs`. Lean must be installed
 
 ## Easy to break
 
-- A law reported as *proved* that is false is the worst bug this project can
+- A law reported as _proved_ that is false is the worst bug this project can
   have. When the translator cannot model a construct exactly as JavaScript
   runs it, throw `Unsupported` so the law falls back to being executed. Do not
   approximate.

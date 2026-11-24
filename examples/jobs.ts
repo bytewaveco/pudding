@@ -1,5 +1,5 @@
-export type JobState = "queued" | "running" | "cancelled" | "finished"
+export type JobState = 'queued' | 'running' | 'cancelled' | 'finished'
 
 export function cancel(state: JobState): JobState {
-  return state === "finished" ? state : "cancelled"
+  return state === 'finished' ? state : 'cancelled'
 }
