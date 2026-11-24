@@ -2,20 +2,34 @@
   "name": "@bytewaveco/pudding",
   "version": "0.1.0-beta.7",
   "description": "Prove laws about existing TypeScript functions, with Lean doing the checking",
+  "keywords": [
+    "laws",
+    "lean",
+    "proof",
+    "property",
+    "testing",
+    "typescript",
+    "verification"
+  ],
+  "homepage": "https://github.com/bytewaveco/pudding#readme",
+  "bugs": "https://github.com/bytewaveco/pudding/issues",
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/bytewaveco/pudding.git"
   },
-  "homepage": "https://github.com/bytewaveco/pudding#readme",
-  "bugs": "https://github.com/bytewaveco/pudding/issues",
-  "type": "module",
-  "engines": {
-    "node": ">=24"
-  },
   "bin": {
     "pudding": "./dist/cli.js"
   },
+  "files": [
+    "dist/*.js",
+    "dist/index.d.ts",
+    "dist/runner.d.ts",
+    "dist/vitest-plugin.d.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "type": "module",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -31,14 +45,6 @@
     },
     "./package.json": "./package.json"
   },
-  "files": [
-    "dist/*.js",
-    "dist/index.d.ts",
-    "dist/runner.d.ts",
-    "dist/vitest-plugin.d.ts",
-    "README.md",
-    "LICENSE"
-  ],
   "publishConfig": {
     "access": "public",
     "tag": "beta"
@@ -51,7 +57,18 @@
     "prepack": "npm run build --silent",
     "test:package": "npm run build --silent && node scripts/smoke-package.mjs",
     "fuzz": "npm run build --silent && node scripts/fuzz.mjs",
-    "pack:runtime": "npm run build --silent && node scripts/pack-runtime.mjs"
+    "pack:runtime": "npm run build --silent && node scripts/pack-runtime.mjs",
+    "lint": "oxfmt --write . && oxlint --fix .",
+    "check": "oxlint --deny-warnings . && oxfmt --check ."
+  },
+  "devDependencies": {
+    "@oxlint/plugins": "1.94.0",
+    "@types/node": "^26.6.6",
+    "oxfmt": "0.79.0",
+    "oxlint": "1.94.0",
+    "tsrs": "7.1.0-beta.tsrs3",
+    "typescript": "7.0.2",
+    "vitest": "^5.1.1"
   },
   "peerDependencies": {
     "tsrs": "*",
@@ -69,25 +86,13 @@
       "optional": true
     }
   },
-  "devDependencies": {
-    "@types/node": "^26.6.6",
-    "tsrs": "7.1.0-beta.tsrs3",
-    "typescript": "7.0.2",
-    "vitest": "^5.1.1"
-  },
-  "keywords": [
-    "typescript",
-    "proof",
-    "lean",
-    "verification",
-    "laws",
-    "property",
-    "testing"
-  ],
   "optionalDependencies": {
     "@bytewaveco/pudding-lean-darwin-arm64": "4.36.0",
     "@bytewaveco/pudding-lean-darwin-x64": "4.36.0",
     "@bytewaveco/pudding-lean-linux-arm64": "4.36.0",
     "@bytewaveco/pudding-lean-linux-x64": "4.36.0"
+  },
+  "engines": {
+    "node": ">=24"
   }
 }

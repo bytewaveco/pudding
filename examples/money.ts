@@ -16,7 +16,6 @@ export function perPart(total: bigint, parts: bigint): bigint {
   return total / parts
 }
 
-/** Cents to whole dollars, rounding half away from zero. */
 export function roundToDollars(cents: bigint): bigint {
   const half = cents < 0n ? -50n : 50n
   return (cents + half) / 100n

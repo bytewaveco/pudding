@@ -1,6 +1,6 @@
 # What a proof means
 
-A *proved* law is a theorem about a model of your code. These things stand
+A _proved_ law is a theorem about a model of your code. These things stand
 between the theorem and the code that runs.
 
 1. **The translation.** Pudding's translator and its constant folding are trusted. To catch mistakes, every law is also executed against the real code and compared with the compiled model, on all inputs of a small finite domain or a sample of a large one (up to 1,000 inputs per instance for proved laws, 4,000 for executed-only laws) that includes the constants the law mentions. A disagreement fails the law. If the law file cannot be executed, the run says so in a warning. With `--no-cross-check` none of this happens, including noticing that a module throws when it loads.

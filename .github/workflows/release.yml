@@ -15,8 +15,8 @@ on:
         options: [package, runtime]
         default: package
       build:
-        description: "runtime only: rebuild number for the same Lean (0 for the first)"
-        default: "0"
+        description: 'runtime only: rebuild number for the same Lean (0 for the first)'
+        default: '0'
       dry-run:
         description: Do everything except upload
         type: boolean

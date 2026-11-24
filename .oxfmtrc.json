@@ -1,0 +1,23 @@
+{
+  "$schema": "./node_modules/oxfmt/configuration_schema.json",
+  "singleQuote": true,
+  "semi": false,
+  "trailingComma": "all",
+  "arrowParens": "always",
+  "ignorePatterns": [
+    ".lake/**",
+    "dist/**",
+    "node_modules/**",
+    "test/fixtures/**",
+    "tools/oxlint/bytewave/**"
+  ],
+  "sortImports": {
+    "groups": [
+      ["value-builtin", "value-external"],
+      "value-internal",
+      ["value-parent", "value-sibling", "value-index"],
+      "type-import",
+      "unknown"
+    ]
+  }
+}

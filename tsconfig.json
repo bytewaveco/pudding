@@ -10,19 +10,8 @@
     "rewriteRelativeImportExtensions": true,
     "noEmit": true,
     "skipLibCheck": true,
-    "types": [
-      "node"
-    ]
+    "types": ["node"]
   },
-  "include": [
-    "src/**/*.ts",
-    "examples/**/*.ts",
-    "test/**/*.ts",
-    "pudding.config.ts"
-  ],
-  "exclude": [
-    "test/fixtures/typeerror",
-    "test/fixtures/.tmp-*",
-    "test/fixtures/review-*"
-  ]
+  "include": ["src/**/*.ts", "examples/**/*.ts", "test/**/*.ts", "pudding.config.ts"],
+  "exclude": ["test/fixtures/typeerror", "test/fixtures/.tmp-*", "test/fixtures/review-*"]
 }

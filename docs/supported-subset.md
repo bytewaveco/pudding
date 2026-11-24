@@ -3,8 +3,8 @@
 Pudding reads only the code a law reaches. A module may contain anything else.
 
 A law over code outside the subset is refused, with the reason, at the exact
-expression. A refused law is executed instead and reported as *checked* or
-*sampled*, so a law can always be written and gets promoted to *proved* when
+expression. A refused law is executed instead and reported as _checked_ or
+_sampled_, so a law can always be written and gets promoted to _proved_ when
 the subset grows.
 
 ## What can be proved
